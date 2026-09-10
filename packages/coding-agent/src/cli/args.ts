@@ -259,20 +259,26 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 					})
 					.join("\n")}\n`
 			: "";
-	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write tools
+	console.log(`${chalk.bold("DUM-E")} - Autonomous Multi-Agent Harness & AI Coding Assistant
+  (Identity: DUM-E | Base Engine: Clean Minimal Core)
 
 ${chalk.bold("Usage:")}
   ${APP_NAME} [options] [--] [@files...] [messages...]
 
-${chalk.bold("Commands:")}
+${chalk.bold("Harness Commands:")}
+  ${APP_NAME} dume doctor               Diagnose DUM-E SQLite WAL & sub-agent harness
+  ${APP_NAME} dume status               Check active unfinished multi-agent attempts
+  ${APP_NAME} dume goal                 Create a durable mission goal with DAG tracking
+
+${chalk.bold("Coding Agent Commands:")}
   ${APP_NAME} install <source> [-l]     Install extension source and add to settings
   ${APP_NAME} remove <source> [-l]      Remove extension source from settings
   ${APP_NAME} uninstall <source> [-l]   Alias for remove
-  ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
+  ${APP_NAME} update [source|self]      Update DUM-E, extensions, or model catalogs
   ${APP_NAME} list                      List installed extensions from settings
-  ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  ${APP_NAME} config [-l]               Open TUI to configure settings
   ${APP_NAME} auth <command>            Print credentials or check provider readiness
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
+  ${APP_NAME} <command> --help          Show help for commands
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)

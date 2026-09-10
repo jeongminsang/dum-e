@@ -36,21 +36,45 @@
 
 ---
 
-## 🚀 Quick Start
+## 📦 Installation & Setup
+
+You can install DUM-E globally or run directly via Bun / Node:
 
 ```bash
-# Check DUM-E harness health
-bun run doctor
+# Clone and install dependencies
+git clone https://github.com/jeongminsang/dum-e.git
+cd dum-e
+bun install
 
-# Check active attempts
-bun run status
+# Link globally as `dume`
+bun --cwd=packages/coding-agent link
+```
 
-# Create an autonomous goal
-bun packages/coding-agent/src/cli.ts dume goal \
-  --title "Distributed Task Execution" \
-  --requirements "Execute multi-worker DAG"
+---
 
-# Run tests
+## 🚀 Quick Start & CLI Usage
+
+DUM-E combines **GJC's plan-first control aesthetics** with a **resilient multi-agent execution harness**:
+
+```bash
+# 1. Check DUM-E harness health & SQLite WAL subsystem
+dume doctor
+
+# 2. Start interactive coding session (DUM-E TUI)
+dume
+
+# 3. Create a durable multi-agent mission goal (DAG tracking)
+dume goal \
+  --title "Implement Distributed Auth" \
+  --requirements "Setup JWT auth routes with verification"
+
+# 4. Check active unfinished attempts
+dume status
+
+# 5. Non-interactive single-prompt execution
+dume -p "Analyze project dependencies and list top 3 improvements"
+
+# 6. Run autonomous harness test suite
 bun run test
 ```
 
