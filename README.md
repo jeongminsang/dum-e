@@ -94,4 +94,3 @@ flowchart TD
     VERIFY --> INTEGRATE[Serialized Integration]
     INTEGRATE --> STORE
 ```
-
