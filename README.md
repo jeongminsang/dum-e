@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="assets/dume_banner.jpg" alt="DUM-E Autonomous Multi-Agent Harness Architecture" width="100%" />
-</p>
-
-<p align="center">
   <img src="assets/dume_logo.jpg" alt="DUM-E Mascot" width="160" height="160" />
 </p>
 
@@ -82,6 +78,10 @@ bun run test
 
 ## 🏗️ Architecture
 
+<p align="center">
+  <img src="assets/dume_banner.jpg" alt="DUM-E Autonomous Multi-Agent Harness Architecture" width="100%" />
+</p>
+
 ```mermaid
 flowchart TD
     UI[CLI / User Interface] --> COORD[DUM-E Coordinator]
@@ -89,7 +89,9 @@ flowchart TD
     COORD --> WORKER[Isolated Worker Hosts]
     WORKER --> WT[Per-Attempt Worktree]
     WORKER --> RESULT[Result Manifest & Artifacts]
-    RESULT --> VERIFY[Independent Acceptance Verifier]
+    VERIFY[Independent Acceptance Verifier]
+    RESULT --> VERIFY
     VERIFY --> INTEGRATE[Serialized Integration]
     INTEGRATE --> STORE
 ```
+
