@@ -1,8 +1,8 @@
 import { basename } from "node:path";
+import { Client, ServerError } from "@dum-e/client";
+import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@dum-e/client/unix";
+import { isServerId, type ServerId } from "@dum-e/protocol";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Client, ServerError } from "@earendil-works/pi-client";
-import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@earendil-works/pi-client/unix";
-import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { RadiusRelayAuthResolver } from "./radius-auth.ts";
 import { createRadiusClientTransportFactory, RadiusClientReconnect } from "./radius-relay.ts";

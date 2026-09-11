@@ -24,8 +24,8 @@ import type {
 	AgentTool,
 	PrepareNextTurnContext,
 	ThinkingLevel,
-} from "@earendil-works/pi-agent-core";
-import { contentText, retryDelayMs } from "@earendil-works/pi-ai";
+} from "@dum-e/agent-core";
+import { contentText, retryDelayMs } from "@dum-e/ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -34,7 +34,7 @@ import type {
 	ProviderHeaders,
 	TextContent,
 	Usage,
-} from "@earendil-works/pi-ai/compat";
+} from "@dum-e/ai/compat";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -46,7 +46,7 @@ import {
 	type RetryCallbacks,
 	resetApiProviders,
 	streamSimple,
-} from "@earendil-works/pi-ai/compat";
+} from "@dum-e/ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { sleep } from "../utils/sleep.ts";

@@ -5,7 +5,7 @@ const src = (path: string): string => fileURLToPath(new URL(path, import.meta.ur
 
 /**
  * Exact matches for bare specifiers, plus one rule per package for subpath exports such as
- * `@earendil-works/pi-ai/utils/uuid`. A prefix alias would rewrite those onto `index.ts/utils/uuid`.
+ * `@dum-e/ai/utils/uuid`. A prefix alias would rewrite those onto `index.ts/utils/uuid`.
  */
 export default defineConfig({
 	test: {

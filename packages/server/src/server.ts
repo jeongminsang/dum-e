@@ -1,14 +1,4 @@
-import {
-	createServiceStateEncoder,
-	decodeServiceControlCall,
-	type JsonValue,
-	parseServiceCall,
-	parseServiceSubscriptionSnapshot,
-	RemoteServiceError,
-	type ServiceCall,
-	type ServiceProviderUpdate,
-} from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT, withAbortSignal } from "@earendil-works/pi-agent-core";
+import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT, withAbortSignal } from "@dum-e/agent-core";
 import {
 	type CancelEnvelope,
 	type ClientHello,
@@ -27,7 +17,17 @@ import {
 	type ServerHello,
 	type ServerHelloError,
 	type ServerMessage,
-} from "@earendil-works/pi-protocol";
+} from "@dum-e/protocol";
+import {
+	createServiceStateEncoder,
+	decodeServiceControlCall,
+	type JsonValue,
+	parseServiceCall,
+	parseServiceSubscriptionSnapshot,
+	RemoteServiceError,
+	type ServiceCall,
+	type ServiceProviderUpdate,
+} from "@earendil-works/chord";
 import {
 	type ByteConnection,
 	type ByteConnectionHandler,

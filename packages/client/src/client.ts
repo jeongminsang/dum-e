@@ -1,4 +1,15 @@
 import {
+	type AttachmentEnvelope,
+	encodeClientMessage,
+	isServerId,
+	ProtocolValidationError,
+	type ResponseEnvelope,
+	type RpcTarget,
+	type ServerHello,
+	type ServiceEventEnvelope,
+	type SessionTarget,
+} from "@dum-e/protocol";
+import {
 	createServiceCatalogueCall,
 	createServiceStateDecoder,
 	createServiceSubscribeCall,
@@ -17,17 +28,6 @@ import {
 	type ServiceSubscriptionSnapshot,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import {
-	type AttachmentEnvelope,
-	encodeClientMessage,
-	isServerId,
-	ProtocolValidationError,
-	type ResponseEnvelope,
-	type RpcTarget,
-	type ServerHello,
-	type ServiceEventEnvelope,
-	type SessionTarget,
-} from "@earendil-works/pi-protocol";
 import { Connection } from "./connection.ts";
 import { ClientDisposedError, DisconnectedError, ServerError, toError } from "./errors.ts";
 import { createPromiseResolvers } from "./promise.ts";

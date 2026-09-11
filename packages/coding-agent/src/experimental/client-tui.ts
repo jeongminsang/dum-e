@@ -1,5 +1,15 @@
 import { resolve } from "node:path";
 import {
+	CombinedAutocompleteProvider,
+	type Component,
+	Container,
+	type SelectItem,
+	SelectList,
+	setKeybindings,
+	Text,
+	type TUI,
+} from "@dum-e/tui";
+import {
 	combineFacetLoaders,
 	createFacetHost,
 	defineFacet,
@@ -9,16 +19,6 @@ import {
 	type LoadedFacets,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import {
-	CombinedAutocompleteProvider,
-	type Component,
-	Container,
-	type SelectItem,
-	SelectList,
-	setKeybindings,
-	Text,
-	type TUI,
-} from "@earendil-works/pi-tui";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { getAgentDir } from "../config.ts";
 import { KeybindingsManager } from "../core/keybindings.ts";

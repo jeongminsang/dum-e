@@ -1,3 +1,5 @@
+import { type Client, createClientServiceTransport } from "@dum-e/client";
+import type { SessionTarget } from "@dum-e/protocol";
 import {
 	type Context,
 	createRemoteServiceBinding,
@@ -12,8 +14,6 @@ import {
 	type ServiceCatalogueEntry,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { type Client, createClientServiceTransport } from "@earendil-works/pi-client";
-import type { SessionTarget } from "@earendil-works/pi-protocol";
 
 export type ServerConnectionState =
 	| { status: "connecting"; attempt: number }

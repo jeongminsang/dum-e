@@ -1,3 +1,4 @@
+import { NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@dum-e/telemetry";
 import type { Context, ContextKey } from "@earendil-works/chord";
 import {
 	awaitWithContext,
@@ -9,7 +10,6 @@ import {
 	withContextValue,
 	withoutAbortSignal,
 } from "@earendil-works/chord/context";
-import { NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@earendil-works/pi-telemetry";
 
 export {
 	awaitWithContext,

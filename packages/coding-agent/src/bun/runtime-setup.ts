@@ -1,6 +1,6 @@
-import { bedrockProviderModule } from "@earendil-works/pi-ai/bedrock-provider";
-import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
-import { setBedrockProviderModule } from "@earendil-works/pi-ai/compat";
+import { bedrockProviderModule } from "@dum-e/ai/bedrock-provider";
+import { registerBunOAuthFlows } from "@dum-e/ai/bun-oauth";
+import { setBedrockProviderModule } from "@dum-e/ai/compat";
 import { APP_NAME } from "../config.ts";
 
 process.title = APP_NAME;

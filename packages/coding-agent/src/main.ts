@@ -5,10 +5,10 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
-import { setCapabilityOverrides } from "@earendil-works/pi-tui";
+import { createInterface } from "node:readline";
+import { type ImageContent, modelsAreEqual } from "@dum-e/ai";
+import { setCapabilityOverrides } from "@dum-e/tui";
 import chalk from "chalk";
 import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
 import {
@@ -563,10 +563,10 @@ export interface MainOptions {
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
-	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
+	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.DUME_OFFLINE);
 	if (offlineMode) {
-		process.env.PI_OFFLINE = "1";
-		process.env.PI_SKIP_VERSION_CHECK = "1";
+		process.env.DUME_OFFLINE = "1";
+		process.env.DUME_SKIP_VERSION_CHECK = "1";
 	}
 
 	if (await runAuthCommand(args)) {
@@ -580,7 +580,9 @@ export async function main(args: string[], options?: MainOptions) {
 		try {
 			if (subAction === "doctor") {
 				console.log(chalk.bold("DUM-E Autonomous Multi-Agent Harness Doctor:"));
-				console.log(`  ${chalk.green("[PASS]")} Database: SQLite WAL store initialized at ${join(getAgentDir(), "harness.db")}`);
+				console.log(
+					`  ${chalk.green("[PASS]")} Database: SQLite WAL store initialized at ${join(getAgentDir(), "harness.db")}`,
+				);
 				console.log(`  ${chalk.green("[PASS]")} Epoch Fencing: Active and verified`);
 				console.log(`  ${chalk.green("[PASS]")} Artifact Store: Hash-addressed blob storage ready`);
 				console.log(`  ${chalk.green("[PASS]")} Base Engine: Pi clean minimal core`);
@@ -589,7 +591,13 @@ export async function main(args: string[], options?: MainOptions) {
 			if (subAction === "status") {
 				const unfinished = store.getUnfinishedAttempts();
 				if (args.includes("--json") || args.includes("-j")) {
-					console.log(JSON.stringify({ ok: true, activeUnfinishedAttempts: unfinished.length, attempts: unfinished }, null, 2));
+					console.log(
+						JSON.stringify(
+							{ ok: true, activeUnfinishedAttempts: unfinished.length, attempts: unfinished },
+							null,
+							2,
+						),
+					);
 				} else {
 					console.log(chalk.bold("DUM-E Harness Status:"));
 					console.log(`  Database: ${join(getAgentDir(), "harness.db")}`);

@@ -3,7 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ExampleFacetService } from "./contract.ts";
 
 export default defineFacet({
-	id: "@earendil-works/pi-example-plugin/session",
+	id: "@dum-e/example-plugin/session",
 	setup(env) {
 		const workerActivations = env.replicatedState({ count: 0 });
 		env.provide(ExampleFacetService, {

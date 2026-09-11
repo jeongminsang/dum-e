@@ -26,7 +26,7 @@ Pi agent, protocol, server, coding agent, TUI, and future applications
 Chord must:
 
 - have no dependency on another Pi workspace package;
-- contain no imports from `@earendil-works/pi-*` or relative paths outside `packages/chord`;
+- contain no imports from `@dum-e/*` or relative paths outside `packages/chord`;
 - use application-neutral vocabulary in source, errors, tests, and examples;
 - own any generic runtime types required by its public API, including strict JSON values and invocation cancellation context;
 - keep Node-specific loading and bundling separate from the platform-neutral runtime; and

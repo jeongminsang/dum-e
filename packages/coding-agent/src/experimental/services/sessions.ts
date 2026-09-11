@@ -1,5 +1,5 @@
+import type { ServerId } from "@dum-e/protocol";
 import { type Context, defineService, type ReplicatedState } from "@earendil-works/chord";
-import type { ServerId } from "@earendil-works/pi-protocol";
 
 export interface SessionAddress {
 	serverId: ServerId;

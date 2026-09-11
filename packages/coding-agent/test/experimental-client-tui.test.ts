@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import {
+	type AgentLane,
+	type LaneSnapshot,
+	type LaneTranscriptSnapshot,
+	type LaneWatchEvent,
+	reduceLaneSnapshot,
+} from "@dum-e/agent-core";
+import { ProcessTerminal, TuiMainScreen } from "@dum-e/tui";
+import {
 	createRemoteServiceBinding,
 	type MutableReplicatedState,
 	RemoteServiceProvider,
@@ -13,14 +21,6 @@ import {
 	FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
 	type FacetBundleArtifact,
 } from "@earendil-works/chord/node";
-import {
-	type AgentLane,
-	type LaneSnapshot,
-	type LaneTranscriptSnapshot,
-	type LaneWatchEvent,
-	reduceLaneSnapshot,
-} from "@earendil-works/pi-agent-core";
-import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type ClientTuiServer, ExperimentalClientTui } from "../src/experimental/client-tui.ts";
 import { createPresentationFacetData } from "../src/experimental/plugins/bundled.ts";

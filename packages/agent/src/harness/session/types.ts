@@ -1,5 +1,5 @@
+import type { AssistantMessage, StopReason, Usage } from "@dum-e/ai";
 import type { JsonValue } from "@earendil-works/chord";
-import type { AssistantMessage, StopReason, Usage } from "@earendil-works/pi-ai";
 import type { AgentMessage, QueueMode, ThinkingLevel } from "../../types.ts";
 import type { BranchPreparation } from "../compaction/branch-summarization.ts";
 import type { CompactionPreparation, CompactionSettings } from "../compaction/compaction.ts";

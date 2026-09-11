@@ -14,7 +14,7 @@ describe("getNativeModuleCandidates", () => {
 			moduleUrl: pathToFileURL(bundledModule).href,
 			execPath: resolve("virtual", "node", "node.exe"),
 			resolvePackage: (specifier) => {
-				assert.equal(specifier, "@earendil-works/pi-tui");
+				assert.equal(specifier, "@dum-e/tui");
 				return join(packageRoot, "dist", "index.js");
 			},
 		});

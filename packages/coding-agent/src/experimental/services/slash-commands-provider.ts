@@ -1,5 +1,5 @@
+import type { ThinkingLevel } from "@dum-e/agent-core";
 import { defineFacet, type Facet, type JsonValue } from "@earendil-works/chord";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { AgentController } from "./agent-controller.ts";
 import { type ModelSummary, Models, type Models as ModelsService } from "./models.ts";
 import { PresentationPlugins, SessionPlugins } from "./plugins.ts";

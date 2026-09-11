@@ -1,3 +1,4 @@
+import type { RoutedServerServiceAttachment, RoutedServerServiceHost } from "@dum-e/server";
 import {
 	type Context,
 	createRemoteServiceEndpoint,
@@ -6,7 +7,6 @@ import {
 	replicatedState,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { RoutedServerServiceAttachment, RoutedServerServiceHost } from "@earendil-works/pi-server";
 import { PresentationPlugins } from "./plugins.ts";
 import {
 	type SessionCreateOptions,

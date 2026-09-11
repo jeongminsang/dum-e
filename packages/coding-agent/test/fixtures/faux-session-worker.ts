@@ -1,8 +1,8 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AgentHarness, BACKGROUND_CONTEXT } from "@dum-e/agent-core";
+import { createModels, fauxAssistantMessage, fauxProvider } from "@dum-e/ai";
 import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
-import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
-import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";

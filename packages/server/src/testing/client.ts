@@ -1,6 +1,5 @@
 import { once } from "node:events";
 import { createConnection, type Socket } from "node:net";
-import type { JsonValue, ServiceCall } from "@earendil-works/chord";
 import {
 	type ClientMessage,
 	encodeClientMessage,
@@ -9,7 +8,8 @@ import {
 	type RpcTarget,
 	type ServerMessage,
 	ServerMessageDecoder,
-} from "@earendil-works/pi-protocol";
+} from "@dum-e/protocol";
+import type { JsonValue, ServiceCall } from "@earendil-works/chord";
 import { Deferred } from "./host.ts";
 
 interface MessageWaiter {

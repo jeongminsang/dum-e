@@ -1,10 +1,10 @@
 import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Client, ServerError as ClientServerError } from "@dum-e/client";
+import { createUnixTransportFactory } from "@dum-e/client/unix";
 import { type Context, createFacetHost, defineFacet, defineService } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
-import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ExampleFacetService } from "../examples/plugins/pi-example-plugin/src/contract.ts";
 import { runClient } from "../src/experimental/client.ts";
@@ -210,7 +210,7 @@ describe("experimental durable server composition", () => {
 			);
 			await activated.management.attach("demo-1", BACKGROUND_CONTEXT);
 			const loaded = await createPresentationFacetLoaders(presentationPlugins)[0]!.load();
-			expect(loaded.facets.map(({ id }) => id)).toEqual(["@earendil-works/pi-example-plugin/tui"]);
+			expect(loaded.facets.map(({ id }) => id)).toEqual(["@dum-e/example-plugin/tui"]);
 			await loaded.dispose();
 		} finally {
 			await first.dispose();

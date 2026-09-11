@@ -5,8 +5,8 @@
  * command that answers with data. Whether that view is in-process or a socket away is invisible here.
  */
 
-import type { AgentMessage, Entry, LaneSnapshot } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, AuthEvent } from "@earendil-works/pi-ai";
+import type { AgentMessage, Entry, LaneSnapshot } from "@dum-e/agent-core";
+import type { AssistantMessage, AuthEvent } from "@dum-e/ai";
 import {
 	type Component,
 	Container,
@@ -25,7 +25,7 @@ import {
 	TruncatedText,
 	TuiAltScreen,
 	VStack,
-} from "@earendil-works/pi-tui";
+} from "@dum-e/tui";
 import { getAgentDir } from "../../../config.ts";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import { createAllToolRenderers } from "../../../core/tools/renderers/index.ts";
