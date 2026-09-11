@@ -1,9 +1,4 @@
 import { compare, valid } from "semver";
-import { fetchWithRetry } from "./management-http.ts";
-import { getPiUserAgent } from "./pi-user-agent.ts";
-
-const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
-const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
 export interface LatestPiRelease {
 	version: string;
@@ -49,42 +44,12 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 }
 
 export async function getLatestPiRelease(
-	currentVersion: string,
-	options: { timeoutMs?: number; retry?: boolean } = {},
+	_currentVersion: string,
+	_options: { timeoutMs?: number; retry?: boolean } = {},
 ): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_OFFLINE) return undefined;
-
-	const response = await fetchWithRetry(
-		LATEST_VERSION_URL,
-		{
-			headers: {
-				"User-Agent": getPiUserAgent(currentVersion),
-				accept: "application/json",
-			},
-		},
-		{
-			maxRetries: options.retry ? 2 : 0,
-			timeoutMs: options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS,
-		},
-	);
-	if (!response.ok) return undefined;
-
-	const data = (await response.json()) as {
-		packageName?: unknown;
-		version?: unknown;
-		note?: unknown;
-	};
-	if (typeof data.version !== "string" || !data.version.trim()) {
-		return undefined;
-	}
-	const packageName =
-		typeof data.packageName === "string" && data.packageName.trim() ? data.packageName.trim() : undefined;
-	const note = typeof data.note === "string" && data.note.trim() ? data.note.trim() : undefined;
-	return {
-		version: data.version.trim(),
-		packageName,
-		...(note ? { note } : {}),
-	};
+	if (process.env.DUME_OFFLINE || process.env.DUME_SKIP_VERSION_CHECK) return undefined;
+	// External version check disabled for standalone DUM-E
+	return undefined;
 }
 
 export async function getLatestPiVersion(
@@ -94,16 +59,7 @@ export async function getLatestPiVersion(
 	return (await getLatestPiRelease(currentVersion, options))?.version;
 }
 
-export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK) return undefined;
-
-	try {
-		const latestRelease = await getLatestPiRelease(currentVersion);
-		if (latestRelease && isNewerPackageVersion(latestRelease.version, currentVersion)) {
-			return latestRelease;
-		}
-		return undefined;
-	} catch {
-		return undefined;
-	}
+export async function checkForNewPiVersion(_currentVersion: string): Promise<LatestPiRelease | undefined> {
+	if (process.env.DUME_SKIP_VERSION_CHECK || process.env.DUME_OFFLINE) return undefined;
+	return undefined;
 }

@@ -24,8 +24,8 @@ export const isBunBinary =
 export const isBunRuntime = !!process.versions.bun;
 
 /** Detect the esbuild-bundled Node.js distribution. */
-declare const PI_BUNDLED_NODE: boolean;
-export const isBundledNode = typeof PI_BUNDLED_NODE !== "undefined" && PI_BUNDLED_NODE;
+declare const DUME_BUNDLED_NODE: boolean;
+export const isBundledNode = typeof DUME_BUNDLED_NODE !== "undefined" && DUME_BUNDLED_NODE;
 
 // =============================================================================
 // Install Method Detection
@@ -338,7 +338,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
+		return `Download from: https://github.com/jeongminsang/dum-e/releases/latest`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	if (command) {
@@ -388,7 +388,7 @@ export function findNodePackageDir(startDir: string): string {
 
 export function getPackageDir(): string {
 	// Allow override via environment variable (useful for Nix/Guix where store paths tokenize poorly)
-	const envDir = process.env.PI_PACKAGE_DIR;
+	const envDir = process.env.DUME_PACKAGE_DIR;
 	if (envDir) {
 		return normalizePath(envDir);
 	}
@@ -498,7 +498,7 @@ try {
 }
 
 const piConfigName: string | undefined = pkg.piConfig?.name;
-export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
+export const PACKAGE_NAME: string = pkg.name || "@dum-e/coding-agent";
 export const APP_NAME: string = piConfigName || "dume";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "DUM-E";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".dume";
@@ -512,11 +512,11 @@ export function expandTildePath(path: string): string {
 	return normalizePath(path);
 }
 
-const DEFAULT_SHARE_VIEWER_URL = "https://pi.dev/session/";
+const DEFAULT_SHARE_VIEWER_URL = "https://github.com/jeongminsang/dum-e";
 
 /** Get the share viewer URL for a gist ID. */
 export function getShareViewerUrl(gistId: string): string {
-	const baseUrl = process.env.PI_SHARE_VIEWER_URL || DEFAULT_SHARE_VIEWER_URL;
+	const baseUrl = process.env.DUME_SHARE_VIEWER_URL || DEFAULT_SHARE_VIEWER_URL;
 	return `${baseUrl}#${gistId}`;
 }
 

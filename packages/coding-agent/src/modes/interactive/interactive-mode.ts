@@ -7,9 +7,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
-import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai/compat";
+import type { AgentMessage, ThinkingLevel } from "@dum-e/agent-core";
+import type { AuthEvent, AuthPrompt } from "@dum-e/ai";
+import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@dum-e/ai/compat";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -21,8 +21,8 @@ import type {
 	OverlayOptions,
 	SlashCommand,
 	TuiMainScreenRenderState,
-} from "@earendil-works/pi-tui";
-import * as TuiLayouts from "@earendil-works/pi-tui";
+} from "@dum-e/tui";
+import * as TuiLayouts from "@dum-e/tui";
 import {
 	CombinedAutocompleteProvider,
 	type Component,
@@ -41,7 +41,7 @@ import {
 	TuiAltScreen,
 	TuiMainScreen,
 	visibleWidth,
-} from "@earendil-works/pi-tui";
+} from "@dum-e/tui";
 import chalk from "chalk";
 import { spawn } from "child_process";
 import {
@@ -95,7 +95,6 @@ import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
-import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
@@ -105,7 +104,6 @@ import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
-import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
@@ -1034,7 +1032,7 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		if (!process.env.PI_OFFLINE) {
+		if (!process.env.DUME_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
@@ -1236,23 +1234,9 @@ export class InteractiveMode {
 		return undefined;
 	}
 
-	private reportInstallTelemetry(version: string): void {
-		if (process.env.PI_OFFLINE) {
-			return;
-		}
-
-		if (!isInstallTelemetryEnabled(this.settingsManager)) {
-			return;
-		}
-
-		void fetch(`https://pi.dev/api/report-install?version=${encodeURIComponent(version)}`, {
-			headers: {
-				"User-Agent": getPiUserAgent(version),
-			},
-			signal: AbortSignal.timeout(5000),
-		})
-			.then(() => undefined)
-			.catch(() => undefined);
+	private reportInstallTelemetry(_version: string): void {
+		// External telemetry reporting disabled for standalone DUM-E
+		return;
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {

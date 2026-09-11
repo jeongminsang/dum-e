@@ -1,4 +1,4 @@
-import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderHeaders } from "@dum-e/ai";
 import type { SettingsManager } from "./settings-manager.ts";
 import { isInstallTelemetryEnabled } from "./telemetry.ts";
 
@@ -43,21 +43,21 @@ function getDefaultAttributionHeaders(
 
 	if (isOpenRouterModel(model)) {
 		return {
-			"HTTP-Referer": "https://pi.dev",
-			"X-OpenRouter-Title": "pi",
+			"HTTP-Referer": "https://github.com/jeongminsang/dum-e",
+			"X-OpenRouter-Title": "dume",
 			"X-OpenRouter-Categories": "cli-agent",
 		};
 	}
 
 	if (isNvidiaNimModel(model)) {
 		return {
-			"X-BILLING-INVOKE-ORIGIN": "Pi",
+			"X-BILLING-INVOKE-ORIGIN": "DUM-E",
 		};
 	}
 
 	if (isCloudflareModel(model)) {
 		return {
-			"User-Agent": "pi-coding-agent",
+			"User-Agent": "dume-coding-agent",
 		};
 	}
 
@@ -73,7 +73,7 @@ function getSessionHeaders(model: Model<Api>, sessionId: string | undefined): Re
 	) {
 		return undefined;
 	}
-	return { "x-opencode-session": sessionId, "x-opencode-client": "pi" };
+	return { "x-opencode-session": sessionId, "x-opencode-client": "dume" };
 }
 
 export function mergeProviderAttributionHeaders(
