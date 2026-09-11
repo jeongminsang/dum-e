@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/pi-protocol",
+	"name": "@dum-e/protocol",
 	"version": "0.85.1",
 	"description": "Transport-neutral CBOR protocol for remote pi sessions",
 	"type": "module",

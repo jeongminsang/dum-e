@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/pi-client",
+	"name": "@dum-e/client",
 	"version": "0.85.1",
 	"description": "Transport-neutral client for remote pi sessions over framed CBOR bytes",
 	"type": "module",
@@ -48,7 +48,7 @@
 	},
 	"dependencies": {
 		"@earendil-works/chord": "^0.85.1",
-		"@earendil-works/pi-protocol": "^0.85.1"
+		"@dum-e/protocol": "^0.85.1"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
