@@ -1,8 +1,8 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
-import { HarnessStore, DumeCoordinator, DumeWorkerHost } from "../index.ts";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { DumeCoordinator, DumeWorkerHost, HarnessStore } from "../src/dume-harness/index.ts";
 
 describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATION.md)", () => {
 	let tempDir: string;
@@ -37,7 +37,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 		expect(goal.id).toBe("goal-clean-1");
 		expect(goal.status).toBe("active");
 
-		const task1 = store.insertTask({
+		const _task1 = store.insertTask({
 			id: "task-1",
 			goalId: "goal-clean-1",
 			title: "Setup schema",
@@ -49,7 +49,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 			status: "ready",
 		});
 
-		const task2 = store.insertTask({
+		const _task2 = store.insertTask({
 			id: "task-2",
 			goalId: "goal-clean-1",
 			title: "Setup API handlers",
@@ -65,9 +65,9 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 		coordinator.registerWorker(worker);
 
 		// DAG dependency violation check
-		await expect(
-			coordinator.dispatchTask("task-2", "worker-clean-1", "commit_0", "")
-		).rejects.toThrow("Dependency task-1 is not completed");
+		await expect(coordinator.dispatchTask("task-2", "worker-clean-1", "commit_0", "")).rejects.toThrow(
+			"Dependency task-1 is not completed",
+		);
 
 		// Dispatch Task 1
 		const attempt1 = await coordinator.dispatchTask("task-1", "worker-clean-1", "commit_0", "");
@@ -83,7 +83,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 				changedArtifacts: {},
 				modifiedFiles: ["src/schema.ts"],
 			},
-			999
+			999,
 		);
 		expect(staleSubmit.accepted).toBe(false);
 		expect(staleSubmit.reason).toContain("Epoch mismatch");
@@ -98,7 +98,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 				modifiedFiles: ["src/schema.ts"],
 				testResults: { passed: true, command: "bun test", outputHash: "hash_test" },
 			},
-			attempt1.epoch
+			attempt1.epoch,
 		);
 		expect(validSubmit.accepted).toBe(true);
 
@@ -117,7 +117,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 				modifiedFiles: ["src/api.ts"],
 				testResults: { passed: true, command: "bun test", outputHash: "hash_test_2" },
 			},
-			attempt2.epoch
+			attempt2.epoch,
 		);
 		expect(submit2.accepted).toBe(true);
 
@@ -137,7 +137,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 			userInterrupted: false,
 		});
 
-		const task = store.insertTask({
+		const _task = store.insertTask({
 			id: "task-sec",
 			goalId: "goal-clean-2",
 			title: "Strict edit",
@@ -162,7 +162,7 @@ describe("DUM-E Harness on Clean Pi Base (HARNESS-DESIGN.md & DUM-E-IMPLEMENTATI
 				changedArtifacts: { "/etc/shadow": "bad_hash" },
 				modifiedFiles: ["/etc/shadow"],
 			},
-			attempt.epoch
+			attempt.epoch,
 		);
 
 		const pass = await coordinator.verifyAndIntegrate(attempt.id);

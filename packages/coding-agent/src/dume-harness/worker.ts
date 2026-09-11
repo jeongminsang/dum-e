@@ -6,9 +6,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AttemptRecord, TaskRecord, ResultManifest } from "./types.ts";
 import type { WorkerRunner } from "./coordinator.ts";
 import type { HarnessStore } from "./store.ts";
+import type { AttemptRecord, ResultManifest, TaskRecord } from "./types.ts";
 
 export class DumeWorkerHost implements WorkerRunner {
 	public readonly id: string;

@@ -4,23 +4,33 @@
  * Conforms to HARNESS-DESIGN.md §4 & §5
  */
 
-import { Database } from "bun:sqlite";
+// Dynamic SQLite backend selection: bun:sqlite in Bun, node:sqlite in Node.js
+type SqliteQuery = {
+	run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
+	get(...params: unknown[]): unknown;
+	all(...params: unknown[]): unknown[];
+};
+interface SqliteDatabaseCompat {
+	exec(sql: string): void;
+	query(sql: string): SqliteQuery;
+	transaction<T>(fn: () => T): () => T;
+	close(): void;
+}
+
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
 import type {
-	GoalRecord,
-	TaskRecord,
 	AttemptRecord,
-	VerificationRecord,
+	GoalRecord,
 	IntegrationRecord,
-	ExternalOperationRecord,
-	HarnessEventRecord,
 	ResultManifest,
-} from "./types";
+	TaskRecord,
+	VerificationRecord,
+} from "./types.ts";
 
 export class HarnessStore {
-	private db: Database;
+	private db: SqliteDatabaseCompat;
 	private artifactDir: string;
 
 	constructor(dbPath: string, artifactDir?: string) {
@@ -33,7 +43,41 @@ export class HarnessStore {
 			fs.mkdirSync(this.artifactDir, { recursive: true });
 		}
 
-		this.db = new Database(dbPath);
+		try {
+			const { Database: BunDb } = require("bun:sqlite");
+			this.db = new BunDb(dbPath);
+		} catch {
+			const { DatabaseSync } = require("node:sqlite");
+			const nodeDb = new DatabaseSync(dbPath);
+			this.db = {
+				exec: (sql: string) => nodeDb.exec(sql),
+				query: (sql: string) => {
+					const stmt = nodeDb.prepare(sql);
+					return {
+						run: (...params: unknown[]) => {
+							const res = stmt.run(...params);
+							return { changes: Number(res.changes), lastInsertRowid: res.lastInsertRowid ?? 0 };
+						},
+						get: (...params: unknown[]) => stmt.get(...params) ?? null,
+						all: (...params: unknown[]) => stmt.all(...params),
+					};
+				},
+				transaction: <T>(fn: () => T) => {
+					return () => {
+						nodeDb.exec("BEGIN");
+						try {
+							const res = fn();
+							nodeDb.exec("COMMIT");
+							return res;
+						} catch (err) {
+							nodeDb.exec("ROLLBACK");
+							throw err;
+						}
+					};
+				},
+				close: () => nodeDb.close(),
+			};
+		}
 		this.db.exec("PRAGMA journal_mode = WAL;");
 		this.db.exec("PRAGMA synchronous = NORMAL;");
 		this.db.exec("PRAGMA foreign_keys = ON;");
@@ -166,9 +210,7 @@ export class HarnessStore {
 		}
 
 		if (current.ownerId === ownerId) {
-			this.db
-				.query("UPDATE coordinator_locks SET heartbeatAt = ? WHERE id = 'primary'")
-				.run(now);
+			this.db.query("UPDATE coordinator_locks SET heartbeatAt = ? WHERE id = 'primary'").run(now);
 			return { acquired: true, epoch: current.epoch };
 		}
 
@@ -206,7 +248,7 @@ export class HarnessStore {
 		this.db
 			.query(
 				`INSERT INTO goals (id, title, requirements, requirementsRevision, acceptanceCriteria, status, userInterrupted, createdAt, updatedAt, completedAt)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				record.id,
@@ -218,7 +260,7 @@ export class HarnessStore {
 				record.userInterrupted ? 1 : 0,
 				record.createdAt,
 				record.updatedAt,
-				record.completedAt ?? null
+				record.completedAt ?? null,
 			);
 
 		this.recordEvent(record.id, "goal_created", 1, record);
@@ -260,7 +302,7 @@ export class HarnessStore {
 		this.db
 			.query(
 				`INSERT INTO tasks (id, goalId, title, dependencies, inputManifest, allowedPaths, retryLimit, retryCount, status, activeAttemptId, createdAt, updatedAt)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				record.id,
@@ -274,7 +316,7 @@ export class HarnessStore {
 				record.status,
 				record.activeAttemptId ?? null,
 				record.createdAt,
-				record.updatedAt
+				record.updatedAt,
 			);
 
 		this.recordEvent(record.id, "task_created", 1, record);
@@ -305,7 +347,9 @@ export class HarnessStore {
 	updateTaskStatus(id: string, status: TaskRecord["status"], activeAttemptId?: string): void {
 		const now = Date.now();
 		this.db
-			.query("UPDATE tasks SET status = ?, activeAttemptId = COALESCE(?, activeAttemptId), updatedAt = ? WHERE id = ?")
+			.query(
+				"UPDATE tasks SET status = ?, activeAttemptId = COALESCE(?, activeAttemptId), updatedAt = ? WHERE id = ?",
+			)
 			.run(status, activeAttemptId ?? null, now, id);
 		this.recordEvent(id, "task_status_changed", 0, { status, activeAttemptId });
 	}
@@ -316,7 +360,7 @@ export class HarnessStore {
 		workerId: string,
 		baseCommit: string,
 		worktreePath: string,
-		ttlMs: number = 30000
+		ttlMs: number = 30000,
 	): AttemptRecord {
 		return this.db.transaction(() => {
 			const task = this.getTask(taskId);
@@ -347,7 +391,7 @@ export class HarnessStore {
 			this.db
 				.query(
 					`INSERT INTO attempts (id, taskId, epoch, coordinatorEpoch, workerId, leaseExpiresAt, baseCommit, worktreePath, status, createdAt, updatedAt, heartbeatAt)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				)
 				.run(
 					record.id,
@@ -361,7 +405,7 @@ export class HarnessStore {
 					record.status,
 					record.createdAt,
 					record.updatedAt,
-					record.heartbeatAt
+					record.heartbeatAt,
 				);
 
 			this.db
@@ -381,7 +425,7 @@ export class HarnessStore {
 		const now = Date.now();
 		const res = this.db
 			.query(
-				"UPDATE attempts SET heartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ? WHERE id = ? AND epoch = ? AND status IN ('starting', 'running')"
+				"UPDATE attempts SET heartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ? WHERE id = ? AND epoch = ? AND status IN ('starting', 'running')",
 			)
 			.run(now, now + extendMs, now, attemptId, epoch);
 		return res.changes > 0;
@@ -414,7 +458,7 @@ export class HarnessStore {
 			this.db
 				.query(
 					`INSERT OR REPLACE INTO result_manifests (attemptId, taskId, baseCommit, manifestJson, manifestHash, createdAt)
-					VALUES (?, ?, ?, ?, ?, ?)`
+					VALUES (?, ?, ?, ?, ?, ?)`,
 				)
 				.run(manifest.attemptId, manifest.taskId, manifest.baseCommit, json, hash, now);
 
@@ -422,9 +466,7 @@ export class HarnessStore {
 				.query("UPDATE attempts SET status = 'result_submitted', updatedAt = ? WHERE id = ?")
 				.run(now, manifest.attemptId);
 
-			this.db
-				.query("UPDATE tasks SET status = 'verifying', updatedAt = ? WHERE id = ?")
-				.run(now, manifest.taskId);
+			this.db.query("UPDATE tasks SET status = 'verifying', updatedAt = ? WHERE id = ?").run(now, manifest.taskId);
 
 			this.recordEvent(manifest.attemptId, "result_submitted", attemptEpoch, {
 				manifestHash: hash,
@@ -462,7 +504,7 @@ export class HarnessStore {
 		this.db
 			.query(
 				`INSERT INTO verifications (id, taskId, attemptId, manifestHash, requirementsRevision, command, passed, logsHash, verifiedAt)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				verification.id,
@@ -473,7 +515,7 @@ export class HarnessStore {
 				verification.command,
 				verification.passed ? 1 : 0,
 				verification.logsHash,
-				verification.verifiedAt
+				verification.verifiedAt,
 			);
 	}
 
@@ -481,7 +523,7 @@ export class HarnessStore {
 		this.db
 			.query(
 				`INSERT OR REPLACE INTO integrations (id, goalId, taskId, targetBranch, baseCommit, candidateCommit, status, conflictDetails, integratedAt)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				integration.id,
@@ -492,7 +534,7 @@ export class HarnessStore {
 				integration.candidateCommit,
 				integration.status,
 				integration.conflictDetails ?? null,
-				integration.integratedAt ?? null
+				integration.integratedAt ?? null,
 			);
 	}
 
@@ -505,9 +547,7 @@ export class HarnessStore {
 	private recordEvent(entityId: string, eventType: string, epoch: number, payload: any): void {
 		const now = Date.now();
 		this.db
-			.query(
-				"INSERT INTO harness_events (entityId, eventType, epoch, payload, createdAt) VALUES (?, ?, ?, ?, ?)"
-			)
+			.query("INSERT INTO harness_events (entityId, eventType, epoch, payload, createdAt) VALUES (?, ?, ?, ?, ?)")
 			.run(entityId, eventType, epoch, JSON.stringify(payload), now);
 	}
 

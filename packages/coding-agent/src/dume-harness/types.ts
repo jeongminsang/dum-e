@@ -3,13 +3,7 @@
  * Based on HARNESS-DESIGN.md & DUM-E-IMPLEMENTATION.md
  */
 
-export type GoalStatus =
-	| "pending"
-	| "active"
-	| "verifying"
-	| "completed"
-	| "cancelled"
-	| "needs_attention";
+export type GoalStatus = "pending" | "active" | "verifying" | "completed" | "cancelled" | "needs_attention";
 
 export type TaskStatus =
 	| "blocked"
@@ -34,12 +28,7 @@ export type AttemptStatus =
 	| "outcome_unknown"
 	| "cancelled";
 
-export type ExternalOperationStatus =
-	| "intent_recorded"
-	| "dispatched"
-	| "confirmed"
-	| "failed"
-	| "outcome_unknown";
+export type ExternalOperationStatus = "intent_recorded" | "dispatched" | "confirmed" | "failed" | "outcome_unknown";
 
 export interface GoalRecord {
 	id: string;

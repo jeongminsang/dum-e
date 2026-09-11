@@ -6,14 +6,8 @@
  */
 
 import * as crypto from "node:crypto";
-import { HarnessStore } from "./store.ts";
-import type {
-	TaskRecord,
-	AttemptRecord,
-	ResultManifest,
-	VerificationRecord,
-	IntegrationRecord,
-} from "./types.ts";
+import type { HarnessStore } from "./store.ts";
+import type { AttemptRecord, IntegrationRecord, ResultManifest, TaskRecord, VerificationRecord } from "./types.ts";
 
 export interface WorkerRunner {
 	id: string;
@@ -25,7 +19,7 @@ export class DumeCoordinator {
 	public store: HarnessStore;
 	public readonly coordinatorId: string;
 	public epoch: number = 1;
-	private heartbeatTimer?: Timer;
+	private heartbeatTimer?: NodeJS.Timeout;
 	private workers: Map<string, WorkerRunner> = new Map();
 
 	constructor(store: HarnessStore, coordinatorId?: string) {
@@ -69,7 +63,7 @@ export class DumeCoordinator {
 					await this.verifyAndIntegrate(attempt.id);
 				} else {
 					console.warn(
-						`[DUM-E Coordinator] Recovering stale attempt ${attempt.id} for task ${attempt.taskId}. Worker lease expired.`
+						`[DUM-E Coordinator] Recovering stale attempt ${attempt.id} for task ${attempt.taskId}. Worker lease expired.`,
 					);
 					this.store.updateTaskStatus(attempt.taskId, "needs_attention");
 				}
@@ -77,7 +71,12 @@ export class DumeCoordinator {
 		}
 	}
 
-	async dispatchTask(taskId: string, workerId: string, baseCommit: string, worktreePath: string): Promise<AttemptRecord> {
+	async dispatchTask(
+		taskId: string,
+		workerId: string,
+		baseCommit: string,
+		worktreePath: string,
+	): Promise<AttemptRecord> {
 		const task = this.store.getTask(taskId);
 		if (!task) throw new Error(`Task ${taskId} not found`);
 
@@ -88,13 +87,7 @@ export class DumeCoordinator {
 			}
 		}
 
-		const attempt = this.store.createAttempt(
-			taskId,
-			this.epoch,
-			workerId,
-			baseCommit,
-			worktreePath
-		);
+		const attempt = this.store.createAttempt(taskId, this.epoch, workerId, baseCommit, worktreePath);
 
 		const worker = this.workers.get(workerId);
 		if (worker) {
@@ -133,7 +126,7 @@ export class DumeCoordinator {
 
 		// 1. Allowed paths whitelist check
 		for (const modFile of manifest.modifiedFiles) {
-			const isAllowed = task.allowedPaths.some(prefix => modFile.startsWith(prefix));
+			const isAllowed = task.allowedPaths.some((prefix) => modFile.startsWith(prefix));
 			if (!isAllowed) {
 				console.error(`[DUM-E Verification] File ${modFile} violates allowedPaths whitelist!`);
 				this.store.updateTaskStatus(task.id, "failed");
@@ -182,7 +175,7 @@ export class DumeCoordinator {
 
 		// Check if goal fully completed
 		const allTasks = this.store.getTasksByGoal(goal.id);
-		const allCompleted = allTasks.every(t => t.status === "completed");
+		const allCompleted = allTasks.every((t) => t.status === "completed");
 		if (allCompleted) {
 			this.store.updateGoalStatus(goal.id, "completed", Date.now());
 			console.log(`[DUM-E Goal Complete] Goal ${goal.id} successfully finished!`);
