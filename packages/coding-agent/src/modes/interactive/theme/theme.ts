@@ -15,6 +15,7 @@ import type { SourceInfo } from "../../../core/source-info.ts";
 import { closeWatcher, watchWithErrorHandler } from "../../../utils/fs-watch.ts";
 import { highlight, supportsLanguage } from "../../../utils/syntax-highlight.ts";
 import { stripBom } from "../../../utils/text.ts";
+import { BUILTIN_DARK_THEME, BUILTIN_LIGHT_THEME } from "./builtin-themes.ts";
 
 // ============================================================================
 // Types & Schema
@@ -406,9 +407,25 @@ function getBuiltinThemes(): Record<string, ThemeJson> {
 		const themesDir = getThemesDir();
 		const darkPath = path.join(themesDir, "dark.json");
 		const lightPath = path.join(themesDir, "light.json");
+		let darkTheme = BUILTIN_DARK_THEME;
+		let lightTheme = BUILTIN_LIGHT_THEME;
+		try {
+			if (fs.existsSync(darkPath)) {
+				darkTheme = JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson;
+			}
+		} catch {
+			// Fall back to embedded builtin dark theme
+		}
+		try {
+			if (fs.existsSync(lightPath)) {
+				lightTheme = JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson;
+			}
+		} catch {
+			// Fall back to embedded builtin light theme
+		}
 		BUILTIN_THEMES = {
-			dark: JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson,
-			light: JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson,
+			dark: darkTheme,
+			light: lightTheme,
 		};
 	}
 	return BUILTIN_THEMES;

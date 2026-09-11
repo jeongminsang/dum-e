@@ -7,7 +7,8 @@
 		"packages/session-backends/*"
 	],
 	"scripts": {
-		"dume": "bun packages/coding-agent/src/cli.ts dume",
+		"dume": "bun packages/coding-agent/src/cli.ts",
+		"harness": "bun packages/coding-agent/src/cli.ts dume",
 		"doctor": "bun packages/coding-agent/src/cli.ts dume doctor",
 		"status": "bun packages/coding-agent/src/cli.ts dume status",
 		"test": "bun test packages/coding-agent/test/dume-harness.test.ts",
