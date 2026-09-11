@@ -56,7 +56,7 @@ sh scripts/install.sh --dev
 
 ## 🚀 Quick Start & CLI Usage
 
-DUM-E combines **GJC's plan-first control aesthetics** with a **resilient multi-agent execution harness**:
+DUM-E provides plan-first control with a **resilient autonomous multi-agent execution harness**:
 
 ```bash
 # 1. Check DUM-E harness health & SQLite WAL subsystem

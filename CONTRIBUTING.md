@@ -1,14 +1,14 @@
-# Contributing to pi
+# Contributing to DUM-E
 
 This guide exists to save both sides time.
 
 ## Philosophy
 
-First things first: **pi's core is minimal**.
+First things first: **DUM-E's core is minimal and resilient**.
 
 If your feature does not belong in the core, it should be an extension. PRs that bloat the core will likely be rejected.
 
-Pi's core exists to be minimal and to be extensible so that it can be influenced and manipulated by extensions.  Even hook points for extensions however should be well considered and discussed to avoid adding unmaintainable bloat and complex interactions.
+DUM-E's foundation exists to be clean, fault-tolerant, and extensible so that it can orchestrate autonomous missions reliably.
 
 ## The One Rule
 
@@ -16,7 +16,7 @@ Pi's core exists to be minimal and to be extensible so that it can be influenced
 
 Using AI to write code is fine. Submitting AI-generated slop without understanding it is not.
 
-If you use an agent, run it from the `pi` root directory so it picks up `AGENTS.md` automatically. Your agent must follow the rules and guidelines in that file.
+If you use an agent, run it from the `dum-e` root directory so it picks up `AGENTS.md` automatically. Your agent must follow the rules and guidelines in that file.
 
 ## Contribution Gate
 
