@@ -34,16 +34,22 @@
 
 ## 📦 Installation & Setup
 
-You can install DUM-E globally or run directly via Bun / Node:
+### 1. One-line Standalone Installer (macOS & Linux, No Bun/Node required)
+```bash
+curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh | sh
+```
 
+### 2. From Source / Development
 ```bash
 # Clone and install dependencies
 git clone https://github.com/jeongminsang/dum-e.git
 cd dum-e
 bun install
 
-# Link globally as `dume`
+# Link globally as `dume` CLI
 bun --cwd=packages/coding-agent link
+# Or compile local standalone binary
+sh scripts/install.sh --dev
 ```
 
 ---
