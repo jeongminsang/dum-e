@@ -8,15 +8,15 @@ import { installCodingAgentConsumer, packReleasePackages, smokeTestCodingAgentCo
 
 const packages = [
 	{ directory: "packages/chord", name: "@earendil-works/chord" },
-	{ directory: "packages/telemetry", name: "@earendil-works/pi-telemetry" },
-	{ directory: "packages/ai", name: "@earendil-works/pi-ai" },
-	{ directory: "packages/tui", name: "@earendil-works/pi-tui" },
-	{ directory: "packages/agent", name: "@earendil-works/pi-agent-core" },
-	{ directory: "packages/protocol", name: "@earendil-works/pi-protocol" },
-	{ directory: "packages/client", name: "@earendil-works/pi-client" },
-	{ directory: "packages/session-backends/sqlite-node", name: "@earendil-works/pi-session-backend-sqlite-node" },
-	{ directory: "packages/server", name: "@earendil-works/pi-server" },
-	{ directory: "packages/coding-agent", name: "@earendil-works/pi-coding-agent" },
+	{ directory: "packages/telemetry", name: "@dum-e/telemetry" },
+	{ directory: "packages/ai", name: "@dum-e/ai" },
+	{ directory: "packages/tui", name: "@dum-e/tui" },
+	{ directory: "packages/agent", name: "@dum-e/agent-core" },
+	{ directory: "packages/protocol", name: "@dum-e/protocol" },
+	{ directory: "packages/client", name: "@dum-e/client" },
+	{ directory: "packages/session-backends/sqlite-node", name: "@dum-e/session-backend-sqlite-node" },
+	{ directory: "packages/server", name: "@dum-e/server" },
+	{ directory: "packages/coding-agent", name: "@dum-e/coding-agent" },
 ];
 
 function printUsage() {

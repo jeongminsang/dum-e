@@ -26,8 +26,8 @@ async function check(t, manifest, source, extraFiles = {}) {
 
 // #9132: workspace resolution and installing every release package masked a missing runtime dependency.
 test("rejects undeclared imports even when the workspace package exists", async (t) => {
-	const result = await check(t, {}, 'export { createUnixServer } from "@earendil-works/pi-server/unix";', {
-		"packages/server/package.json": JSON.stringify({ name: "@earendil-works/pi-server", version: "1.0.0" }),
+	const result = await check(t, {}, 'export { createUnixServer } from "@dum-e/server/unix";', {
+		"packages/server/package.json": JSON.stringify({ name: "@dum-e/server", version: "1.0.0" }),
 	});
 	assert.equal(result.status, 1);
 	assert.match(result.stderr, /src[\\/]index\.ts:1: @earendil-works\/pi-server\/unix is not declared/);

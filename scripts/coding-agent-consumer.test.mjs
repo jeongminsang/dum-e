@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { installCodingAgentConsumer, packReleasePackages, smokeTestCodingAgentConsumer } from "./coding-agent-consumer.mjs";
 
-const codingAgentName = "@earendil-works/pi-coding-agent";
+const codingAgentName = "@dum-e/coding-agent";
 const devPackages = ["pi-client", "pi-protocol", "pi-server"].map((name) => `@earendil-works/${name}`);
 
 function createFixture(t, { importServer = false, declareServer = false } = {}) {
@@ -30,7 +30,7 @@ function createFixture(t, { importServer = false, declareServer = false } = {}) 
 				bin: { pi: "dist/bundle/cli.js" },
 				dependencies: {
 					"@earendil-works/chord": "1.0.0",
-					...(declareServer ? { "@earendil-works/pi-server": "1.0.0" } : {}),
+					...(declareServer ? { "@dum-e/server": "1.0.0" } : {}),
 				},
 				devDependencies: Object.fromEntries(devPackages.map((name) => [name, "1.0.0"])),
 			} : {}),
@@ -38,7 +38,7 @@ function createFixture(t, { importServer = false, declareServer = false } = {}) 
 		const files = {
 			"package.json": JSON.stringify(manifest),
 			"dist/index.js": isAgent ? `
-${importServer ? 'import "@earendil-works/pi-server";' : ""}
+${importServer ? 'import "@dum-e/server";' : ""}
 import { marker } from "@earendil-works/chord";
 if (marker !== "local tarball") throw new Error("Wrong Chord artifact");
 export function createAgentSession() {}
@@ -72,9 +72,9 @@ test("installs only coding-agent directly and uses overrides only for declared r
 	}
 	smokeTestCodingAgentConsumer(directory);
 
-	const nested = join(directory, "node_modules", codingAgentName, "node_modules/@earendil-works/pi-server");
+	const nested = join(directory, "node_modules", codingAgentName, "node_modules/@dum-e/server");
 	mkdirSync(nested, { recursive: true });
-	writeFileSync(join(nested, "package.json"), JSON.stringify({ name: "@earendil-works/pi-server", version: "1.0.0" }));
+	writeFileSync(join(nested, "package.json"), JSON.stringify({ name: "@dum-e/server", version: "1.0.0" }));
 	assert.throws(() => smokeTestCodingAgentConsumer(directory), /pi-server must not be installed/);
 	rmSync(nested, { recursive: true });
 

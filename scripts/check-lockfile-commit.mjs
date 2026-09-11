@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 
-const allowValue = process.env.PI_ALLOW_LOCKFILE_CHANGE;
+const allowValue = process.env.DUME_ALLOW_LOCKFILE_CHANGE;
 const allowed = allowValue === "1" || allowValue === "true" || allowValue === "yes";
 
 function git(args) {
@@ -116,5 +116,5 @@ if (summary.length > 0) {
 
 console.error("");
 console.error("If this lockfile change is intentional, commit with:");
-console.error("  PI_ALLOW_LOCKFILE_CHANGE=1 git commit ...");
+console.error("  DUME_ALLOW_LOCKFILE_CHANGE=1 git commit ...");
 process.exit(1);
