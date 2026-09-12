@@ -146,3 +146,69 @@ fn test_verification_path_whitelist_rejection() {
     };
     assert!(!verify_allowed_paths(&task, &bad_manifest));
 }
+
+#[tokio::test]
+async fn test_real_process_crash_and_recovery() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("harness.db");
+    let artifacts_dir = dir.path().join("artifacts");
+
+    // 1. Coordinator 1 starts and acquires lock
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let lock = store.acquire_coordinator_lock("coord_main", "proc_parent_1", 10_000).unwrap();
+        assert_eq!(lock.epoch, 1);
+
+        // Create goal and task
+        store.create_goal("g_crash", "Crash Test Goal").unwrap();
+        let task = Task {
+            id: "t_crash".to_string(),
+            goal_id: "g_crash".to_string(),
+            title: "Task".to_string(),
+            description: "Will crash".to_string(),
+            status: TaskStatus::Ready,
+            dependencies: vec![],
+            acceptance_criteria: vec!["true".to_string()],
+            allowed_paths: None,
+            target_branch: "main".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        store.create_task(&task).unwrap();
+
+        // Worker begins running attempt
+        let _att = store.create_attempt("att_c1", "t_crash", 1, "w1", "/tmp/wt_c1", 10_000).unwrap();
+
+        // Simulate abrupt SIGKILL of coordinator 1 without release_coordinator_lock:
+        // (Coordinator drops without clean exit, lease remains in DB)
+    }
+
+    // Fast-forward or expire lease:
+    // In real scenario, after lease_expires_at passes (or forced failover):
+    {
+        // 2. New Coordinator 2 starts up, recovers state
+        let store2 = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        
+        // Coordinator 2 acquires lock (taking over with incremented monotonic epoch)
+        // Set lease expired in SQLite to simulate time passing
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE coordinator_locks SET lease_expires_at = 0", []).unwrap();
+        }
+
+        let lock2 = store2.acquire_coordinator_lock("coord_main", "proc_parent_2", 10_000).unwrap();
+        assert_eq!(lock2.epoch, 2); // Monotonic increase to 2
+
+        // Crash recovery: uncommitted attempt from epoch 1 transitions to needs_attention
+        let (ready, needs_attention, _) = store2.recover_state(lock2.epoch).unwrap();
+        assert_eq!(ready.len(), 0);
+        assert_eq!(needs_attention.len(), 1);
+        assert_eq!(needs_attention[0].id, "att_c1");
+        assert_eq!(needs_attention[0].status, AttemptStatus::NeedsAttention);
+
+        // Stale worker att_c1 late submission is rejected
+        let stale = store2.submit_attempt_result("att_c1", 1, "commit_stale", "hash_stale");
+        assert!(stale.is_err(), "Late worker submission after coordinator crash must be rejected");
+    }
+}
+
