@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dume-core",
+    "crates/dume-store",
+    "crates/dume-git",
+    "crates/dume-worker",
+    "crates/dume-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jeongminsang/dum-e"
+authors = ["DUM-E Contributors"]
+
+[workspace.dependencies]
+dume-core = { path = "crates/dume-core" }
+dume-store = { path = "crates/dume-store" }
+dume-git = { path = "crates/dume-git" }
+dume-worker = { path = "crates/dume-worker" }
+
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3.17"
+clap = { version = "4.5", features = ["derive"] }

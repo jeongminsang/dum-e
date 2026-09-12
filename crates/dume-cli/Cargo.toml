@@ -1,0 +1,27 @@
+[package]
+name = "dume-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dume"
+path = "src/main.rs"
+
+[dependencies]
+dume-core = { workspace = true }
+dume-store = { workspace = true }
+dume-git = { workspace = true }
+dume-worker = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
