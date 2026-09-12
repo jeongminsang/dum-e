@@ -25,6 +25,8 @@ impl WorkerHost {
         _coordinator_epoch: i64,
         worktree_path: &Path,
         test_command: Option<String>,
+        task_prompt: Option<String>,
+        model: Option<String>,
         cancel_token: CancellationToken,
     ) -> Result<ResultManifest> {
         let mut cmd = Command::new(&self.binary_path);
@@ -39,6 +41,13 @@ impl WorkerHost {
         if let Some(ref tc) = test_command {
             cmd.args(["--test-command", tc]);
         }
+        if let Some(ref tp) = task_prompt {
+            cmd.args(["--task-prompt", tp]);
+        }
+        if let Some(ref m) = model {
+            cmd.args(["--model", m]);
+        }
+
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

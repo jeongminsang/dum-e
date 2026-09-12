@@ -37,7 +37,12 @@ enum Commands {
         worktree_path: String,
         #[arg(long)]
         test_command: Option<String>,
+        #[arg(long)]
+        task_prompt: Option<String>,
+        #[arg(long, default_value = "claude-3-5-sonnet")]
+        model: String,
     },
+
     /// Show current harness status
     Status {
         #[arg(long, default_value = ".dume/rust/harness.db")]
@@ -61,8 +66,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::fmt::init();
             run_coordinator(&db_path, &artifacts_dir, &repo_path).await?;
         }
-        Some(Commands::Worker { attempt_id, worktree_path, test_command }) => {
-            run_worker_child(&attempt_id, &worktree_path, test_command.as_deref()).await?;
+        Some(Commands::Worker { attempt_id, worktree_path, test_command, task_prompt, model }) => {
+            run_worker_child(&attempt_id, &worktree_path, test_command.as_deref(), task_prompt.as_deref(), &model).await?;
         }
         Some(Commands::Status { db_path, artifacts_dir }) => {
             print_status(&db_path, &artifacts_dir)?;
@@ -84,6 +89,8 @@ async fn run_worker_child(
     attempt_id: &str,
     worktree_path: &str,
     test_command: Option<&str>,
+    task_prompt: Option<&str>,
+    model: &str,
 ) -> Result<()> {
     let path = Path::new(worktree_path);
 
@@ -94,14 +101,25 @@ async fn run_worker_child(
     };
     print!("{}", serialize_message(&progress_msg)?);
 
-    // 1. Run test command if provided
+    // 1. Run actual Agent Loop if task prompt is present
+    if let Some(prompt) = task_prompt {
+        let agent = dume_worker::AgentLoop::new(path, model);
+        let progress_exec = WorkerToHostMessage::Progress {
+            attempt_id: attempt_id.to_string(),
+            message: format!("Agent loop executing prompt: {}", prompt),
+        };
+        print!("{}", serialize_message(&progress_exec)?);
+        let _ = agent.run_task(prompt).await?;
+    }
+
+    // 2. Run test command if provided
     let mut test_results = Vec::new();
     if let Some(cmd) = test_command {
         let result = WorkerExecutor::run_test_command(path, cmd).await?;
         test_results.push(result);
     }
 
-    // 2. Finalize manifest (detect modified files, commit changes)
+    // 3. Finalize manifest (detect modified files, commit changes)
     let manifest = WorkerExecutor::finalize_manifest(
         attempt_id,
         path,
@@ -116,6 +134,7 @@ async fn run_worker_child(
 
     Ok(())
 }
+
 
 async fn run_coordinator(
     db_path: &str,
@@ -157,9 +176,131 @@ async fn run_coordinator(
         }
     });
 
-    // 4. Recover and verify any pending results
+    // 4. Recover and verify any pending results from prior crashes
     for attempt in ready_for_verify {
         verify_and_integrate_attempt(&store, repo_path, &attempt, epoch).await?;
+    }
+
+    // 5. Continuous Coordinator Dispatch Loop:
+    // Polls active goals, evaluates TaskDag for ready tasks, spawns workers, and verifies results
+    let worker_host = dume_worker::WorkerHost::new(
+        std::env::current_exe()?.to_str().context("Failed to get current executable path")?,
+    );
+
+    let repo_p = Path::new(repo_path);
+    let mut idle_iterations = 0;
+
+    while running.load(Ordering::Relaxed) {
+        let active_goals = store.list_active_goals()?;
+        if active_goals.is_empty() {
+            idle_iterations += 1;
+            if idle_iterations >= 3 {
+                tracing::info!("No active goals pending in harness. Coordinator loop exiting.");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        idle_iterations = 0;
+        let mut any_work_done = false;
+
+        for goal in &active_goals {
+            let tasks = store.list_tasks_for_goal(&goal.id)?;
+            if tasks.is_empty() {
+                continue;
+            }
+
+            let all_completed = tasks.iter().all(|t| t.status == TaskStatus::Completed);
+            if all_completed {
+                store.update_goal_status(&goal.id, GoalStatus::Completed)?;
+                tracing::info!("Goal {} all tasks completed successfully", goal.id);
+                continue;
+            }
+
+            let any_failed = tasks.iter().any(|t| t.status == TaskStatus::Failed || t.status == TaskStatus::NeedsAttention);
+            if any_failed {
+                store.update_goal_status(&goal.id, GoalStatus::Failed)?;
+                tracing::warn!("Goal {} has failed/blocked tasks", goal.id);
+                continue;
+            }
+
+            let dag = match dume_core::dag::TaskDag::new(&tasks) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("DAG error for goal {}: {}", goal.id, e);
+                    store.update_goal_status(&goal.id, GoalStatus::Failed)?;
+                    continue;
+                }
+            };
+
+            let ready_tasks = dag.get_ready_tasks();
+            for task in ready_tasks {
+                any_work_done = true;
+                let attempt_id = format!("att_{}_{}", task.id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis());
+                let worktree_dir = repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
+
+                // 1. Create isolated worktree for worker
+                dume_git::worktree::create_git_worktree(repo_p, &worktree_dir, &task.target_branch).await?;
+
+                // 2. Record attempt in store under current coordinator epoch
+                let attempt = store.create_attempt(
+                    &attempt_id,
+                    &task.id,
+                    epoch,
+                    &owner_id,
+                    worktree_dir.to_str().unwrap(),
+                    30_000,
+                )?;
+
+                tracing::info!("Dispatched task {} (attempt {}) to worker", task.id, attempt.id);
+
+                // 3. Spawn separate OS worker process
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let manifest_res = worker_host.run_attempt(
+                    &attempt.id,
+                    &task.id,
+                    epoch,
+                    &worktree_dir,
+                    task.acceptance_criteria.first().cloned(),
+                    Some(task.description.clone()),
+                    Some("claude-3-5-sonnet".to_string()),
+                    cancel_token,
+                ).await;
+
+                match manifest_res {
+                    Ok(manifest) => {
+                        // Save manifest artifact
+                        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+                        let manifest_hash = store.artifacts.save_artifact(manifest_json.as_bytes())?;
+
+                        // Submit attempt result under epoch guard
+                        store.submit_attempt_result(
+                            &attempt.id,
+                            epoch,
+                            &manifest.candidate_commit,
+                            &manifest_hash,
+                        )?;
+
+                        let updated_attempt = store.get_attempt(&attempt.id)?;
+                        verify_and_integrate_attempt(&store, repo_path, &updated_attempt, epoch).await?;
+                    }
+                    Err(e) => {
+                        tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
+                        store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
+                        store.update_task_status(&task.id, TaskStatus::Failed)?;
+                    }
+
+                }
+
+                // Clean up worker worktree
+                let _ = dume_git::worktree::remove_git_worktree(repo_p, &worktree_dir).await;
+            }
+        }
+
+        if !any_work_done {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     // Stop coordinator gracefully
@@ -169,6 +310,7 @@ async fn run_coordinator(
 
     Ok(())
 }
+
 
 pub async fn verify_and_integrate_attempt(
     store: &HarnessStore,

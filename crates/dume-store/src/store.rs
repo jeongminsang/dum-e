@@ -183,7 +183,31 @@ impl HarnessStore {
         })
     }
 
+    pub fn list_active_goals(&self) -> Result<Vec<Goal>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, description, status, created_at, updated_at FROM goals WHERE status NOT IN ('completed', 'failed')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(2)?;
+            let status: GoalStatus = serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
+            Ok(Goal {
+                id: row.get(0)?,
+                description: row.get(1)?,
+                status,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        let mut goals = Vec::new();
+        for r in rows {
+            goals.push(r?);
+        }
+        Ok(goals)
+    }
+
     pub fn update_goal_status(&self, id: &str, status: GoalStatus) -> Result<(), StoreError> {
+
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
         let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
