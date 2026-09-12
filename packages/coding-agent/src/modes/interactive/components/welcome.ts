@@ -162,10 +162,11 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): string[] {
-		const boxWidth = Math.max(0, termWidth - 2);
+		// Respect viewport bounds strictly
+		const boxWidth = Math.max(0, termWidth);
 		if (boxWidth < 10) return [];
 
-		const dualContentWidth = boxWidth - 3;
+		const dualContentWidth = boxWidth - 3; // 3 border vertical bars: │ ... │ ... │
 		const minLeftCol = 22;
 		const minRightCol = 28;
 		const showRightColumn = dualContentWidth >= minLeftCol + minRightCol;
@@ -242,32 +243,34 @@ export class WelcomeComponent implements Component {
 		const titlePrefix = hChar.repeat(3);
 		const titleStyled = theme.fg("dim", titlePrefix) + theme.fg("muted", title);
 		const titleVis = visibleWidth(titlePrefix) + visibleWidth(title);
-		const headerSpace = boxWidth - 2;
+		const headerSpace = Math.max(0, boxWidth - 2);
 		const topBorder =
 			titleVis >= headerSpace
 				? tl + truncateToWidth(titleStyled, headerSpace) + tr
 				: tl + titleStyled + theme.fg("dim", hChar.repeat(headerSpace - titleVis)) + tr;
 
-		const bottomBorder = bl + theme.fg("dim", hChar.repeat(boxWidth - 2)) + br;
+		const bottomBorder = bl + theme.fg("dim", hChar.repeat(headerSpace)) + br;
 
 		const lines: string[] = [topBorder];
 		const maxRows = showRightColumn ? Math.max(leftLines.length, rightLines.length) : leftLines.length;
 
 		for (let i = 0; i < maxRows; i++) {
 			const left = leftLines[i] ?? "";
-			const leftPadded = truncateToWidth(left, leftCol) + " ".repeat(Math.max(0, leftCol - visibleWidth(left)));
+			const leftTruncated = truncateToWidth(left, leftCol);
+			const leftPadded = leftTruncated + " ".repeat(Math.max(0, leftCol - visibleWidth(leftTruncated)));
 
 			if (showRightColumn) {
 				const right = rightLines[i] ?? "";
-				const rightPadded =
-					truncateToWidth(right, rightCol) + " ".repeat(Math.max(0, rightCol - visibleWidth(right)));
-				lines.push(`${v} ${leftPadded} ${v} ${rightPadded} ${v}`);
+				const rightTruncated = truncateToWidth(right, rightCol);
+				const rightPadded = rightTruncated + " ".repeat(Math.max(0, rightCol - visibleWidth(rightTruncated)));
+				lines.push(`${v}${leftPadded}${v}${rightPadded}${v}`);
 			} else {
-				lines.push(`${v} ${leftPadded} ${v}`);
+				lines.push(`${v}${leftPadded}${v}`);
 			}
 		}
 
 		lines.push(bottomBorder);
-		return lines;
+		// Double check all lines to ensure zero lines exceed boxWidth
+		return lines.map((l) => truncateToWidth(l, boxWidth));
 	}
 }
