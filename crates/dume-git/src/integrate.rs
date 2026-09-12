@@ -83,6 +83,27 @@ pub async fn integrate_candidate_commit(
         .await?;
     let integration_commit = String::from_utf8_lossy(&head_rev.stdout).trim().to_string();
 
+    // 5. Update target branch reference to integration_commit
+    let update_ref = Command::new("git")
+        .args([
+            "-C",
+            repo_str,
+            "update-ref",
+            &format!("refs/heads/{}", target_branch),
+            &integration_commit,
+            &base_commit,
+        ])
+        .output()
+        .await?;
+
+    if !update_ref.status.success() {
+        let stderr = String::from_utf8_lossy(&update_ref.stderr);
+        let _ = crate::worktree::remove_git_worktree(repo_path, integration_worktree_dir).await;
+        return Ok(IntegrationResult::Failed {
+            error: format!("Failed to update branch ref: {}", stderr),
+        });
+    }
+
     // Clean up integration worktree
     let _ = crate::worktree::remove_git_worktree(repo_path, integration_worktree_dir).await;
 
@@ -91,3 +112,4 @@ pub async fn integrate_candidate_commit(
         integration_commit,
     })
 }
+

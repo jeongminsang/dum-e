@@ -212,3 +212,149 @@ async fn test_real_process_crash_and_recovery() {
     }
 }
 
+#[tokio::test]
+async fn test_e2e_full_agent_workflow() {
+    // 1. Initialize temporary Git repository
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+
+    // Initialize git repository with initial commit
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+
+    // Create initial commit
+    let readme_file = repo_path.join("README.md");
+    std::fs::write(&readme_file, "# Initial Repo\n").unwrap();
+    run_git(&["add", "README.md"]);
+    run_git(&["commit", "-m", "Initial commit"]);
+
+    let db_path = repo_path.join(".dume/rust/harness.db");
+    let artifacts_dir = repo_path.join(".dume/rust/artifacts");
+    let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+
+    // 2. Create Goal and Task with executable acceptance criteria
+    let goal = store.create_goal("g_e2e", "Add math function").unwrap();
+    let task = Task {
+        id: "t_add_feature".to_string(),
+        goal_id: goal.id.clone(),
+        title: "Create math module".to_string(),
+        description: "Create math.txt with 42".to_string(),
+        status: TaskStatus::Ready,
+        dependencies: vec![],
+        acceptance_criteria: vec!["test -f math.txt".to_string(), "grep -q '42' math.txt".to_string()],
+        allowed_paths: Some(vec!["math.txt".to_string()]),
+        target_branch: "main".to_string(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    store.create_task(&task).unwrap();
+
+    // 3. Simulate Worker execution in isolated worktree
+    let wt_dir = repo_path.join(".dume/rust/worktrees/wt_e2e");
+    dume_git::worktree::create_git_worktree(repo_path, &wt_dir, "main").await.unwrap();
+
+    let attempt = store.create_attempt(
+        "att_e2e_1",
+        &task.id,
+        1,
+        "worker_e2e",
+        wt_dir.to_str().unwrap(),
+        30_000,
+    ).unwrap();
+
+    // Worker modifies file according to task
+    let target_file = wt_dir.join("math.txt");
+    std::fs::write(&target_file, "42\n").unwrap();
+
+    // Worker commits changes
+    let candidate_commit = dume_git::commit::commit_worktree_changes(&wt_dir, "feat: add math.txt with 42").await.unwrap();
+
+    // Worker creates result manifest
+    let manifest = ResultManifest {
+        attempt_id: attempt.id.clone(),
+        candidate_commit: candidate_commit.clone(),
+        modified_files: vec!["math.txt".to_string()],
+        changed_artifacts: vec![],
+        test_results: vec![TestResult {
+            name: "test -f math.txt".to_string(),
+            passed: true,
+            exit_code: 0,
+            stdout: "".to_string(),
+            stderr: "".to_string(),
+        }],
+        summary: "Created math.txt".to_string(),
+    };
+
+    let manifest_bytes = serde_json::to_string(&manifest).unwrap();
+    let manifest_hash = store.artifacts.save_artifact(manifest_bytes.as_bytes()).unwrap();
+
+    // Worker submits attempt result
+    store.submit_attempt_result(&attempt.id, 1, &candidate_commit, &manifest_hash).unwrap();
+    let submitted_attempt = store.get_attempt(&attempt.id).unwrap();
+    assert_eq!(submitted_attempt.status, AttemptStatus::ResultSubmitted);
+
+    // Clean up worker worktree
+    dume_git::worktree::remove_git_worktree(repo_path, &wt_dir).await.unwrap();
+
+    // 4. Coordinator runs independent verification and cherry-pick integration
+    let repo_str = repo_path.to_str().unwrap();
+    let int_wt = repo_path.join(".dume/rust/integration-worktree");
+
+    // Run independent acceptance test on candidate commit
+    let verify_wt = repo_path.join(".dume/rust/verify-wt");
+    dume_git::worktree::create_git_worktree(repo_path, &verify_wt, &candidate_commit).await.unwrap();
+
+    let check_cmd = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("test -f math.txt && grep -q '42' math.txt")
+        .current_dir(&verify_wt)
+        .output()
+        .unwrap();
+    assert!(check_cmd.status.success(), "Independent acceptance check passed");
+    dume_git::worktree::remove_git_worktree(repo_path, &verify_wt).await.unwrap();
+
+    // Perform cherry-pick integration
+    let int_res = dume_git::integrate::integrate_candidate_commit(
+        repo_path,
+        "main",
+        &candidate_commit,
+        &int_wt,
+    ).await.unwrap();
+
+    match int_res {
+        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => {
+            store.update_attempt_status(&attempt.id, AttemptStatus::Accepted).unwrap();
+            store.update_task_status(&task.id, TaskStatus::Completed).unwrap();
+            store.update_goal_status(&goal.id, GoalStatus::Completed).unwrap();
+
+            // Verify target branch actually contains the change and integration commit
+            let main_head = std::process::Command::new("git")
+                .args(["-C", repo_str, "rev-parse", "main"])
+                .output()
+                .unwrap();
+            let main_sha = String::from_utf8_lossy(&main_head.stdout).trim().to_string();
+            assert_eq!(main_sha, integration_commit, "Target branch ref was updated to integration commit");
+
+            // Verify math.txt exists in main
+            let show_file = std::process::Command::new("git")
+                .args(["-C", repo_str, "show", "main:math.txt"])
+                .output()
+                .unwrap();
+            assert!(show_file.status.success());
+            assert_eq!(String::from_utf8_lossy(&show_file.stdout).trim(), "42");
+        }
+        _ => panic!("Integration expected to succeed"),
+    }
+}
+
+
