@@ -83,6 +83,11 @@ enum Commands {
         #[arg(long, default_value = ".dume/rust/artifacts")]
         artifacts_dir: String,
     },
+    /// List available models across Anthropic, OpenAI, and Google
+    Models {
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Login via browser OAuth flow or API key
     Login {
         #[arg(long, default_value = "anthropic")]
@@ -135,6 +140,20 @@ async fn main() -> Result<()> {
             };
             store.create_task(&task)?;
             println!("Created task '{}' under goal '{}'", task.id, task.goal_id);
+        }
+        Some(Commands::Models { provider }) => {
+            let all = dume_provider::ModelCatalog::list_all_builtin_models()?;
+            println!("{:<30} {:<12} {:<10} {:<12} {}", "MODEL ID", "PROVIDER", "REASONING", "MAX TOKENS", "NAME");
+            println!("{}", "-".repeat(80));
+            for m in all {
+                if let Some(ref p) = provider {
+                    if !m.provider.eq_ignore_ascii_case(p) {
+                        continue;
+                    }
+                }
+                let max_tok = m.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
+                println!("{:<30} {:<12} {:<10} {:<12} {}", m.id, m.provider, m.reasoning, max_tok, m.name);
+            }
         }
         Some(Commands::Login { provider }) => {
             run_login(&provider).await?;

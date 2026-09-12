@@ -225,6 +225,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                     StreamEvent::TextDelta(delta) => {
                         app.streaming_text.push_str(&delta);
                     }
+                    StreamEvent::ToolCallDelta { name, arguments_delta, .. } => {
+                        if let Some(tool_name) = name {
+                            app.streaming_text.push_str(&format!("\n[Tool Call: {}] ", tool_name));
+                        }
+                        if !arguments_delta.is_empty() {
+                            app.streaming_text.push_str(&arguments_delta);
+                        }
+                    }
                     StreamEvent::Completed { .. } => {
                         let final_text = std::mem::take(&mut app.streaming_text);
                         app.messages.push(ChatMessage::assistant(final_text));
@@ -235,7 +243,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.streaming_text.clear();
                         app.is_busy = false;
                     }
-                    _ => {}
                 }
             }
         }
