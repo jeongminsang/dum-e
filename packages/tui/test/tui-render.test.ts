@@ -226,8 +226,8 @@ describe("TUI crash dump without configured log directory", () => {
 		// isolate the test by pointing the temp directory at a fresh directory rather
 		// than sharing the real one with concurrent test runs. os.tmpdir() reads
 		// TMPDIR on POSIX and TEMP/TMP on Windows, so override all three.
-		const crashDir = mkdtempSync(join(tmpdir(), "pi-tui-crash-"));
-		const crashLogPath = join(crashDir, "pi-tui-crash.log");
+		const crashDir = mkdtempSync(join(tmpdir(), "dume-tui-crash-"));
+		const crashLogPath = join(crashDir, "dume-tui-crash.log");
 		const restoreTmpdirEnv = overrideEnv(["TMPDIR", "TEMP", "TMP"], crashDir);
 		try {
 			const terminal = new VirtualTerminal(40, 10);

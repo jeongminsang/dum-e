@@ -516,7 +516,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			output.append("\x1b[2K"); // Clear current line
 			if (!isImage && visibleWidth(line) > width) {
 				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(this.logDirectory ?? os.tmpdir(), "pi-tui-crash.log");
+				const crashLogPath = path.join(this.logDirectory ?? os.tmpdir(), "dume-tui-crash.log");
 				const crashData = [
 					`Crash at ${new Date().toISOString()}`,
 					`Terminal width: ${width}`,
