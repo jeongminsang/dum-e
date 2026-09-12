@@ -150,6 +150,15 @@ pub async fn verify_and_integrate_attempt(
             )
             .await?;
 
+            // Exact failure injection hook: test asks coordinator to terminate immediately after git ref updated but before Applied DB write
+            if std::env::var("DUME_TEST_CRASH_AFTER_GIT_UPDATE").map(|v| v == "1").unwrap_or(false) {
+                // Signal to parent process via stdout exactly at the boundary
+                println!("DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                // Immediate ungraceful exit (simulating SIGKILL crash)
+                std::process::exit(137);
+            }
+
             // Transition DB record to Applied
             let applied_record = Integration {
                 status: IntegrationStatus::Applied,

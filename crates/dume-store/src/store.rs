@@ -165,6 +165,15 @@ impl HarnessStore {
         Ok(())
     }
 
+    pub fn force_expire_coordinator_lock(&self, coordinator_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coordinator_locks SET lease_expires_at = 0, owner_id = NULL WHERE coordinator_id = ?1",
+            params![coordinator_id],
+        )?;
+        Ok(())
+    }
+
     // --- Goal & Task Management ---
 
     pub fn create_goal(&self, id: &str, description: &str) -> Result<Goal, StoreError> {
@@ -457,7 +466,7 @@ impl HarnessStore {
     pub fn record_verification(&self, v: &Verification) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO verifications (attempt_id, epoch, passed, allowed_paths_passed, acceptance_command_passed, manifest_hash, details, verified_at)
+            "INSERT OR REPLACE INTO verifications (attempt_id, epoch, passed, allowed_paths_passed, acceptance_command_passed, manifest_hash, details, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 v.attempt_id,
@@ -779,37 +788,90 @@ impl HarnessStore {
         Ok(out)
     }
 
+    pub fn list_active_context_messages(&self, session_id: &str) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT role, content, tool_calls_json, tool_call_id, is_compacted_summary
+            FROM session_messages
+            WHERE session_id = ?1 AND is_archived = 0
+            ORDER BY is_compacted_summary DESC, message_index ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |r| {
+            let role: String = r.get(0)?;
+            let content: String = r.get(1)?;
+            let tool_calls: Option<String> = r.get(2)?;
+            let tool_call_id: Option<String> = r.get(3)?;
+            let is_summary: i32 = r.get(4)?;
+            Ok((role, content, tool_calls, tool_call_id, is_summary == 1))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn compact_session(&self, session_id: &str, summary_content: &str, retain_last_n: usize) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let total_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+        let active_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0",
             params![session_id],
             |r| r.get(0),
         )?;
 
-        if (total_count as usize) <= retain_last_n {
+        if (active_count as usize) <= retain_last_n {
             return Ok(());
         }
 
-        let cutoff_idx: i64 = conn.query_row(
-            "SELECT message_index FROM session_messages WHERE session_id = ?1 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
+        let mut cutoff_idx: i64 = conn.query_row(
+            "SELECT message_index FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
             params![session_id, retain_last_n as i64],
             |r| r.get(0),
         )?;
 
-        // Delete older messages before cutoff
+        // ATOMIC PAIR PRESERVATION:
+        // If cutoff_idx lands on an assistant message with tool_calls, do not split it from following tool results!
+        // Move cutoff forward to include the tool results in the archive window so the active context never starts with an orphaned tool result.
+        let is_tool_call_boundary: bool = conn.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
+            params![session_id, cutoff_idx],
+            |r| r.get::<_, i64>(0).map(|c| c > 0),
+        ).unwrap_or(false);
+
+        if is_tool_call_boundary {
+            // Find max index of corresponding tool response
+            if let Ok(next_res_idx) = conn.query_row(
+                "SELECT message_index FROM session_messages WHERE session_id = ?1 AND message_index > ?2 AND role = 'tool' ORDER BY message_index ASC LIMIT 1",
+                params![session_id, cutoff_idx],
+                |r| r.get::<_, i64>(0),
+            ) {
+                cutoff_idx = next_res_idx;
+            }
+        }
+
+        // ARCHIVE without deleting (Original raw audit history is completely preserved!)
         conn.execute(
-            "DELETE FROM session_messages WHERE session_id = ?1 AND message_index <= ?2",
+            "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND message_index <= ?2",
             params![session_id, cutoff_idx],
         )?;
 
-        // Insert new compacted summary as message 0 (or prepended)
+        let max_idx: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(message_index), -1) + 1 FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+
+        // Insert new compacted summary into active context with new unique index
         conn.execute(
             r#"
-            INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, created_at)
-            VALUES (?1, ?2, 'system', ?3, NULL, NULL, 1, ?4)
+            INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
+            VALUES (?1, ?2, 'system', ?3, NULL, NULL, 1, 0, ?4)
             "#,
-            params![session_id, cutoff_idx, summary_content, now_millis()],
+            params![session_id, max_idx, summary_content, now_millis()],
         )?;
 
         Ok(())
@@ -902,13 +964,17 @@ mod tests {
         let summary = "Summary of conversation: Task 1 and Task 2 were completed.";
         store.compact_session(session_id, summary, 2).unwrap();
 
-        let compacted_msgs = store.list_session_messages(session_id).unwrap();
-        // Cutoff deleted 3 messages, replaced with 1 summary, keeping last 2 -> total 3 messages
-        assert_eq!(compacted_msgs.len(), 3);
-        assert_eq!(compacted_msgs[0].0, "system");
-        assert!(compacted_msgs[0].1.contains("Summary of conversation"));
-        assert!(compacted_msgs[0].4, "Must be flagged as summary");
-        assert_eq!(compacted_msgs[1].1, "Done task 2");
-        assert_eq!(compacted_msgs[2].1, "Now do task 3");
+        let raw_audit_msgs = store.list_session_messages(session_id).unwrap();
+        // Raw audit log is fully preserved: 5 original messages + 1 summary = 6 total entries
+        assert_eq!(raw_audit_msgs.len(), 6, "Audit trail must preserve all raw historical messages");
+
+        // Active context returned to model contains only compacted summary + recent unarchived messages
+        let active_msgs = store.list_active_context_messages(session_id).unwrap();
+        assert_eq!(active_msgs.len(), 3, "Active context must contain summary + 2 retained messages");
+        assert_eq!(active_msgs[0].0, "system");
+        assert!(active_msgs[0].1.contains("Summary of conversation"));
+        assert!(active_msgs[0].4, "Must be flagged as summary");
+        assert_eq!(active_msgs[1].1, "Done task 2");
+        assert_eq!(active_msgs[2].1, "Now do task 3");
     }
 }

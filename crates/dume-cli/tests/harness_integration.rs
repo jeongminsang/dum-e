@@ -901,7 +901,7 @@ async fn test_r5_real_os_process_sigkill_recovery() {
     std::process::Command::new("git").args(["-C", repo_str, "add", "."]).output().unwrap();
     std::process::Command::new("git").args(["-C", repo_str, "commit", "-m", "initial"]).output().unwrap();
 
-    let base_head = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
+    let _base_head = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
 
     // Prepare candidate cherry-pick
     let candidate_commit = {
@@ -913,42 +913,51 @@ async fn test_r5_real_os_process_sigkill_recovery() {
         c
     };
 
-    let int_wt = repo_path.join("wt_int");
-    let prep_res = dume_git::integrate::prepare_candidate_cherry_pick(
-        &repo_path,
-        "main",
-        &candidate_commit,
-        &int_wt,
-    ).await.unwrap();
+    // 1. Initial process: Set up candidate attempt ready for verification
+    let _attempt = {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        store.create_goal("goal_r5", "R5 Crash Boundary Test").unwrap();
+        let task = Task {
+            id: "task_r5".to_string(),
+            goal_id: "goal_r5".to_string(),
+            title: "Task R5".to_string(),
+            description: "Test crash boundary".to_string(),
+            status: TaskStatus::Ready,
+            dependencies: vec![],
+            acceptance_criteria: vec!["true".to_string()],
+            allowed_paths: None,
+            target_branch: "main".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        store.create_task(&task).unwrap();
 
-    let integration_commit = match prep_res {
-        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => integration_commit,
-        _ => panic!("Expected prep success"),
+        let manifest = ResultManifest {
+            attempt_id: "att_r5_1".to_string(),
+            candidate_commit: candidate_commit.clone(),
+            modified_files: vec!["sigkill.txt".to_string()],
+            changed_artifacts: vec![],
+            test_results: vec![],
+            summary: "sigkill feature".to_string(),
+        };
+        let manifest_bytes = serde_json::to_string(&manifest).unwrap();
+        let manifest_hash = store.artifacts.save_artifact(manifest_bytes.as_bytes()).unwrap();
+
+        let att = store.create_attempt("att_r5_1", "task_r5", 1, "worker_1", repo_str, 10_000).unwrap();
+        store.submit_attempt_result("att_r5_1", 1, &candidate_commit, &manifest_hash).unwrap();
+        att
     };
 
-    // 1. Initial process: Write Pending record
-    {
-        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
-        let pending = Integration {
-            target_branch: "main".to_string(),
-            base_commit: base_head.clone(),
-            candidate_commit: candidate_commit.clone(),
-            integration_commit: Some(integration_commit.clone()),
-            status: IntegrationStatus::Pending,
-            error_message: None,
-            integrated_at: 1000,
-        };
-        store.record_integration(&pending).unwrap();
-    }
-
-    // Git ref update succeeds
-    dume_git::integrate::apply_branch_update(&repo_path, "main", &integration_commit, &base_head).await.unwrap();
-
-    // 2. Spawn a REAL OS child process that simulates coordinator startup
-    // We launch `cargo run --bin dume -- coordinator ...` or run the test binary in a real process
-    // To test actual OS process SIGKILL:
+    // 2. Spawn real coordinator OS child process WITH exact crash hook enabled:
+    // DUME_TEST_CRASH_AFTER_GIT_UPDATE=1
+    // The coordinator will:
+    // 1) Verify attempt
+    // 2) Write Pending to SQLite
+    // 3) Successfully update Git ref via CAS
+    // 4) Emit boundary signal "DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED"
+    // 5) Exit immediately with code 137 (SIGKILL crash emulation) BEFORE writing Applied!
     let dume_bin = env!("CARGO_BIN_EXE_dume");
-    let mut child = std::process::Command::new(dume_bin)
+    let child = std::process::Command::new(dume_bin)
         .args([
             "coordinator",
             "--db-path",
@@ -958,31 +967,73 @@ async fn test_r5_real_os_process_sigkill_recovery() {
             "--repo-path",
             repo_str,
         ])
+        .env("DUME_TEST_CRASH_AFTER_GIT_UPDATE", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("Failed to spawn real dume coordinator process");
+        .expect("Failed to spawn real dume coordinator process with failure injection");
 
     let pid = child.id();
     assert!(pid > 0, "Real child process must have valid OS PID");
 
-    // Wait for coordinator to start and perform startup reconciliation
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    // Wait for child to exit at exact crash boundary
+    let child_res = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&child_res.stdout);
+    assert!(stdout.contains("DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED"), "Child must reach exact crash boundary between Git ref update and DB write");
+    assert_eq!(child_res.status.code(), Some(137), "Child must crash immediately with exit code 137");
 
-    // Send actual SIGKILL to the real OS child process
-    let _ = child.kill();
-    let _ = child.wait();
-
-    // Verify after SIGKILL:
-    // The coordinator's startup reconciliation executed before it was killed,
-    // or if a NEW process starts up now, it must reconcile to Applied cleanly!
+    // 3. Verify exact crash state:
+    // - Git ref WAS updated to integration_commit
+    // - SQLite record is STILL 'pending' (crash-before-db-record confirmed!)
     {
-        let store2 = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
-        let rec = store2.get_integration("main", &candidate_commit).unwrap();
-        assert!(rec.is_some(), "Integration record must exist");
-        let rec = rec.unwrap();
-        assert_eq!(rec.status, IntegrationStatus::Applied, "Pre-crash pending integration must be reconciled to Applied");
-        assert_eq!(rec.integration_commit.as_deref(), Some(integration_commit.as_str()));
+        let store_crashed = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let pending = store_crashed.get_integration("main", &candidate_commit).unwrap().expect("Pending record must exist in DB");
+        assert_eq!(pending.status, IntegrationStatus::Pending, "Database must still be in Pending state at crash moment");
+        let expected_integration_commit = pending.integration_commit.clone().expect("Pending record must record planned integration_commit");
+
+        let current_git_ref = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
+        assert_eq!(current_git_ref, expected_integration_commit, "Git ref must have already advanced to integration commit");
+    }
+
+    // 4. Recovery: Start a NEW, fresh coordinator process (without failure injection hook)
+    // Mark crashed process's lease expired so recovery coordinator takes over immediately
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        store.force_expire_coordinator_lock("default_coordinator").unwrap();
+    }
+
+    let recovery_child = std::process::Command::new(dume_bin)
+        .args([
+            "coordinator",
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--artifacts-dir",
+            artifacts_dir.to_str().unwrap(),
+            "--repo-path",
+            repo_str,
+        ])
+        .output()
+        .expect("Failed to run recovery coordinator process");
+
+    let rec_stdout = String::from_utf8_lossy(&recovery_child.stdout);
+    let rec_stderr = String::from_utf8_lossy(&recovery_child.stderr);
+    assert!(recovery_child.status.success(), "Recovery coordinator must exit successfully. stdout: {}, stderr: {}", rec_stdout, rec_stderr);
+
+    // 5. Verify post-recovery state:
+    // DB record is now Applied, no duplicate cherry-picks exist in git log
+    {
+        let store_recovered = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let record = store_recovered.get_integration("main", &candidate_commit).unwrap().expect("Record must exist");
+        assert_eq!(record.status, IntegrationStatus::Applied, "Recovered coordinator must reconcile Pending to Applied");
+
+        // Verify git log has exactly ONE cherry-pick commit
+        let log_out = std::process::Command::new("git")
+            .args(["-C", repo_str, "log", "--oneline", "main"])
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&log_out.stdout);
+        let count = log_str.lines().filter(|l| l.contains("feat: sigkill feature")).count();
+        assert_eq!(count, 1, "Exactly one cherry-pick commit in history, no duplicate integration");
     }
 }
 
