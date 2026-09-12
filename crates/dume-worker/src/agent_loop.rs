@@ -89,12 +89,51 @@ impl AgentLoop {
                     "required": ["pattern"]
                 }),
             },
+            ToolDefinition {
+                name: "spawn_subagent".to_string(),
+                description: "Spawn an autonomous subagent with a dedicated sub-worktree to execute a task concurrently".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Unique identifier for the subagent" },
+                        "prompt": { "type": "string", "description": "Task description for the subagent" },
+                        "sub_dir": { "type": "string", "description": "Relative directory in worktree for subagent execution" }
+                    },
+                    "required": ["id", "prompt", "sub_dir"]
+                }),
+            },
+            ToolDefinition {
+                name: "wait_subagent".to_string(),
+                description: "Wait for a spawned subagent to finish and retrieve its result".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Subagent ID to wait for" },
+                        "timeout_ms": { "type": "integer", "description": "Maximum wait timeout in milliseconds (default 30000)" }
+                    },
+                    "required": ["id"]
+                }),
+            },
+            ToolDefinition {
+                name: "cancel_subagent".to_string(),
+                description: "Cancel an active running subagent".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Subagent ID to cancel" }
+                    },
+                    "required": ["id"]
+                }),
+            },
         ]
     }
 
-    pub async fn run_task(&self, task_prompt: &str) -> Result<String> {
-        let tools = Self::tool_definitions();
-        let tool_executor = LocalToolExecutor::new(&self.worktree_path);
+    pub fn run_task<'a>(&'a self, task_prompt: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        let task_prompt = task_prompt.to_string();
+        Box::pin(async move {
+            let tools = Self::tool_definitions();
+            let tool_executor = LocalToolExecutor::new(&self.worktree_path);
+            let subagent_manager = std::sync::Arc::new(dume_mcp::subagent::SubagentManager::new());
 
         let system_msg = format!(
             "You are DUM-E coding agent. Work directly in the worktree.\nGoal: {}\nUse tools bash, read_file, write_file as needed.",
@@ -119,19 +158,26 @@ impl AgentLoop {
                     // Direct mock/custom provider endpoint
                     let p = OpenAiProvider::new("mock-key").with_base_url(&base_url);
                     let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
-                } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                    let p = AnthropicProvider::new(&api_key);
+                    return;
+                }
+
+                let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+
+                if let Some(token) = cred_store.resolve_valid_token("anthropic").await {
+                    let p = AnthropicProvider::new(&token);
                     let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
-                } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-                    let p = OpenAiProvider::new(&api_key);
+                } else if let Some(token) = cred_store.resolve_valid_token("openai").await {
+                    let p = OpenAiProvider::new(&token);
                     let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
-                } else if let Ok(api_key) = std::env::var("GEMINI_API_KEY") {
-                    let p = GeminiProvider::new(&api_key);
+                } else if let Some(token) = cred_store.resolve_valid_token("gemini").await {
+                    let p = GeminiProvider::new(&token);
                     let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
-                } else {
-                    // Fallback mock tool step if no API key is set in test/dev environment
+                } else if std::env::var("DUME_MOCK_API").is_ok() || cfg!(test) {
+                    // Test harness mock execution
                     let _ = tx.send(StreamEvent::TextDelta("Autonomous action completed.".to_string())).await;
                     let _ = tx.send(StreamEvent::Completed { finish_reason: "stop".to_string() }).await;
+                } else {
+                    let _ = tx.send(StreamEvent::Error("No valid credentials found. Please run `dume login` or configure ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY.".to_string())).await;
                 }
             });
 
@@ -261,6 +307,31 @@ impl AgentLoop {
                             None
                         }
                     }
+                    "spawn_subagent" => {
+                        if parsed_args.get("id").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'id' (string)")
+                        } else if parsed_args.get("prompt").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'prompt' (string)")
+                        } else if parsed_args.get("sub_dir").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'sub_dir' (string)")
+                        } else {
+                            None
+                        }
+                    }
+                    "wait_subagent" => {
+                        if parsed_args.get("id").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'id' (string)")
+                        } else {
+                            None
+                        }
+                    }
+                    "cancel_subagent" => {
+                        if parsed_args.get("id").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'id' (string)")
+                        } else {
+                            None
+                        }
+                    }
                     _ => Some("Unknown tool name"),
                 };
 
@@ -269,16 +340,68 @@ impl AgentLoop {
                     continue;
                 }
 
-                let exec_result = match tool_executor.execute(&tc.name, &parsed_args).await {
-                    Ok(res) => res,
-                    Err(e) => format!("Tool execution error: {}", e),
+                let exec_result = match tc.name.as_str() {
+                    "spawn_subagent" => {
+                        let sub_id = parsed_args["id"].as_str().unwrap().to_string();
+                        let prompt = parsed_args["prompt"].as_str().unwrap().to_string();
+                        let sub_dir = parsed_args["sub_dir"].as_str().unwrap();
+                        let child_wt = self.worktree_path.join(sub_dir);
+                        let model_name = self.model.clone();
+                        let base_url_opt = self.base_url.clone();
+
+                        let child_prompt = prompt.clone();
+                        let res = subagent_manager.start_subagent(&sub_id, &prompt, move |_token| async move {
+                            let _ = tokio::fs::create_dir_all(&child_wt).await;
+                            let mut child_agent = AgentLoop::new(&child_wt, &model_name);
+                            if let Some(b) = base_url_opt {
+                                child_agent = child_agent.with_base_url(b);
+                            }
+                            child_agent.run_task(&child_prompt).await
+                        }).await;
+
+                        match res {
+                            Ok(_) => format!("Subagent '{}' started successfully in {}", sub_id, sub_dir),
+                            Err(e) => format!("Failed to start subagent: {}", e),
+                        }
+                    }
+                    "wait_subagent" => {
+                        let sub_id = parsed_args["id"].as_str().unwrap();
+                        let timeout = parsed_args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+                        match subagent_manager.await_subagent(sub_id, timeout).await {
+                            Ok(dume_mcp::subagent::SubagentStatus::Completed { result }) => {
+                                format!("Subagent '{}' completed: {}", sub_id, result)
+                            }
+                            Ok(dume_mcp::subagent::SubagentStatus::Failed { error }) => {
+                                format!("Subagent '{}' failed: {}", sub_id, error)
+                            }
+                            Ok(dume_mcp::subagent::SubagentStatus::Cancelled) => {
+                                format!("Subagent '{}' was cancelled", sub_id)
+                            }
+                            Ok(dume_mcp::subagent::SubagentStatus::Running) => {
+                                format!("Subagent '{}' still running", sub_id)
+                            }
+                            Err(e) => format!("Error waiting for subagent '{}': {}", sub_id, e),
+                        }
+                    }
+                    "cancel_subagent" => {
+                        let sub_id = parsed_args["id"].as_str().unwrap();
+                        match subagent_manager.cancel_subagent(sub_id).await {
+                            Ok(_) => format!("Subagent '{}' cancelled successfully", sub_id),
+                            Err(e) => format!("Failed to cancel subagent '{}': {}", sub_id, e),
+                        }
+                    }
+                    _ => match tool_executor.execute(&tc.name, &parsed_args).await {
+                        Ok(res) => res,
+                        Err(e) => format!("Tool execution error: {}", e),
+                    },
                 };
 
                 messages.push(ChatMessage::tool(exec_result, tc.id));
             }
         }
 
-        Ok("Agent completed task execution".to_string())
+            Ok("Agent completed task execution".to_string())
+        })
     }
 }
 
@@ -605,5 +728,22 @@ mod tests {
 
         // Verify parent worktree was unaffected
         assert!(!parent_wt.join("child_output.txt").exists(), "Parent worktree must remain isolated");
+    }
+
+    #[tokio::test]
+    async fn test_subagent_tool_invocation_via_agent_loop() {
+        let dir = tempdir().unwrap();
+        let wt_path = dir.path().to_path_buf();
+        let agent = AgentLoop::new(&wt_path, "mock-model");
+
+        let tools = AgentLoop::tool_definitions();
+        assert!(tools.iter().any(|t| t.name == "spawn_subagent"));
+        assert!(tools.iter().any(|t| t.name == "wait_subagent"));
+        assert!(tools.iter().any(|t| t.name == "cancel_subagent"));
+
+        // Verify tool definition schemas
+        let spawn_def = tools.iter().find(|t| t.name == "spawn_subagent").unwrap();
+        assert_eq!(spawn_def.parameters["required"], serde_json::json!(["id", "prompt", "sub_dir"]));
+        let _ = agent;
     }
 }

@@ -1075,6 +1075,7 @@ async fn test_release_binary_cli_lifecycle_end_to_end() {
     dume_git::worktree::create_git_worktree(&repo_path, &wt, "main").await.unwrap();
 
     let worker_out = std::process::Command::new(dume_bin)
+        .env("DUME_MOCK_API", "1")
         .args([
             "worker",
             "--attempt-id",

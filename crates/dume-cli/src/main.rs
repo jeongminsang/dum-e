@@ -53,6 +53,36 @@ enum Commands {
         #[arg(long, default_value = "claude-3-5-sonnet")]
         model: String,
     },
+    /// Create a new goal
+    Goal {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        description: String,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+    /// Create a new task under a goal
+    Task {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        goal_id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        description: String,
+        #[arg(long)]
+        test_command: Option<String>,
+        #[arg(long, default_value = "main")]
+        target_branch: String,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
     /// Login via browser OAuth flow or API key
     Login {
         #[arg(long, default_value = "anthropic")]
@@ -82,6 +112,29 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Interactive { model }) => {
             dume_tui::run_tui(&model).await?;
+        }
+        Some(Commands::Goal { id, description, db_path, artifacts_dir }) => {
+            let store = HarnessStore::open(&db_path, &artifacts_dir)?;
+            let goal = store.create_goal(&id, &description)?;
+            println!("Created goal '{}': {}", goal.id, goal.description);
+        }
+        Some(Commands::Task { id, goal_id, title, description, test_command, target_branch, db_path, artifacts_dir }) => {
+            let store = HarnessStore::open(&db_path, &artifacts_dir)?;
+            let task = Task {
+                id: id.clone(),
+                goal_id: goal_id.clone(),
+                title: title.clone(),
+                description,
+                status: TaskStatus::Ready,
+                dependencies: vec![],
+                acceptance_criteria: test_command.into_iter().collect(),
+                allowed_paths: None,
+                target_branch,
+                created_at: 0,
+                updated_at: 0,
+            };
+            store.create_task(&task)?;
+            println!("Created task '{}' under goal '{}'", task.id, task.goal_id);
         }
         Some(Commands::Login { provider }) => {
             run_login(&provider).await?;
@@ -449,5 +502,30 @@ fn print_status(db_path: &str, artifacts_dir: &str) -> Result<()> {
     let store = HarnessStore::open(db_path, artifacts_dir)?;
     println!("=== DUM-E Harness Status (Rust) ===");
     println!("Database: {}", store.db_path.display());
+
+    // Coordinator lock status
+    if let Ok(Some(lock)) = store.get_coordinator_lock("default_coordinator") {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let active = lock.lease_expires_at > now;
+        println!("Coordinator: epoch={}, owner={}, active={}",
+            lock.epoch,
+            lock.owner_id.as_deref().unwrap_or("<none>"),
+            active
+        );
+    } else {
+        println!("Coordinator: idle / not initialized");
+    }
+
+    // Goals breakdown
+    let goals = store.list_all_goals()?;
+    println!("Goals: {} total", goals.len());
+    for g in goals {
+        let tasks = store.list_tasks_for_goal(&g.id)?;
+        println!("  - [{:?}] {} ({}): {} tasks", g.status, g.id, g.description, tasks.len());
+        for t in tasks {
+            println!("      * [{:?}] {} - {}", t.status, t.id, t.title);
+        }
+    }
+
     Ok(())
 }

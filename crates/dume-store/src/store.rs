@@ -174,6 +174,25 @@ impl HarnessStore {
         Ok(())
     }
 
+    pub fn get_coordinator_lock(&self, coordinator_id: &str) -> Result<Option<CoordinatorLock>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT coordinator_id, owner_id, epoch, lease_expires_at, heartbeat_at FROM coordinator_locks WHERE coordinator_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![coordinator_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(CoordinatorLock {
+                coordinator_id: row.get(0)?,
+                owner_id: row.get(1)?,
+                epoch: row.get(2)?,
+                lease_expires_at: row.get(3)?,
+                heartbeat_at: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     // --- Goal & Task Management ---
 
     pub fn create_goal(&self, id: &str, description: &str) -> Result<Goal, StoreError> {
@@ -196,6 +215,29 @@ impl HarnessStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, description, status, created_at, updated_at FROM goals WHERE status NOT IN ('completed', 'failed')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(2)?;
+            let status: GoalStatus = serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
+            Ok(Goal {
+                id: row.get(0)?,
+                description: row.get(1)?,
+                status,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        let mut goals = Vec::new();
+        for r in rows {
+            goals.push(r?);
+        }
+        Ok(goals)
+    }
+
+    pub fn list_all_goals(&self) -> Result<Vec<Goal>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, description, status, created_at, updated_at FROM goals ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             let status_str: String = row.get(2)?;

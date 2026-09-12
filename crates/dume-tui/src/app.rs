@@ -32,7 +32,7 @@ impl App {
         Self {
             messages: Vec::new(),
             input_buffer: String::new(),
-            cursor_pos: 0,
+            cursor_pos: 0, // In characters, not bytes!
             streaming_text: String::new(),
             scroll_offset: 0,
             is_busy: false,
@@ -42,14 +42,23 @@ impl App {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        self.input_buffer.insert(self.cursor_pos, c);
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        if self.cursor_pos > chars.len() {
+            self.cursor_pos = chars.len();
+        }
+        chars.insert(self.cursor_pos, c);
         self.cursor_pos += 1;
+        self.input_buffer = chars.into_iter().collect();
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor_pos > 0 && !self.input_buffer.is_empty() {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        if self.cursor_pos > 0 && !chars.is_empty() {
             self.cursor_pos -= 1;
-            self.input_buffer.remove(self.cursor_pos);
+            if self.cursor_pos < chars.len() {
+                chars.remove(self.cursor_pos);
+            }
+            self.input_buffer = chars.into_iter().collect();
         }
     }
 
@@ -60,7 +69,8 @@ impl App {
     }
 
     pub fn cursor_right(&mut self) {
-        if self.cursor_pos < self.input_buffer.len() {
+        let char_count = self.input_buffer.chars().count();
+        if self.cursor_pos < char_count {
             self.cursor_pos += 1;
         }
     }
