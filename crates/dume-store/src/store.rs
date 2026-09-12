@@ -22,6 +22,8 @@ pub enum StoreError {
     },
     #[error("Epoch fencing violation: entity epoch {actual} != required {expected}")]
     FencingViolation { expected: i64, actual: i64 },
+    #[error("Stale epoch submission: attempt epoch {attempt_epoch} is superceded by active coordinator epoch {current_coordinator_epoch}")]
+    StaleEpoch { attempt_epoch: i64, current_coordinator_epoch: i64 },
     #[error("Entity not found: {0}")]
     NotFound(String),
 }
@@ -352,7 +354,8 @@ impl HarnessStore {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
 
-        // Strict epoch fencing guard
+        // Strict epoch fencing guard:
+        // 1. Worker's reported epoch must match attempt's recorded epoch
         let attempt_epoch: i64 = conn.query_row(
             "SELECT coordinator_epoch FROM attempts WHERE id = ?1",
             params![attempt_id],
@@ -366,11 +369,25 @@ impl HarnessStore {
             });
         }
 
+        // 2. If coordinator lock has already advanced to a higher epoch (e.g., after crash/failover),
+        // any delayed submissions from old epochs MUST be rejected (R2 guard)
+        let current_epoch: i64 = conn
+            .query_row("SELECT COALESCE(MAX(epoch), 0) FROM coordinator_locks", [], |r| r.get(0))?;
+
+        if current_epoch > 0 && attempt_epoch < current_epoch {
+            return Err(StoreError::StaleEpoch {
+                attempt_epoch,
+                current_coordinator_epoch: current_epoch,
+            });
+        }
+
+
         conn.execute(
             "UPDATE attempts SET status = 'result_submitted', candidate_commit = ?1, manifest_hash = ?2, updated_at = ?3 WHERE id = ?4",
             params![candidate_commit, manifest_hash, now, attempt_id],
         )?;
         Ok(())
+
     }
 
     pub fn update_attempt_status(&self, attempt_id: &str, status: AttemptStatus) -> Result<(), StoreError> {

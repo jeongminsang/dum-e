@@ -60,13 +60,17 @@ fn test_harness_dag_and_epoch_fencing() {
     let lock2 = store.acquire_coordinator_lock("coord_main", "host_process_2", 5000).unwrap();
     assert_eq!(lock2.epoch, 2); // Monotonic increase to epoch 2
 
-    // 5. Stale worker from epoch 1 tries to submit result -> rejected by epoch fencing guard (R2)
+    // 5. Stale worker from epoch 1 tries to submit result -> MUST BE REJECTED by epoch fencing guard (R2)
     let stale_submit = store.submit_attempt_result("att_1", 1, "commit_old", "hash_old");
-    assert!(stale_submit.is_ok()); // The attempt itself was recorded at epoch 1, so matching its own coordinator_epoch is allowed
+    assert!(
+        matches!(stale_submit, Err(StoreError::StaleEpoch { attempt_epoch: 1, current_coordinator_epoch: 2 })),
+        "Stale epoch submission from old coordinator epoch must be rejected"
+    );
 
-    // If another epoch submits to an attempt recorded under epoch 1, it must fail:
+    // If another invalid epoch submits to an attempt recorded under epoch 1, it must fail with FencingViolation:
     let foreign_submit = store.submit_attempt_result("att_1", 99, "commit_fake", "hash_fake");
     assert!(matches!(foreign_submit, Err(StoreError::FencingViolation { .. })));
+
 
     // 6. External operation dispatched without confirmation before crash (R3)
     store.record_external_operation_intent("op_1", "att_1", "deploy_prod_1", "Deploy service").unwrap();
@@ -74,9 +78,11 @@ fn test_harness_dag_and_epoch_fencing() {
 
     // 7. Crash recovery inspection (R1 & R3)
     let (ready_verify, needs_attention, unknown_ops) = store.recover_state(lock2.epoch).unwrap();
-    assert_eq!(ready_verify.len(), 1);
-    assert_eq!(ready_verify[0].id, "att_1");
-    assert_eq!(needs_attention.len(), 0);
+    // Stale attempt was not successfully submitted before crash, so it transitions to needs_attention:
+    assert_eq!(ready_verify.len(), 0);
+    assert_eq!(needs_attention.len(), 1);
+    assert_eq!(needs_attention[0].id, "att_1");
+
 
     // Operation was automatically moved to OutcomeUnknown upon unconfirmed crash recovery
     assert_eq!(unknown_ops.len(), 1);

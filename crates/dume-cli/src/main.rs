@@ -181,34 +181,51 @@ pub async fn verify_and_integrate_attempt(
 
     tracing::info!("Verifying candidate commit {} for task {}", candidate_commit, task.id);
 
-    // 1. Independent acceptance verification:
-    // Run acceptance criteria command directly in candidate worktree or candidate commit
-    let mut acceptance_passed = true;
-    for cmd in &task.acceptance_criteria {
-        let wt = Path::new(&attempt.worktree_path);
-        let test_res = WorkerExecutor::run_test_command(wt, cmd).await?;
-        if !test_res.passed {
-            acceptance_passed = false;
-            tracing::warn!("Acceptance command '{}' failed with exit code {}", cmd, test_res.exit_code);
-            break;
-        }
-    }
+    let repo_p = Path::new(repo_path);
+    let verify_wt_dir = repo_p.join(format!(".dume/rust/verify-wt-{}", attempt.id));
 
-    // 2. Verify allowed paths whitelist
-    let manifest_bytes = if let Some(ref h) = attempt.manifest_hash {
-        store.artifacts.get_artifact(h).ok()
+    // Create an isolated worktree checked out directly to candidate_commit to verify immutability
+    dume_git::worktree::create_git_worktree(repo_p, &verify_wt_dir, candidate_commit).await?;
+
+    // 1. Independent acceptance verification:
+    // Run acceptance criteria command strictly in the isolated candidate worktree
+    let (acceptance_passed, acceptance_details) = if task.acceptance_criteria.is_empty() {
+        // Empty criteria cannot be assumed as success
+        (false, "No acceptance criteria defined for task".to_string())
     } else {
-        None
+        let mut passed = true;
+        let mut detail = "Acceptance criteria passed".to_string();
+        for cmd in &task.acceptance_criteria {
+            let test_res = WorkerExecutor::run_test_command(&verify_wt_dir, cmd).await?;
+            if !test_res.passed {
+                passed = false;
+                detail = format!("Acceptance command '{}' failed with exit code {}", cmd, test_res.exit_code);
+                tracing::warn!("{}", detail);
+                break;
+            }
+        }
+        (passed, detail)
     };
 
-    let allowed_paths_passed = if let Some(bytes) = manifest_bytes {
-        if let Ok(manifest) = serde_json::from_slice::<dume_core::manifest::ResultManifest>(&bytes) {
-            verify_allowed_paths(&task, &manifest)
-        } else {
-            true
+    // Clean up verification worktree immediately
+    let _ = dume_git::worktree::remove_git_worktree(repo_p, &verify_wt_dir).await;
+
+    // 2. Verify allowed paths whitelist
+    // Missing manifest or corrupted manifest must FAIL verification (evidence is mandatory)
+    let (allowed_paths_passed, manifest_hash_str) = match &attempt.manifest_hash {
+        Some(h) => {
+            match store.artifacts.get_artifact(h) {
+                Ok(bytes) => match serde_json::from_slice::<dume_core::manifest::ResultManifest>(&bytes) {
+                    Ok(manifest) => {
+                        let ok = verify_allowed_paths(&task, &manifest);
+                        (ok, h.clone())
+                    }
+                    Err(_) => (false, h.clone()), // Corrupt manifest -> Fail
+                },
+                Err(_) => (false, h.clone()),     // Missing artifact bytes -> Fail
+            }
         }
-    } else {
-        true
+        None => (false, "".to_string()),         // Missing manifest hash -> Fail
     };
 
     let overall_passed = acceptance_passed && allowed_paths_passed;
@@ -219,11 +236,11 @@ pub async fn verify_and_integrate_attempt(
         passed: overall_passed,
         allowed_paths_passed,
         acceptance_command_passed: acceptance_passed,
-        manifest_hash: attempt.manifest_hash.clone().unwrap_or_default(),
+        manifest_hash: manifest_hash_str,
         details: if overall_passed {
             "All acceptance tests and path constraints passed".to_string()
         } else {
-            "Verification criteria failed".to_string()
+            format!("Verification criteria failed: {}", acceptance_details)
         },
         verified_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -233,6 +250,7 @@ pub async fn verify_and_integrate_attempt(
     store.record_verification(&verification)?;
 
     if !overall_passed {
+
         store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
         store.update_task_status(&task.id, TaskStatus::Failed)?;
         tracing::warn!("Attempt {} rejected by verification gate", attempt.id);
