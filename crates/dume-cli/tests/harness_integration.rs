@@ -884,7 +884,7 @@ async fn test_r5_subsequent_commit_ancestry_reconciliation() {
 }
 
 #[tokio::test]
-async fn test_r5_real_os_process_sigkill_recovery() {
+async fn test_r5_process_boundary_crash_and_recovery() {
     let dir = tempdir().unwrap();
     let repo_path = dir.path().join("repo");
     let repo_str = repo_path.to_str().unwrap();
@@ -907,8 +907,8 @@ async fn test_r5_real_os_process_sigkill_recovery() {
     let candidate_commit = {
         let wt = repo_path.join("wt_cand");
         dume_git::worktree::create_git_worktree(&repo_path, &wt, "main").await.unwrap();
-        std::fs::write(wt.join("sigkill.txt"), "sigkill feature\n").unwrap();
-        let c = dume_git::commit::commit_worktree_changes(&wt, "feat: sigkill feature").await.unwrap();
+        std::fs::write(wt.join("crash_boundary.txt"), "boundary feature\n").unwrap();
+        let c = dume_git::commit::commit_worktree_changes(&wt, "feat: boundary feature").await.unwrap();
         dume_git::worktree::remove_git_worktree(&repo_path, &wt).await.unwrap();
         c
     };
@@ -935,10 +935,10 @@ async fn test_r5_real_os_process_sigkill_recovery() {
         let manifest = ResultManifest {
             attempt_id: "att_r5_1".to_string(),
             candidate_commit: candidate_commit.clone(),
-            modified_files: vec!["sigkill.txt".to_string()],
+            modified_files: vec!["crash_boundary.txt".to_string()],
             changed_artifacts: vec![],
             test_results: vec![],
-            summary: "sigkill feature".to_string(),
+            summary: "boundary feature".to_string(),
         };
         let manifest_bytes = serde_json::to_string(&manifest).unwrap();
         let manifest_hash = store.artifacts.save_artifact(manifest_bytes.as_bytes()).unwrap();
@@ -955,7 +955,7 @@ async fn test_r5_real_os_process_sigkill_recovery() {
     // 2) Write Pending to SQLite
     // 3) Successfully update Git ref via CAS
     // 4) Emit boundary signal "DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED"
-    // 5) Exit immediately with code 137 (SIGKILL crash emulation) BEFORE writing Applied!
+    // 5) Exit immediately before writing Applied!
     let dume_bin = env!("CARGO_BIN_EXE_dume");
     let child = std::process::Command::new(dume_bin)
         .args([
@@ -980,7 +980,7 @@ async fn test_r5_real_os_process_sigkill_recovery() {
     let child_res = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&child_res.stdout);
     assert!(stdout.contains("DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED"), "Child must reach exact crash boundary between Git ref update and DB write");
-    assert_eq!(child_res.status.code(), Some(137), "Child must crash immediately with exit code 137");
+    assert_eq!(child_res.status.code(), Some(137), "Child must exit immediately at crash boundary");
 
     // 3. Verify exact crash state:
     // - Git ref WAS updated to integration_commit
@@ -1032,7 +1032,7 @@ async fn test_r5_real_os_process_sigkill_recovery() {
             .output()
             .unwrap();
         let log_str = String::from_utf8_lossy(&log_out.stdout);
-        let count = log_str.lines().filter(|l| l.contains("feat: sigkill feature")).count();
+        let count = log_str.lines().filter(|l| l.contains("feat: boundary feature")).count();
         assert_eq!(count, 1, "Exactly one cherry-pick commit in history, no duplicate integration");
     }
 }

@@ -816,8 +816,10 @@ impl HarnessStore {
     }
 
     pub fn compact_session(&self, session_id: &str, summary_content: &str, retain_last_n: usize) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let active_count: i64 = conn.query_row(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let active_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0",
             params![session_id],
             |r| r.get(0),
@@ -827,7 +829,7 @@ impl HarnessStore {
             return Ok(());
         }
 
-        let mut cutoff_idx: i64 = conn.query_row(
+        let mut cutoff_idx: i64 = tx.query_row(
             "SELECT message_index FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
             params![session_id, retain_last_n as i64],
             |r| r.get(0),
@@ -836,7 +838,7 @@ impl HarnessStore {
         // ATOMIC PAIR PRESERVATION:
         // If cutoff_idx lands on an assistant message with tool_calls, do not split it from following tool results!
         // Move cutoff forward to include the tool results in the archive window so the active context never starts with an orphaned tool result.
-        let is_tool_call_boundary: bool = conn.query_row(
+        let is_tool_call_boundary: bool = tx.query_row(
             "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
             params![session_id, cutoff_idx],
             |r| r.get::<_, i64>(0).map(|c| c > 0),
@@ -844,7 +846,7 @@ impl HarnessStore {
 
         if is_tool_call_boundary {
             // Find max index of corresponding tool response
-            if let Ok(next_res_idx) = conn.query_row(
+            if let Ok(next_res_idx) = tx.query_row(
                 "SELECT message_index FROM session_messages WHERE session_id = ?1 AND message_index > ?2 AND role = 'tool' ORDER BY message_index ASC LIMIT 1",
                 params![session_id, cutoff_idx],
                 |r| r.get::<_, i64>(0),
@@ -854,25 +856,27 @@ impl HarnessStore {
         }
 
         // ARCHIVE without deleting (Original raw audit history is completely preserved!)
-        conn.execute(
+        tx.execute(
             "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND message_index <= ?2",
             params![session_id, cutoff_idx],
         )?;
 
-        let max_idx: i64 = conn.query_row(
+        let max_idx: i64 = tx.query_row(
             "SELECT COALESCE(MAX(message_index), -1) + 1 FROM session_messages WHERE session_id = ?1",
             params![session_id],
             |r| r.get(0),
         )?;
 
         // Insert new compacted summary into active context with new unique index
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
             VALUES (?1, ?2, 'system', ?3, NULL, NULL, 1, 0, ?4)
             "#,
             params![session_id, max_idx, summary_content, now_millis()],
         )?;
+
+        tx.commit()?;
 
         Ok(())
     }
