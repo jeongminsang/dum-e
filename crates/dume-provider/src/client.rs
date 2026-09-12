@@ -77,15 +77,27 @@ impl LlmClient {
         }
     }
 
-    pub fn build_auth_headers(api_key: &str, is_anthropic: bool) -> HeaderMap {
+    pub fn build_auth_headers(auth_token: &str, is_anthropic: bool) -> HeaderMap {
         let mut map = HeaderMap::new();
         map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         if is_anthropic {
-            map.insert("x-api-key", HeaderValue::from_str(api_key).unwrap());
-            map.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            let is_oauth = auth_token.starts_with("sk-ant-oat") || auth_token.contains("oat");
+            if is_oauth {
+                // Anthropic OAuth: Bearer authorization + Claude Code CLI identity headers
+                let bearer_val = format!("Bearer {}", auth_token);
+                map.insert(AUTHORIZATION, HeaderValue::from_str(&bearer_val).unwrap());
+                map.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+                map.insert("anthropic-beta", HeaderValue::from_static("claude-code-20250219,oauth-2025-01-01"));
+                map.insert("user-agent", HeaderValue::from_static("claude-cli/0.2.29"));
+                map.insert("x-app", HeaderValue::from_static("cli"));
+            } else {
+                // Anthropic API Key: x-api-key header
+                map.insert("x-api-key", HeaderValue::from_str(auth_token).unwrap());
+                map.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            }
         } else {
-            let auth_val = format!("Bearer {}", api_key);
+            let auth_val = format!("Bearer {}", auth_token);
             map.insert(AUTHORIZATION, HeaderValue::from_str(&auth_val).unwrap());
         }
 

@@ -159,6 +159,25 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     if !app.input_buffer.trim().is_empty() && !app.is_busy {
                                         let content = std::mem::take(&mut app.input_buffer);
                                         app.cursor_pos = 0;
+
+                                        // Slash command handling
+                                        let trimmed = content.trim();
+                                        if trimmed.starts_with("/model ") {
+                                            let new_model = trimmed[7..].trim().to_string();
+                                            app.messages.push(ChatMessage::system(format!("Switched model to '{}'", new_model)));
+                                            app.model = new_model;
+                                            continue;
+                                        } else if trimmed == "/clear" {
+                                            app.messages.clear();
+                                            app.streaming_text.clear();
+                                            continue;
+                                        } else if trimmed == "/help" {
+                                            app.messages.push(ChatMessage::system(
+                                                "DUM-E Commands:\n  /model <name>  - Switch active model (e.g. claude-3-5-sonnet, gpt-4o)\n  /clear         - Clear conversation transcript\n  /help          - Show this help\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down"
+                                            ));
+                                            continue;
+                                        }
+
                                         app.messages.push(ChatMessage::user(content.clone()));
                                         app.is_busy = true;
 
@@ -223,17 +242,17 @@ async fn dispatch_stream(
 ) {
     let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
 
-    if let Some(token) = cred_store.get_api_key("anthropic") {
+    if let Some(token) = cred_store.resolve_valid_token("anthropic").await {
         let provider = AnthropicProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;
         }
-    } else if let Some(token) = cred_store.get_api_key("openai") {
+    } else if let Some(token) = cred_store.resolve_valid_token("openai").await {
         let provider = OpenAiProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;
         }
-    } else if let Some(token) = cred_store.get_api_key("gemini") {
+    } else if let Some(token) = cred_store.resolve_valid_token("gemini").await {
         let provider = GeminiProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;

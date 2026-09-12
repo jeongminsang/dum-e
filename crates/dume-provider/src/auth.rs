@@ -32,7 +32,10 @@ impl CredentialStore {
     }
 
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
-        // 1. Check environment variables first
+        self.get_token(provider)
+    }
+
+    pub fn get_token(&self, provider: &str) -> Option<String> {
         let env_var = match provider {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
@@ -48,7 +51,6 @@ impl CredentialStore {
             }
         }
 
-        // 2. Fall back to credentials file
         if let Ok(creds) = self.load() {
             if let Some(cred) = creds.get(provider) {
                 if let Some(ref k) = cred.key {
@@ -63,6 +65,59 @@ impl CredentialStore {
         None
     }
 
+    /// Resolve valid token, refreshing OAuth token automatically if expired or expiring within 5 minutes
+    pub async fn resolve_valid_token(&self, provider: &str) -> Option<String> {
+        let env_var = match provider {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "google" | "gemini" => "GEMINI_API_KEY",
+            _ => "",
+        };
+
+        if !env_var.is_empty() {
+            if let Ok(val) = std::env::var(env_var) {
+                if !val.trim().is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+
+        let cred = self.load().ok()?.get(provider).cloned()?;
+        if let Some(ref k) = cred.key {
+            return Some(k.clone());
+        }
+
+        // OAuth token with potential expiration
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let buffer_ms = 5 * 60 * 1000; // 5 minutes buffer
+
+        if let (Some(access_token), Some(refresh_token), Some(expires_at)) = (&cred.access_token, &cred.refresh_token, cred.expires_at) {
+            if expires_at - now < buffer_ms {
+                // Token expiring soon or expired: perform refresh
+                if provider == "anthropic" {
+                    if let Ok(token_resp) = crate::oauth::refresh_oauth_token(
+                        crate::oauth::ANTHROPIC_TOKEN_URL,
+                        crate::oauth::ANTHROPIC_CLIENT_ID,
+                        refresh_token,
+                    ).await {
+                        let new_cred = Credential {
+                            cred_type: "oauth".to_string(),
+                            key: None,
+                            access_token: Some(token_resp.access_token.clone()),
+                            refresh_token: token_resp.refresh_token.or_else(|| Some(refresh_token.clone())),
+                            expires_at: token_resp.expires_in.map(|exp| now + exp * 1000),
+                        };
+                        let _ = self.save(provider, &new_cred);
+                        return Some(token_resp.access_token);
+                    }
+                }
+            }
+            return Some(access_token.clone());
+        }
+
+        cred.access_token
+    }
+
     pub fn save(&self, provider: &str, cred: &Credential) -> Result<()> {
         let mut creds = self.load().unwrap_or_default();
         creds.insert(provider.to_string(), cred.clone());
@@ -71,7 +126,20 @@ impl CredentialStore {
             fs::create_dir_all(parent)?;
         }
         let serialized = serde_json::to_string_pretty(&creds)?;
-        fs::write(&self.file_path, serialized)?;
+
+        // Atomic write via temporary file in same directory
+        let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        fs::write(temp_file.path(), serialized)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            let _ = fs::set_permissions(temp_file.path(), permissions);
+        }
+
+        temp_file.persist(&self.file_path)?;
         Ok(())
     }
 
@@ -83,7 +151,19 @@ impl CredentialStore {
             fs::create_dir_all(parent)?;
         }
         let serialized = serde_json::to_string_pretty(&creds)?;
-        fs::write(&self.file_path, serialized)?;
+
+        let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        fs::write(temp_file.path(), serialized)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            let _ = fs::set_permissions(temp_file.path(), permissions);
+        }
+
+        temp_file.persist(&self.file_path)?;
         Ok(())
     }
 
