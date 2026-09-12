@@ -492,6 +492,31 @@ impl HarnessStore {
         Ok(())
     }
 
+    pub fn get_integration_by_candidate(&self, candidate_commit: &str) -> Result<Option<Integration>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT target_branch, base_commit, candidate_commit, integration_commit, status, error_message, integrated_at
+             FROM integrations WHERE candidate_commit = ?1",
+        )?;
+        let mut rows = stmt.query(params![candidate_commit])?;
+        if let Some(row) = rows.next()? {
+            let status_str: String = row.get(4)?;
+            let status: IntegrationStatus = serde_json::from_str(&format!("\"{}\"", status_str))
+                .unwrap_or(IntegrationStatus::Failed);
+            Ok(Some(Integration {
+                target_branch: row.get(0)?,
+                base_commit: row.get(1)?,
+                candidate_commit: row.get(2)?,
+                integration_commit: row.get(3)?,
+                status,
+                error_message: row.get(5)?,
+                integrated_at: row.get(6)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     // --- External Operations (Slice 2) ---
 
     pub fn record_external_operation_intent(

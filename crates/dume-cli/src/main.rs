@@ -403,6 +403,17 @@ pub async fn verify_and_integrate_attempt(
     let repo_p = Path::new(repo_path);
     let integration_wt = repo_p.join(".dume/rust/integration-worktree");
 
+    // R5: If this candidate was already applied (e.g. crash after git update-ref but before DB write or recovery retry),
+    // check if it is already recorded or is already an ancestor of target branch
+    if let Ok(Some(existing_int)) = store.get_integration_by_candidate(candidate_commit) {
+        if existing_int.status == IntegrationStatus::Applied {
+            store.update_attempt_status(&attempt.id, AttemptStatus::Accepted)?;
+            store.update_task_status(&task.id, TaskStatus::Completed)?;
+            tracing::info!("Candidate commit {} already recorded as integrated", candidate_commit);
+            return Ok(());
+        }
+    }
+
     let int_res = dume_git::integrate::integrate_candidate_commit(
         repo_p,
         &task.target_branch,

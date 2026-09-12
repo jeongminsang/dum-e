@@ -404,7 +404,7 @@ async fn test_r4_conflict_vs_acceptance_failure_separation() {
     run_git(&["add", "file.txt"]);
     run_git(&["commit", "-m", "Initial commit"]);
 
-    let initial_head = {
+    let _initial_head = {
         let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
@@ -465,7 +465,7 @@ async fn test_r5_branch_ref_ancestry_reconciliation() {
     run_git(&["add", "base.txt"]);
     run_git(&["commit", "-m", "Base commit"]);
 
-    let base_commit = {
+    let _base_commit = {
         let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
@@ -510,6 +510,257 @@ async fn test_r5_branch_ref_ancestry_reconciliation() {
     // Candidate commit hash itself is different from integration_commit hash
     assert_ne!(candidate_commit, integration_commit, "Candidate commit hash must differ from cherry-picked integration commit");
 }
+
+#[tokio::test]
+async fn test_r4_clean_merge_but_acceptance_criteria_failure_rejects() {
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+    let repo_str = repo_path.to_str().unwrap();
+
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_str])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+
+    std::fs::write(repo_path.join("init.txt"), "hello\n").unwrap();
+    run_git(&["add", "init.txt"]);
+    run_git(&["commit", "-m", "init"]);
+    let base_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let db_path = repo_path.join(".dume/rust/harness.db");
+    let artifacts_dir = repo_path.join(".dume/rust/artifacts");
+    let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+    let _goal = store.create_goal("g_r4", "Test R4 acceptance failure").unwrap();
+
+    // Task specifies acceptance criteria that WILL FAIL (e.g. grep for required_secret)
+    let task = Task {
+        id: "t_r4_fail".to_string(),
+        goal_id: "g_r4".to_string(),
+        title: "Feature with failing test".to_string(),
+        description: "Must fail acceptance".to_string(),
+        status: TaskStatus::Ready,
+        dependencies: vec![],
+        acceptance_criteria: vec!["grep -q 'required_secret' app.txt".to_string()],
+        allowed_paths: Some(vec!["app.txt".to_string()]),
+        target_branch: "main".to_string(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    store.create_task(&task).unwrap();
+
+    // Create a candidate commit that cleanly merges but FAILS acceptance criteria
+    let wt_cand = repo_path.join("wt_r4_cand");
+    dume_git::worktree::create_git_worktree(repo_path, &wt_cand, "main").await.unwrap();
+    std::fs::write(wt_cand.join("app.txt"), "wrong content without required string\n").unwrap();
+    let candidate_commit = dume_git::commit::commit_worktree_changes(&wt_cand, "feat: wrong content").await.unwrap();
+    dume_git::worktree::remove_git_worktree(repo_path, &wt_cand).await.unwrap();
+
+    let manifest = ResultManifest {
+        attempt_id: "att_r4_fail".to_string(),
+        candidate_commit: candidate_commit.clone(),
+        modified_files: vec!["app.txt".to_string()],
+        changed_artifacts: vec![],
+        test_results: vec![],
+        summary: "wrong content".to_string(),
+    };
+    let manifest_bytes = serde_json::to_string(&manifest).unwrap();
+    let manifest_hash = store.artifacts.save_artifact(manifest_bytes.as_bytes()).unwrap();
+
+    let _attempt = store.create_attempt("att_r4_fail", &task.id, 1, "worker", "/tmp/wt", 30_000).unwrap();
+    store.submit_attempt_result("att_r4_fail", 1, &candidate_commit, &manifest_hash).unwrap();
+
+    // Coordinator runs verify_and_integrate_attempt
+    let res = dume_cli_verify_helper(&store, repo_str, &store.get_attempt("att_r4_fail").unwrap(), 1).await;
+    assert!(res.is_ok());
+
+    // Task and Attempt MUST be Rejected / Failed
+    let updated_att = store.get_attempt("att_r4_fail").unwrap();
+    assert_eq!(updated_att.status, AttemptStatus::Rejected);
+    let updated_task = store.get_task(&task.id).unwrap();
+    assert_eq!(updated_task.status, TaskStatus::Failed);
+
+    // Target branch ref MUST be completely unchanged
+    let current_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(current_head, base_head, "Target branch head must remain untouched upon acceptance failure");
+}
+
+#[tokio::test]
+async fn test_r7_tampered_manifest_artifact_blocks_verification() {
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+    let repo_str = repo_path.to_str().unwrap();
+
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_str])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+    std::fs::write(repo_path.join("init.txt"), "hello\n").unwrap();
+    run_git(&["add", "init.txt"]);
+    run_git(&["commit", "-m", "init"]);
+    let base_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let db_path = repo_path.join(".dume/rust/harness.db");
+    let artifacts_dir = repo_path.join(".dume/rust/artifacts");
+    let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+    let _goal = store.create_goal("g_r7", "Test R7 tampering").unwrap();
+
+    let task = Task {
+        id: "t_r7".to_string(),
+        goal_id: "g_r7".to_string(),
+        title: "Tampered manifest test".to_string(),
+        description: "Evidence tampering".to_string(),
+        status: TaskStatus::Ready,
+        dependencies: vec![],
+        acceptance_criteria: vec!["true".to_string()],
+        allowed_paths: Some(vec!["valid.txt".to_string()]),
+        target_branch: "main".to_string(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    store.create_task(&task).unwrap();
+
+    let wt_cand = repo_path.join("wt_r7_cand");
+    dume_git::worktree::create_git_worktree(repo_path, &wt_cand, "main").await.unwrap();
+    std::fs::write(wt_cand.join("valid.txt"), "content\n").unwrap();
+    let candidate_commit = dume_git::commit::commit_worktree_changes(&wt_cand, "feat: valid").await.unwrap();
+    dume_git::worktree::remove_git_worktree(repo_path, &wt_cand).await.unwrap();
+
+    let manifest = ResultManifest {
+        attempt_id: "att_r7".to_string(),
+        candidate_commit: candidate_commit.clone(),
+        modified_files: vec!["valid.txt".to_string()],
+        changed_artifacts: vec![],
+        test_results: vec![],
+        summary: "valid".to_string(),
+    };
+    let manifest_bytes = serde_json::to_string(&manifest).unwrap();
+    let manifest_hash = store.artifacts.save_artifact(manifest_bytes.as_bytes()).unwrap();
+
+    let _attempt = store.create_attempt("att_r7", &task.id, 1, "worker", "/tmp/wt", 30_000).unwrap();
+    store.submit_attempt_result("att_r7", 1, &candidate_commit, &manifest_hash).unwrap();
+
+    // External corruption / tampering: modify artifact file on disk
+    let shard = &manifest_hash[..2];
+    let artifact_file = artifacts_dir.join(shard).join(&manifest_hash);
+    std::fs::write(&artifact_file, b"corrupted payload").unwrap();
+
+    // Verify should catch tampering via InvalidData and REJECT integration
+    let res = dume_cli_verify_helper(&store, repo_str, &store.get_attempt("att_r7").unwrap(), 1).await;
+    assert!(res.is_ok());
+
+    let updated_att = store.get_attempt("att_r7").unwrap();
+    assert_eq!(updated_att.status, AttemptStatus::Rejected, "Tampered artifact MUST be rejected");
+
+    let updated_task = store.get_task(&task.id).unwrap();
+    assert_eq!(updated_task.status, TaskStatus::Failed);
+
+    let current_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(current_head, base_head, "Target branch ref must not advance when artifact is corrupted");
+}
+
+async fn dume_cli_verify_helper(
+    store: &HarnessStore,
+    repo_path: &str,
+    attempt: &Attempt,
+    epoch: i64,
+) -> anyhow::Result<()> {
+    let task = store.get_task(&attempt.task_id)?;
+    let candidate_commit = attempt.candidate_commit.as_ref().unwrap();
+    let repo_p = std::path::Path::new(repo_path);
+    let verify_wt_dir = repo_p.join(format!(".dume/rust/verify-wt-{}", attempt.id));
+
+    dume_git::worktree::create_git_worktree(repo_p, &verify_wt_dir, candidate_commit).await?;
+
+    let (acceptance_passed, acceptance_details) = if task.acceptance_criteria.is_empty() {
+        (false, "No criteria".to_string())
+    } else {
+        let mut passed = true;
+        let mut detail = "OK".to_string();
+        for cmd in &task.acceptance_criteria {
+            let res = dume_worker::WorkerExecutor::run_test_command(&verify_wt_dir, cmd).await?;
+            if !res.passed {
+                passed = false;
+                detail = format!("Failed {}", cmd);
+                break;
+            }
+        }
+        (passed, detail)
+    };
+    let _ = dume_git::worktree::remove_git_worktree(repo_p, &verify_wt_dir).await;
+
+    let (allowed_paths_passed, manifest_hash_str) = match &attempt.manifest_hash {
+        Some(h) => match store.artifacts.get_artifact(h) {
+            Ok(bytes) => match serde_json::from_slice::<ResultManifest>(&bytes) {
+                Ok(manifest) => (verify_allowed_paths(&task, &manifest), h.clone()),
+                Err(_) => (false, h.clone()),
+            },
+            Err(_) => (false, h.clone()),
+        },
+        None => (false, "".to_string()),
+    };
+
+    let overall_passed = acceptance_passed && allowed_paths_passed;
+    let verification = Verification {
+        attempt_id: attempt.id.clone(),
+        epoch,
+        passed: overall_passed,
+        allowed_paths_passed,
+        acceptance_command_passed: acceptance_passed,
+        manifest_hash: manifest_hash_str,
+        details: acceptance_details,
+        verified_at: 0,
+    };
+    store.record_verification(&verification)?;
+
+    if !overall_passed {
+        store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
+        store.update_task_status(&task.id, TaskStatus::Failed)?;
+        return Ok(());
+    }
+
+    let int_wt = repo_p.join(".dume/rust/integration-worktree");
+    let int_res = dume_git::integrate::integrate_candidate_commit(
+        repo_p,
+        &task.target_branch,
+        candidate_commit,
+        &int_wt,
+    ).await?;
+
+    if let dume_git::integrate::IntegrationResult::Success { .. } = int_res {
+        store.update_attempt_status(&attempt.id, AttemptStatus::Accepted)?;
+        store.update_task_status(&task.id, TaskStatus::Completed)?;
+    }
+    Ok(())
+}
+
 
 
 

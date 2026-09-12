@@ -113,3 +113,12 @@ pub async fn integrate_candidate_commit(
     })
 }
 
+pub async fn is_ancestor(repo_path: &Path, commit: &str, branch: &str) -> Result<bool> {
+    let repo_str = repo_path.to_str().unwrap();
+    let status = Command::new("git")
+        .args(["-C", repo_str, "merge-base", "--is-ancestor", commit, branch])
+        .status()
+        .await?;
+    Ok(status.success())
+}
+
