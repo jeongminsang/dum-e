@@ -68,11 +68,29 @@ fn test_harness_dag_and_epoch_fencing() {
     let foreign_submit = store.submit_attempt_result("att_1", 99, "commit_fake", "hash_fake");
     assert!(matches!(foreign_submit, Err(StoreError::FencingViolation { .. })));
 
-    // 6. Crash recovery inspection
-    let (ready_verify, needs_attention) = store.recover_state(lock2.epoch).unwrap();
+    // 6. External operation dispatched without confirmation before crash (R3)
+    store.record_external_operation_intent("op_1", "att_1", "deploy_prod_1", "Deploy service").unwrap();
+    store.update_external_operation_status("op_1", ExternalOperationStatus::Dispatched, None).unwrap();
+
+    // 7. Crash recovery inspection (R1 & R3)
+    let (ready_verify, needs_attention, unknown_ops) = store.recover_state(lock2.epoch).unwrap();
     assert_eq!(ready_verify.len(), 1);
     assert_eq!(ready_verify[0].id, "att_1");
     assert_eq!(needs_attention.len(), 0);
+
+    // Operation was automatically moved to OutcomeUnknown upon unconfirmed crash recovery
+    assert_eq!(unknown_ops.len(), 1);
+    assert_eq!(unknown_ops[0].id, "op_1");
+    assert_eq!(unknown_ops[0].status, ExternalOperationStatus::OutcomeUnknown);
+
+    // OutcomeUnknown guard prevents automatic re-dispatch
+    assert_eq!(
+        dume_core::operation::validate_operation_transition(
+            unknown_ops[0].status,
+            ExternalOperationStatus::Dispatched
+        ),
+        Err(dume_core::operation::OperationError::OutcomeUnknownGuard)
+    );
 }
 
 #[test]

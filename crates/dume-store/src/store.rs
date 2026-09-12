@@ -451,9 +451,99 @@ impl HarnessStore {
         Ok(())
     }
 
+    // --- External Operations (Slice 2) ---
+
+    pub fn record_external_operation_intent(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        idempotency_key: &str,
+        description: &str,
+    ) -> Result<ExternalOperation, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        conn.execute(
+            "INSERT INTO external_operations (id, attempt_id, idempotency_key, description, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'intent_recorded', ?5, ?6)",
+            params![id, attempt_id, idempotency_key, description, now, now],
+        )?;
+
+        Ok(ExternalOperation {
+            id: id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            description: description.to_string(),
+            status: ExternalOperationStatus::IntentRecorded,
+            receipt_data: None,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn update_external_operation_status(
+        &self,
+        id: &str,
+        status: ExternalOperationStatus,
+        receipt_data: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
+
+        conn.execute(
+            "UPDATE external_operations SET status = ?1, receipt_data = COALESCE(?2, receipt_data), updated_at = ?3 WHERE id = ?4",
+            params![status_str, receipt_data, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_external_operation(&self, id: &str) -> Result<ExternalOperation, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, attempt_id, idempotency_key, description, status, receipt_data, created_at, updated_at
+             FROM external_operations WHERE id = ?1",
+            params![id],
+            |row| {
+                let status_str: String = row.get(4)?;
+                let status: ExternalOperationStatus = serde_json::from_str(&format!("\"{}\"", status_str))
+                    .unwrap_or(ExternalOperationStatus::OutcomeUnknown);
+                Ok(ExternalOperation {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    description: row.get(3)?,
+                    status,
+                    receipt_data: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        ).map_err(StoreError::Db)
+    }
+
+    pub fn record_durable_event(
+        &self,
+        entity_id: &str,
+        event_type: &str,
+        epoch: i64,
+        dedup_key: Option<&str>,
+        payload: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+
+        conn.execute(
+            "INSERT INTO events (entity_id, event_type, epoch, dedup_key, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![entity_id, event_type, epoch, dedup_key, payload, now],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
     // --- Recovery State Inspection ---
 
-    pub fn recover_state(&self, current_epoch: i64) -> Result<(Vec<Attempt>, Vec<Attempt>), StoreError> {
+    pub fn recover_state(&self, current_epoch: i64) -> Result<(Vec<Attempt>, Vec<Attempt>, Vec<ExternalOperation>), StoreError> {
         let conn = self.conn.lock().unwrap();
         
         // 1. Mark stale running attempts from older epochs as needs_attention
@@ -462,7 +552,13 @@ impl HarnessStore {
             params![current_epoch],
         )?;
 
-        // 2. Find result_submitted attempts ready for verification
+        // 2. R3: Dispatched external operations without confirmed receipt transition to outcome_unknown
+        conn.execute(
+            "UPDATE external_operations SET status = 'outcome_unknown' WHERE status = 'dispatched'",
+            [],
+        )?;
+
+        // 3. Find result_submitted attempts ready for verification
         let mut stmt = conn.prepare(
             "SELECT id, task_id, coordinator_epoch, worker_id, worktree_path, status, lease_expires_at, heartbeat_at, candidate_commit, manifest_hash, created_at, updated_at
              FROM attempts WHERE status = 'result_submitted'",
@@ -484,7 +580,7 @@ impl HarnessStore {
             })
         })?.filter_map(|r| r.ok()).collect();
 
-        // 3. Find attempts needing attention
+        // 4. Find attempts needing attention
         let mut stmt2 = conn.prepare(
             "SELECT id, task_id, coordinator_epoch, worker_id, worktree_path, status, lease_expires_at, heartbeat_at, candidate_commit, manifest_hash, created_at, updated_at
              FROM attempts WHERE status = 'needs_attention'",
@@ -506,7 +602,25 @@ impl HarnessStore {
             })
         })?.filter_map(|r| r.ok()).collect();
 
-        Ok((ready_for_verify, needs_attention))
+        // 5. Find unknown operations needing manual reconciliation
+        let mut stmt3 = conn.prepare(
+            "SELECT id, attempt_id, idempotency_key, description, status, receipt_data, created_at, updated_at
+             FROM external_operations WHERE status = 'outcome_unknown'",
+        )?;
+        let unknown_ops = stmt3.query_map([], |row| {
+            Ok(ExternalOperation {
+                id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                idempotency_key: row.get(2)?,
+                description: row.get(3)?,
+                status: ExternalOperationStatus::OutcomeUnknown,
+                receipt_data: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok((ready_for_verify, needs_attention, unknown_ops))
     }
 }
 

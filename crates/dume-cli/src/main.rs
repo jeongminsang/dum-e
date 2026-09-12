@@ -125,11 +125,12 @@ async fn run_coordinator(
     tracing::info!("Acquired coordinator lock with epoch {}", epoch);
 
     // 2. Crash recovery: inspect previous state
-    let (ready_for_verify, needs_attention) = store.recover_state(epoch)?;
+    let (ready_for_verify, needs_attention, unknown_ops) = store.recover_state(epoch)?;
     tracing::info!(
-        "Crash recovery complete: {} submitted attempts ready for verification, {} attempts needing attention",
+        "Crash recovery complete: {} submitted attempts ready for verification, {} attempts needing attention, {} external operations with unknown outcome",
         ready_for_verify.len(),
-        needs_attention.len()
+        needs_attention.len(),
+        unknown_ops.len()
     );
 
     // 3. Start background heartbeat task
