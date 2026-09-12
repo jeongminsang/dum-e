@@ -5,6 +5,7 @@ members = [
     "crates/dume-store",
     "crates/dume-git",
     "crates/dume-worker",
+    "crates/dume-mcp",
     "crates/dume-cli",
 ]
 
@@ -20,6 +21,7 @@ dume-core = { path = "crates/dume-core" }
 dume-store = { path = "crates/dume-store" }
 dume-git = { path = "crates/dume-git" }
 dume-worker = { path = "crates/dume-worker" }
+dume-mcp = { path = "crates/dume-mcp" }
 
 tokio = { version = "1.44", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
