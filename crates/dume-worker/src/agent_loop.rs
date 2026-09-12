@@ -65,6 +65,30 @@ impl AgentLoop {
                     "required": ["path", "content"]
                 }),
             },
+            ToolDefinition {
+                name: "replace_file_content".to_string(),
+                description: "Replace a target string within a file at relative path".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative file path" },
+                        "target": { "type": "string", "description": "Exact target string to replace" },
+                        "replacement": { "type": "string", "description": "Replacement text" }
+                    },
+                    "required": ["path", "target", "replacement"]
+                }),
+            },
+            ToolDefinition {
+                name: "grep_search".to_string(),
+                description: "Search for a regex or text pattern across files in worktree".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Search pattern" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
         ]
     }
 
@@ -215,6 +239,24 @@ impl AgentLoop {
                             Some("Missing required field 'path' (string)")
                         } else if parsed_args.get("content").and_then(|v| v.as_str()).is_none() {
                             Some("Missing required field 'content' (string)")
+                        } else {
+                            None
+                        }
+                    }
+                    "replace_file_content" => {
+                        if parsed_args.get("path").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'path' (string)")
+                        } else if parsed_args.get("target").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'target' (string)")
+                        } else if parsed_args.get("replacement").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'replacement' (string)")
+                        } else {
+                            None
+                        }
+                    }
+                    "grep_search" => {
+                        if parsed_args.get("pattern").and_then(|v| v.as_str()).is_none() {
+                            Some("Missing required field 'pattern' (string)")
                         } else {
                             None
                         }
@@ -440,18 +482,128 @@ mod tests {
         let unknown_res = executor.execute("unsupported_tool", &serde_json::json!({})).await;
         assert!(unknown_res.is_err(), "Unknown tool must fail");
 
-        // 4. Directory traversal attempt: ../escaped.txt
+        // 4. Directory traversal attempt: ../../escaped.txt
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox_root = sandbox_dir.path().join("sandbox_root");
+        let parent_dir = sandbox_root.join("parent");
+        let worktree_dir = parent_dir.join("worktree");
+        tokio::fs::create_dir_all(&worktree_dir).await.unwrap();
+
+        let strict_executor = LocalToolExecutor::new(&worktree_dir);
+
         let bad_args_traversal = serde_json::json!({
             "path": "../../escaped.txt",
-            "content": "malicious"
+            "content": "malicious content outside worktree"
         });
-        // Execute write_file with path traversal - must error and not write outside worktree
-        let trav_res = executor.execute("write_file", &bad_args_traversal).await;
-        // Verify no file written outside worktree
-        assert!(trav_res.is_err() || !dir.path().parent().unwrap().join("escaped.txt").exists());
+        let trav_res = strict_executor.execute("write_file", &bad_args_traversal).await;
+        assert!(trav_res.is_err(), "Directory traversal write must strictly fail");
 
-        // Zero side effect check: worktree must remain completely empty!
+        // CRITICAL: Physically inspect outer directories - escaped file MUST NOT EXIST outside worktree!
+        assert!(!sandbox_root.join("escaped.txt").exists(), "escaped.txt must not exist in sandbox_root");
+        assert!(!parent_dir.join("escaped.txt").exists(), "escaped.txt must not exist in parent_dir");
+        assert!(!sandbox_dir.path().join("escaped.txt").exists(), "escaped.txt must not exist in temp root");
+
+        // 5. Symlink traversal defense: symlink pointing outside worktree
+        let outside_dir = sandbox_root.join("outside_target");
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        let symlink_in_wt = worktree_dir.join("symlink_out");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, &symlink_in_wt).unwrap();
+
+        let bad_symlink_write = serde_json::json!({
+            "path": "symlink_out/pwned.txt",
+            "content": "escape via symlink"
+        });
+        let sym_res = strict_executor.execute("write_file", &bad_symlink_write).await;
+        assert!(sym_res.is_err(), "Write via symlink pointing outside worktree must fail");
+        assert!(!outside_dir.join("pwned.txt").exists(), "pwned.txt must not exist in outside directory");
+
+        // Zero side effect check: wt_path must remain completely empty!
         let mut entries = tokio::fs::read_dir(&wt_path).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none(), "Worktree must have 0 side effects");
+        assert!(entries.next_entry().await.unwrap().is_none(), "wt_path must have 0 side effects");
+    }
+
+    #[tokio::test]
+    async fn test_replace_file_content_and_grep_search() {
+        let dir = tempdir().unwrap();
+        let wt_path = dir.path().to_path_buf();
+        let executor = LocalToolExecutor::new(&wt_path);
+
+        // 1. Create file with write_file
+        let write_args = serde_json::json!({
+            "path": "src/main.rs",
+            "content": "fn main() {\n    println!(\"old message\");\n}\n"
+        });
+        executor.execute("write_file", &write_args).await.unwrap();
+
+        // 2. Search pattern with grep_search
+        let grep_args = serde_json::json!({
+            "pattern": "old message"
+        });
+        let grep_res = executor.execute("grep_search", &grep_args).await.unwrap();
+        assert!(grep_res.contains("old message"));
+
+        // 3. Replace content with replace_file_content
+        let replace_args = serde_json::json!({
+            "path": "src/main.rs",
+            "target": "old message",
+            "replacement": "new rust engine message"
+        });
+        let rep_res = executor.execute("replace_file_content", &replace_args).await.unwrap();
+        assert!(rep_res.contains("Successfully replaced"));
+
+        // 4. Verify updated file content
+        let read_args = serde_json::json!({
+            "path": "src/main.rs"
+        });
+        let content = executor.execute("read_file", &read_args).await.unwrap();
+        assert!(content.contains("new rust engine message"));
+        assert!(!content.contains("old message"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_manager_runs_real_child_agent_loop() {
+        let dir = tempdir().unwrap();
+        let parent_wt = dir.path().join("parent_wt");
+        let child_wt = dir.path().join("child_wt");
+        tokio::fs::create_dir_all(&parent_wt).await.unwrap();
+        tokio::fs::create_dir_all(&child_wt).await.unwrap();
+
+        let sub_mgr = dume_mcp::subagent::SubagentManager::new();
+
+        // Start subagent executing an actual AgentLoop in its own isolated child worktree
+        let child_wt_clone = child_wt.clone();
+        sub_mgr.start_subagent("sub_worker_1", "Initialize child project", move |_token| async move {
+            let agent = AgentLoop::new(&child_wt_clone, "mock-model");
+            // Direct write tool execution in child worktree
+            let executor = LocalToolExecutor::new(&child_wt_clone);
+            let write_args = serde_json::json!({
+                "path": "child_output.txt",
+                "content": "produced by child agent"
+            });
+            executor.execute("write_file", &write_args).await?;
+            let _ = agent;
+            Ok("Child task completed successfully".to_string())
+        })
+        .await
+        .unwrap();
+
+        // Await subagent result from parent
+        let status = sub_mgr.await_subagent("sub_worker_1", 2000).await.unwrap();
+        match status {
+            dume_mcp::subagent::SubagentStatus::Completed { result } => {
+                assert_eq!(result, "Child task completed successfully");
+            }
+            other => panic!("Expected completed subagent, got {:?}", other),
+        }
+
+        // Verify child worktree produced physical result
+        let child_file = child_wt.join("child_output.txt");
+        assert!(child_file.exists(), "Child agent must have created file in child worktree");
+        let content = tokio::fs::read_to_string(&child_file).await.unwrap();
+        assert_eq!(content, "produced by child agent");
+
+        // Verify parent worktree was unaffected
+        assert!(!parent_wt.join("child_output.txt").exists(), "Parent worktree must remain isolated");
     }
 }

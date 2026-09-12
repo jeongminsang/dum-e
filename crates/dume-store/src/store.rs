@@ -715,6 +715,105 @@ impl HarnessStore {
 
         Ok((ready_for_verify, needs_attention, unknown_ops))
     }
+
+    pub fn append_session_message(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls_json: Option<&str>,
+        tool_call_id: Option<&str>,
+        is_summary: bool,
+    ) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let next_idx: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(message_index), -1) + 1 FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+
+        conn.execute(
+            r#"
+            INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                session_id,
+                next_idx,
+                role,
+                content,
+                tool_calls_json,
+                tool_call_id,
+                if is_summary { 1 } else { 0 },
+                now_millis()
+            ],
+        )?;
+
+        Ok(next_idx)
+    }
+
+    pub fn list_session_messages(&self, session_id: &str) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT role, content, tool_calls_json, tool_call_id, is_compacted_summary
+            FROM session_messages
+            WHERE session_id = ?1
+            ORDER BY message_index ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |r| {
+            let role: String = r.get(0)?;
+            let content: String = r.get(1)?;
+            let tool_calls: Option<String> = r.get(2)?;
+            let tool_call_id: Option<String> = r.get(3)?;
+            let is_summary: i32 = r.get(4)?;
+            Ok((role, content, tool_calls, tool_call_id, is_summary == 1))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn compact_session(&self, session_id: &str, summary_content: &str, retain_last_n: usize) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let total_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+
+        if (total_count as usize) <= retain_last_n {
+            return Ok(());
+        }
+
+        let cutoff_idx: i64 = conn.query_row(
+            "SELECT message_index FROM session_messages WHERE session_id = ?1 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
+            params![session_id, retain_last_n as i64],
+            |r| r.get(0),
+        )?;
+
+        // Delete older messages before cutoff
+        conn.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1 AND message_index <= ?2",
+            params![session_id, cutoff_idx],
+        )?;
+
+        // Insert new compacted summary as message 0 (or prepended)
+        conn.execute(
+            r#"
+            INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, created_at)
+            VALUES (?1, ?2, 'system', ?3, NULL, NULL, 1, ?4)
+            "#,
+            params![session_id, cutoff_idx, summary_content, now_millis()],
+        )?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -780,5 +879,36 @@ mod tests {
         let updated = store.get_attempt("att_1").unwrap();
         assert_eq!(updated.status, AttemptStatus::ResultSubmitted);
         assert_eq!(updated.candidate_commit.as_deref(), Some("commit123"));
+    }
+
+    #[test]
+    fn test_session_message_compaction_and_resume() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+
+        let session_id = "session_test_42";
+
+        // Append 5 messages
+        store.append_session_message(session_id, "user", "Task 1", None, None, false).unwrap();
+        store.append_session_message(session_id, "assistant", "Working on task 1", None, None, false).unwrap();
+        store.append_session_message(session_id, "user", "Task 2", None, None, false).unwrap();
+        store.append_session_message(session_id, "assistant", "Done task 2", None, None, false).unwrap();
+        store.append_session_message(session_id, "user", "Now do task 3", None, None, false).unwrap();
+
+        let msgs = store.list_session_messages(session_id).unwrap();
+        assert_eq!(msgs.len(), 5);
+
+        // Compact session retaining only the last 2 messages
+        let summary = "Summary of conversation: Task 1 and Task 2 were completed.";
+        store.compact_session(session_id, summary, 2).unwrap();
+
+        let compacted_msgs = store.list_session_messages(session_id).unwrap();
+        // Cutoff deleted 3 messages, replaced with 1 summary, keeping last 2 -> total 3 messages
+        assert_eq!(compacted_msgs.len(), 3);
+        assert_eq!(compacted_msgs[0].0, "system");
+        assert!(compacted_msgs[0].1.contains("Summary of conversation"));
+        assert!(compacted_msgs[0].4, "Must be flagged as summary");
+        assert_eq!(compacted_msgs[1].1, "Done task 2");
+        assert_eq!(compacted_msgs[2].1, "Now do task 3");
     }
 }

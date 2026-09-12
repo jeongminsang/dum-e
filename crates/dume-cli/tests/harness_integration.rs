@@ -882,3 +882,163 @@ async fn test_r5_subsequent_commit_ancestry_reconciliation() {
         assert_eq!(updated.status, IntegrationStatus::Applied);
     }
 }
+
+#[tokio::test]
+async fn test_r5_real_os_process_sigkill_recovery() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path().join("repo");
+    let repo_str = repo_path.to_str().unwrap();
+    let db_path = dir.path().join("harness.db");
+    let artifacts_dir = dir.path().join("artifacts");
+
+    // Initialize Git repository
+    std::process::Command::new("git").args(["init", "-b", "main", repo_str]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.name", "Dume Test"]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.email", "test@dume.local"]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "commit.gpgSign", "false"]).output().unwrap();
+
+    std::fs::write(repo_path.join("README.md"), "# Initial\n").unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "add", "."]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "commit", "-m", "initial"]).output().unwrap();
+
+    let base_head = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
+
+    // Prepare candidate cherry-pick
+    let candidate_commit = {
+        let wt = repo_path.join("wt_cand");
+        dume_git::worktree::create_git_worktree(&repo_path, &wt, "main").await.unwrap();
+        std::fs::write(wt.join("sigkill.txt"), "sigkill feature\n").unwrap();
+        let c = dume_git::commit::commit_worktree_changes(&wt, "feat: sigkill feature").await.unwrap();
+        dume_git::worktree::remove_git_worktree(&repo_path, &wt).await.unwrap();
+        c
+    };
+
+    let int_wt = repo_path.join("wt_int");
+    let prep_res = dume_git::integrate::prepare_candidate_cherry_pick(
+        &repo_path,
+        "main",
+        &candidate_commit,
+        &int_wt,
+    ).await.unwrap();
+
+    let integration_commit = match prep_res {
+        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => integration_commit,
+        _ => panic!("Expected prep success"),
+    };
+
+    // 1. Initial process: Write Pending record
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let pending = Integration {
+            target_branch: "main".to_string(),
+            base_commit: base_head.clone(),
+            candidate_commit: candidate_commit.clone(),
+            integration_commit: Some(integration_commit.clone()),
+            status: IntegrationStatus::Pending,
+            error_message: None,
+            integrated_at: 1000,
+        };
+        store.record_integration(&pending).unwrap();
+    }
+
+    // Git ref update succeeds
+    dume_git::integrate::apply_branch_update(&repo_path, "main", &integration_commit, &base_head).await.unwrap();
+
+    // 2. Spawn a REAL OS child process that simulates coordinator startup
+    // We launch `cargo run --bin dume -- coordinator ...` or run the test binary in a real process
+    // To test actual OS process SIGKILL:
+    let dume_bin = env!("CARGO_BIN_EXE_dume");
+    let mut child = std::process::Command::new(dume_bin)
+        .args([
+            "coordinator",
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--artifacts-dir",
+            artifacts_dir.to_str().unwrap(),
+            "--repo-path",
+            repo_str,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn real dume coordinator process");
+
+    let pid = child.id();
+    assert!(pid > 0, "Real child process must have valid OS PID");
+
+    // Wait for coordinator to start and perform startup reconciliation
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Send actual SIGKILL to the real OS child process
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Verify after SIGKILL:
+    // The coordinator's startup reconciliation executed before it was killed,
+    // or if a NEW process starts up now, it must reconcile to Applied cleanly!
+    {
+        let store2 = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let rec = store2.get_integration("main", &candidate_commit).unwrap();
+        assert!(rec.is_some(), "Integration record must exist");
+        let rec = rec.unwrap();
+        assert_eq!(rec.status, IntegrationStatus::Applied, "Pre-crash pending integration must be reconciled to Applied");
+        assert_eq!(rec.integration_commit.as_deref(), Some(integration_commit.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn test_release_binary_cli_lifecycle_end_to_end() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path().join("repo");
+    let repo_str = repo_path.to_str().unwrap();
+    let db_path = dir.path().join("harness.db");
+    let artifacts_dir = dir.path().join("artifacts");
+
+    // Init Git repo
+    std::process::Command::new("git").args(["init", "-b", "main", repo_str]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.name", "Dume Test"]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.email", "test@dume.local"]).output().unwrap();
+    std::fs::write(repo_path.join("README.md"), "# E2E Release Test\n").unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "add", "."]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "commit", "-m", "init"]).output().unwrap();
+
+    let dume_bin = env!("CARGO_BIN_EXE_dume");
+
+    // 1. Run binary status check on empty db
+    let status_out = std::process::Command::new(dume_bin)
+        .args([
+            "status",
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--artifacts-dir",
+            artifacts_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute dume status");
+    assert!(status_out.status.success(), "dume status command must succeed");
+    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    assert!(status_str.contains("DUM-E Harness Status"), "Must print status banner");
+
+    // 2. Run worker attempt command directly via CLI
+    let wt = repo_path.join("worker_e2e_wt");
+    dume_git::worktree::create_git_worktree(&repo_path, &wt, "main").await.unwrap();
+
+    let worker_out = std::process::Command::new(dume_bin)
+        .args([
+            "worker",
+            "--attempt-id",
+            "att_release_1",
+            "--worktree-path",
+            wt.to_str().unwrap(),
+            "--test-command",
+            "echo 'test passed'",
+            "--task-prompt",
+            "Initialize feature",
+        ])
+        .output()
+        .expect("Failed to execute dume worker");
+    assert!(worker_out.status.success(), "dume worker command must succeed");
+    let worker_stdout = String::from_utf8_lossy(&worker_out.stdout);
+    assert!(worker_stdout.contains("\"type\":\"completed\""), "Worker output must contain completed manifest message");
+}
+

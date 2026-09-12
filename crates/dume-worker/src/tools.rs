@@ -38,6 +38,24 @@ impl LocalToolExecutor {
                     .context("Missing 'content' argument for write_file")?;
                 self.write_file(path_str, content).await
             }
+            "replace_file_content" => {
+                let path_str = args.get("path")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'path' argument for replace_file_content")?;
+                let target = args.get("target")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'target' argument for replace_file_content")?;
+                let replacement = args.get("replacement")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'replacement' argument for replace_file_content")?;
+                self.replace_file_content(path_str, target, replacement).await
+            }
+            "grep_search" => {
+                let pattern = args.get("pattern")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'pattern' argument for grep_search")?;
+                self.grep_search(pattern).await
+            }
             _ => anyhow::bail!("Unknown tool: {}", name),
         }
     }
@@ -80,16 +98,104 @@ impl LocalToolExecutor {
         Ok(format!("Successfully wrote {} bytes to {}", content.len(), rel_path))
     }
 
-    fn resolve_path(&self, rel_path: &str) -> Result<PathBuf> {
-        let clean = rel_path.trim_start_matches('/');
-        let resolved = self.worktree_path.join(clean);
-        // Normalize and guard against directory traversal
-        let canonical_base = std::fs::canonicalize(&self.worktree_path).unwrap_or_else(|_| self.worktree_path.clone());
-        if let Ok(canon_resolved) = std::fs::canonicalize(&resolved) {
-            if !canon_resolved.starts_with(&canonical_base) {
-                anyhow::bail!("Security violation: Path outside worktree: {}", rel_path);
+    async fn replace_file_content(&self, rel_path: &str, target: &str, replacement: &str) -> Result<String> {
+        let full_path = self.resolve_path(rel_path)?;
+        let content = tokio::fs::read_to_string(&full_path)
+            .await
+            .with_context(|| format!("Failed to read file for replace: {}", full_path.display()))?;
+
+        if !content.contains(target) {
+            anyhow::bail!("Target content not found in file: {}", rel_path);
+        }
+
+        let new_content = content.replacen(target, replacement, 1);
+        tokio::fs::write(&full_path, new_content)
+            .await
+            .with_context(|| format!("Failed to write modified file: {}", full_path.display()))?;
+
+        Ok(format!("Successfully replaced content in {}", rel_path))
+    }
+
+    async fn grep_search(&self, pattern: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["grep", "-n", "--", pattern])
+            .current_dir(&self.worktree_path)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).to_string())
+            }
+            Ok(out) if out.status.code() == Some(1) => {
+                Ok("No matches found".to_string())
+            }
+            _ => {
+                // Fallback to find + grep for non-git worktree directories
+                let sh_out = Command::new("grep")
+                    .args(["-rn", pattern, "."])
+                    .current_dir(&self.worktree_path)
+                    .output()
+                    .await
+                    .context("Failed to run grep search")?;
+                let text = String::from_utf8_lossy(&sh_out.stdout);
+                if text.is_empty() {
+                    Ok("No matches found".to_string())
+                } else {
+                    Ok(text.to_string())
+                }
             }
         }
-        Ok(resolved)
+    }
+
+    fn resolve_path(&self, rel_path: &str) -> Result<PathBuf> {
+        let clean = rel_path.trim_start_matches('/');
+
+        // Canonical base directory
+        let canonical_base = std::fs::canonicalize(&self.worktree_path)
+            .unwrap_or_else(|_| self.worktree_path.clone());
+
+        // Build normalized path starting from canonical_base
+        let mut normalized = canonical_base.clone();
+        for comp in std::path::Path::new(clean).components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    if normalized == canonical_base || !normalized.pop() {
+                        anyhow::bail!("Security violation: Path outside worktree: {}", rel_path);
+                    }
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(c) => normalized.push(c),
+                _ => anyhow::bail!("Security violation: Invalid path component in {}", rel_path),
+            }
+        }
+
+        // If target or any existing component is a symlink, verify canonical target remains within canonical_base
+        if normalized.exists() || normalized.is_symlink() {
+            if let Ok(canon) = std::fs::canonicalize(&normalized) {
+                if !canon.starts_with(&canonical_base) {
+                    anyhow::bail!("Security violation: Symlink or path outside worktree: {}", rel_path);
+                }
+            }
+        } else {
+            let mut parent_check = normalized.parent();
+            while let Some(p) = parent_check {
+                if p.exists() {
+                    if let Ok(canon_p) = std::fs::canonicalize(p) {
+                        if !canon_p.starts_with(&canonical_base) {
+                            anyhow::bail!("Security violation: Parent outside worktree: {}", rel_path);
+                        }
+                    }
+                    break;
+                }
+                parent_check = p.parent();
+            }
+        }
+
+        if !normalized.starts_with(&canonical_base) {
+            anyhow::bail!("Security violation: Target outside worktree: {}", rel_path);
+        }
+
+        Ok(normalized)
     }
 }
