@@ -220,3 +220,11 @@ pub async fn apply_branch_update(
     Ok(())
 }
 
+pub async fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let repo_str = repo_path.to_str().unwrap();
+    let out = Command::new("git")
+        .args(["-C", repo_str, "merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .await?;
+    Ok(out.status.success())
+}

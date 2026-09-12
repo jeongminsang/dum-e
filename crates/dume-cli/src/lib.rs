@@ -92,13 +92,26 @@ pub async fn verify_and_integrate_attempt(
     // 3. Serialized Two-Phase Cherry-pick integration (R5 crash-safe transaction)
     let integration_wt = repo_p.join(".dume/rust/integration-worktree");
 
-    // Phase 0: Check if already integrated and recorded
+    // Phase 0: Check if already integrated in DB or Git ancestry
     if let Ok(Some(existing_int)) = store.get_integration(&task.target_branch, candidate_commit) {
         if existing_int.status == IntegrationStatus::Applied {
             store.update_attempt_status(&attempt.id, AttemptStatus::Accepted)?;
             store.update_task_status(&task.id, TaskStatus::Completed)?;
             tracing::info!("Candidate commit {} already applied on {}", candidate_commit, task.target_branch);
             return Ok(());
+        }
+        if let Some(int_commit) = &existing_int.integration_commit {
+            if let Ok(current_ref) = dume_git::integrate::resolve_ref(repo_p, &task.target_branch).await {
+                if current_ref == *int_commit || dume_git::integrate::is_ancestor(repo_p, int_commit, &current_ref).await.unwrap_or(false) {
+                    let mut applied = existing_int.clone();
+                    applied.status = IntegrationStatus::Applied;
+                    store.record_integration(&applied)?;
+                    store.update_attempt_status(&attempt.id, AttemptStatus::Accepted)?;
+                    store.update_task_status(&task.id, TaskStatus::Completed)?;
+                    tracing::info!("Candidate commit {} already integrated in ancestry of {}", candidate_commit, task.target_branch);
+                    return Ok(());
+                }
+            }
         }
     }
 

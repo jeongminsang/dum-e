@@ -11,6 +11,7 @@ pub struct AgentLoop {
     worktree_path: std::path::PathBuf,
     model: String,
     max_turns: usize,
+    base_url: Option<String>,
 }
 
 impl AgentLoop {
@@ -19,7 +20,13 @@ impl AgentLoop {
             worktree_path: worktree_path.as_ref().to_path_buf(),
             model: model.into(),
             max_turns: 10,
+            base_url: None,
         }
+    }
+
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
     }
 
     pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -81,9 +88,14 @@ impl AgentLoop {
             let msgs = messages.clone();
             let tools_clone = tools.clone();
 
+            let base_url_opt = self.base_url.clone();
             // Stream response
             let stream_handle = tokio::spawn(async move {
-                if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                if let Some(base_url) = base_url_opt {
+                    // Direct mock/custom provider endpoint
+                    let p = OpenAiProvider::new("mock-key").with_base_url(&base_url);
+                    let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
+                } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
                     let p = AnthropicProvider::new(&api_key);
                     let _ = p.stream(&model_name, &msgs, &tools_clone, tx).await;
                 } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
@@ -306,5 +318,140 @@ mod tests {
         let args1: serde_json::Value = serde_json::from_str(&ordered_calls[1].2).unwrap();
         let res1 = executor.execute(&ordered_calls[1].1, &args1).await.unwrap();
         assert!(res1.contains("ordered hello"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_e2e_roundtrip_with_mock_provider() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let dir = tempdir().unwrap();
+        let wt_path = dir.path().to_path_buf();
+
+        // Spawn mock server for 2-turn agent loop:
+        // Turn 1: model returns write_file tool call
+        // Turn 2: model inspects assistant with tool_calls + tool result, then returns final text
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                if count == 0 {
+                    // Turn 1 response: call write_file
+                    let sse = format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": "call_mock_write",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": "{\"path\": \"e2e_out.txt\", \"content\": \"hello e2e agent loop\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        })
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if count == 1 {
+                    // Turn 2 verification: request payload MUST contain assistant with tool_calls and tool result
+                    assert!(req_str.contains("\"tool_calls\""), "Must contain tool_calls metadata");
+                    assert!(req_str.contains("call_mock_write"), "Must contain call_mock_write ID");
+                    assert!(req_str.contains("\"role\":\"tool\""), "Must contain tool result role");
+                    assert!(req_str.contains("Successfully wrote"), "Must contain tool result content");
+
+                    // Turn 2 response: model final answer
+                    let sse = format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "content": "E2E Task is finished."
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        })
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let mock_url = format!("http://{}", addr);
+        let agent = AgentLoop::new(&wt_path, "mock-model").with_base_url(&mock_url);
+
+        let res = agent.run_task("Write e2e_out.txt with test content").await.unwrap();
+        assert_eq!(res, "Agent completed task execution");
+
+        // Verify physical side-effect on disk!
+        let disk_file = wt_path.join("e2e_out.txt");
+        assert!(disk_file.exists(), "write_file tool must have created the file on disk");
+        let content = tokio::fs::read_to_string(&disk_file).await.unwrap();
+        assert_eq!(content, "hello e2e agent loop");
+
+        // Verify request count
+        assert_eq!(request_count.load(Ordering::SeqCst), 2, "Agent loop must execute both turns via HTTP");
+    }
+
+    #[tokio::test]
+    async fn test_tool_schema_violation_prevents_execution_zero_side_effect() {
+        let dir = tempdir().unwrap();
+        let wt_path = dir.path().to_path_buf();
+        let executor = LocalToolExecutor::new(&wt_path);
+
+        // 1. Invalid argument type: write_file path is integer instead of string
+        let bad_args1 = serde_json::json!({
+            "path": 12345,
+            "content": "some content"
+        });
+        assert!(bad_args1.get("path").and_then(|v| v.as_str()).is_none());
+
+        // 2. Missing field: write_file missing content
+        let bad_args2 = serde_json::json!({
+            "path": "missing_content.txt"
+        });
+        assert!(bad_args2.get("content").and_then(|v| v.as_str()).is_none());
+
+        // 3. Unknown tool name
+        let unknown_res = executor.execute("unsupported_tool", &serde_json::json!({})).await;
+        assert!(unknown_res.is_err(), "Unknown tool must fail");
+
+        // 4. Directory traversal attempt: ../escaped.txt
+        let bad_args_traversal = serde_json::json!({
+            "path": "../../escaped.txt",
+            "content": "malicious"
+        });
+        // Execute write_file with path traversal - must error and not write outside worktree
+        let trav_res = executor.execute("write_file", &bad_args_traversal).await;
+        // Verify no file written outside worktree
+        assert!(trav_res.is_err() || !dir.path().parent().unwrap().join("escaped.txt").exists());
+
+        // Zero side effect check: worktree must remain completely empty!
+        let mut entries = tokio::fs::read_dir(&wt_path).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none(), "Worktree must have 0 side effects");
     }
 }

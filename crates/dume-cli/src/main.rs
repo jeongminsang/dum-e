@@ -181,20 +181,33 @@ async fn run_coordinator(
         if let Some(target_commit) = &pending.integration_commit {
             // Check if Git target branch was already advanced to the integration commit before crash
             if let Ok(current_ref) = dume_git::integrate::resolve_ref(repo_p, &pending.target_branch).await {
-                if current_ref == *target_commit {
-                    // Ref was already updated: transition DB status to Applied cleanly
+                let is_already_integrated = current_ref == *target_commit
+                    || dume_git::integrate::is_ancestor(repo_p, target_commit, &current_ref).await.unwrap_or(false);
+
+                if is_already_integrated {
+                    // Ref was already updated or further advanced by subsequent normal commits: transition DB status to Applied cleanly
                     let mut applied = pending.clone();
                     applied.status = IntegrationStatus::Applied;
                     store.record_integration(&applied)?;
-                    tracing::info!("Reconciled pre-crash pending integration for branch {} -> Applied", pending.target_branch);
+                    tracing::info!("Reconciled pre-crash pending integration for branch {} (ref: {}) -> Applied", pending.target_branch, current_ref);
                 } else if current_ref == pending.base_commit {
-                    // Ref was not updated: retry update-ref
-                    if dume_git::integrate::apply_branch_update(repo_p, &pending.target_branch, target_commit, &pending.base_commit).await.is_ok() {
-                        let mut applied = pending.clone();
-                        applied.status = IntegrationStatus::Applied;
-                        store.record_integration(&applied)?;
-                        tracing::info!("Completed pre-crash pending integration for branch {} -> Applied", pending.target_branch);
+                    // Ref was not updated: attempt atomic update-ref with CAS
+                    match dume_git::integrate::apply_branch_update(repo_p, &pending.target_branch, target_commit, &pending.base_commit).await {
+                        Ok(()) => {
+                            let mut applied = pending.clone();
+                            applied.status = IntegrationStatus::Applied;
+                            store.record_integration(&applied)?;
+                            tracing::info!("Completed pre-crash pending integration for branch {} -> Applied", pending.target_branch);
+                        }
+                        Err(cas_err) => {
+                            tracing::warn!("Pre-crash pending integration CAS update-ref failed for branch {}: {}", pending.target_branch, cas_err);
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        "Target branch {} moved unexpectedly (current: {}, expected base: {}, candidate: {:?}); CAS update-ref rejected",
+                        pending.target_branch, current_ref, pending.base_commit, pending.integration_commit
+                    );
                 }
             }
         }

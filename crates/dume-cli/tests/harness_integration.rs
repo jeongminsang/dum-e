@@ -792,6 +792,93 @@ async fn test_r5_crash_after_git_update_before_applied_db_record_recovery() {
     }
 }
 
+#[tokio::test]
+async fn test_r5_subsequent_commit_ancestry_reconciliation() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path().join("repo");
+    let repo_str = repo_path.to_str().unwrap();
+    let db_path = dir.path().join("harness.db");
+    let artifacts_dir = dir.path().join("artifacts");
 
+    // Init Git repository with initial commit
+    std::process::Command::new("git").args(["init", "-b", "main", repo_str]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.name", "Dume Test"]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "user.email", "test@dume.local"]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "config", "commit.gpgSign", "false"]).output().unwrap();
 
+    std::fs::write(repo_path.join("README.md"), "# Repo\n").unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "add", "."]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "commit", "-m", "initial"]).output().unwrap();
 
+    let base_head = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
+
+    // Create candidate commit
+    let candidate_commit = {
+        let wt = repo_path.join("wt_cand");
+        dume_git::worktree::create_git_worktree(&repo_path, &wt, "main").await.unwrap();
+        std::fs::write(wt.join("feature.txt"), "feature 1\n").unwrap();
+        let c = dume_git::commit::commit_worktree_changes(&wt, "feat: feature 1").await.unwrap();
+        dume_git::worktree::remove_git_worktree(&repo_path, &wt).await.unwrap();
+        c
+    };
+
+    let int_wt = repo_path.join("wt_int");
+    let prep_res = dume_git::integrate::prepare_candidate_cherry_pick(
+        &repo_path,
+        "main",
+        &candidate_commit,
+        &int_wt,
+    ).await.unwrap();
+
+    let integration_commit = match prep_res {
+        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => integration_commit,
+        _ => panic!("Expected prep success"),
+    };
+
+    // Store writes Pending record
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let pending = Integration {
+            target_branch: "main".to_string(),
+            base_commit: base_head.clone(),
+            candidate_commit: candidate_commit.clone(),
+            integration_commit: Some(integration_commit.clone()),
+            status: IntegrationStatus::Pending,
+            error_message: None,
+            integrated_at: 1000,
+        };
+        store.record_integration(&pending).unwrap();
+    }
+
+    // Git ref updated to integration_commit
+    dume_git::integrate::apply_branch_update(&repo_path, "main", &integration_commit, &base_head).await.unwrap();
+
+    // Now a normal subsequent commit is added to main by another task/user!
+    std::fs::write(repo_path.join("subsequent.txt"), "subsequent normal commit\n").unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "add", "."]).output().unwrap();
+    std::process::Command::new("git").args(["-C", repo_str, "commit", "-m", "feat: subsequent normal"]).output().unwrap();
+
+    let subsequent_head = dume_git::integrate::resolve_ref(&repo_path, "main").await.unwrap();
+    assert_ne!(subsequent_head, integration_commit, "HEAD has advanced past integration_commit");
+
+    // Coordinator reconciles pending integration on restart
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let pending_list = store.list_pending_integrations().unwrap();
+        assert_eq!(pending_list.len(), 1);
+
+        let pending = &pending_list[0];
+        let current_ref = dume_git::integrate::resolve_ref(&repo_path, &pending.target_branch).await.unwrap();
+        
+        // Ancestry check: integration_commit is an ancestor of subsequent_head
+        let is_in_ancestry = dume_git::integrate::is_ancestor(&repo_path, pending.integration_commit.as_ref().unwrap(), &current_ref).await.unwrap();
+        assert!(is_in_ancestry, "integration_commit must be recognized in ancestry");
+
+        let mut applied = pending.clone();
+        applied.status = IntegrationStatus::Applied;
+        store.record_integration(&applied).unwrap();
+
+        let updated = store.get_integration("main", &candidate_commit).unwrap().unwrap();
+        assert_eq!(updated.status, IntegrationStatus::Applied);
+    }
+}
