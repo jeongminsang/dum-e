@@ -176,8 +176,17 @@ async fn test_real_process_crash_and_recovery() {
         };
         store.create_task(&task).unwrap();
 
-        // Worker begins running attempt
-        let _att = store.create_attempt("att_c1", "t_crash", 1, "w1", "/tmp/wt_c1", 10_000).unwrap();
+        // Worker 1 starts attempt (running, not submitted)
+        let _att1 = store.create_attempt("att_c1", "t_crash", 1, "w1", "/tmp/wt_c1", 10_000).unwrap();
+
+        // Worker 2 finished and submitted result just before crash
+        let _att2 = store.create_attempt("att_c2", "t_crash", 1, "w2", "/tmp/wt_c2", 10_000).unwrap();
+        store.submit_attempt_result("att_c2", 1, "commit_submitted", "hash_submitted").unwrap();
+
+        // Task 3 was already verified and completed earlier
+        let _att3 = store.create_attempt("att_c3", "t_crash", 1, "w3", "/tmp/wt_c3", 10_000).unwrap();
+        store.submit_attempt_result("att_c3", 1, "commit_completed", "hash_completed").unwrap();
+        store.update_attempt_status("att_c3", AttemptStatus::Accepted).unwrap();
 
         // Simulate abrupt SIGKILL of coordinator 1 without release_coordinator_lock:
         // (Coordinator drops without clean exit, lease remains in DB)
@@ -199,18 +208,32 @@ async fn test_real_process_crash_and_recovery() {
         let lock2 = store2.acquire_coordinator_lock("coord_main", "proc_parent_2", 10_000).unwrap();
         assert_eq!(lock2.epoch, 2); // Monotonic increase to 2
 
-        // Crash recovery: uncommitted attempt from epoch 1 transitions to needs_attention
+        // Crash recovery:
+        // 1. Uncommitted running attempt from epoch 1 transitions to needs_attention
+        // 2. Already submitted attempt is recovered into ready_for_verify queue!
+        // 3. Already accepted attempt remains undisturbed
         let (ready, needs_attention, _) = store2.recover_state(lock2.epoch).unwrap();
-        assert_eq!(ready.len(), 0);
+        
+        // att_c2 was submitted before crash -> MUST be recovered for verification
+        assert_eq!(ready.len(), 1, "Result-submitted attempt must be recovered for verification");
+        assert_eq!(ready[0].id, "att_c2");
+        assert_eq!(ready[0].candidate_commit.as_deref(), Some("commit_submitted"));
+
+        // att_c1 was running without submission -> MUST be quarantined to needs_attention
         assert_eq!(needs_attention.len(), 1);
         assert_eq!(needs_attention[0].id, "att_c1");
         assert_eq!(needs_attention[0].status, AttemptStatus::NeedsAttention);
+
+        // att_c3 was already accepted -> remains Accepted
+        let att3 = store2.get_attempt("att_c3").unwrap();
+        assert_eq!(att3.status, AttemptStatus::Accepted);
 
         // Stale worker att_c1 late submission is rejected
         let stale = store2.submit_attempt_result("att_c1", 1, "commit_stale", "hash_stale");
         assert!(stale.is_err(), "Late worker submission after coordinator crash must be rejected");
     }
 }
+
 
 #[tokio::test]
 async fn test_e2e_full_agent_workflow() {
@@ -356,5 +379,137 @@ async fn test_e2e_full_agent_workflow() {
         _ => panic!("Integration expected to succeed"),
     }
 }
+
+#[tokio::test]
+async fn test_r4_conflict_vs_acceptance_failure_separation() {
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+    let repo_str = repo_path.to_str().unwrap();
+
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_str])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+
+    // Initial commit
+    std::fs::write(repo_path.join("file.txt"), "line1\n").unwrap();
+    run_git(&["add", "file.txt"]);
+    run_git(&["commit", "-m", "Initial commit"]);
+
+    let initial_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // 1. Create a conflicting commit on candidate branch
+    let wt_conf = repo_path.join("wt_conf");
+    dume_git::worktree::create_git_worktree(repo_path, &wt_conf, "main").await.unwrap();
+    std::fs::write(wt_conf.join("file.txt"), "candidate conflicting edit\n").unwrap();
+    let conf_commit = dume_git::commit::commit_worktree_changes(&wt_conf, "conflicting edit").await.unwrap();
+    dume_git::worktree::remove_git_worktree(repo_path, &wt_conf).await.unwrap();
+
+    // In main repo, create conflicting change
+    std::fs::write(repo_path.join("file.txt"), "main different edit\n").unwrap();
+    run_git(&["add", "file.txt"]);
+    run_git(&["commit", "-m", "main edit"]);
+    let main_updated_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Attempt cherry-pick integration -> MUST result in Conflict, NOT acceptance failure
+    let int_wt = repo_path.join("wt_int");
+    let res = dume_git::integrate::integrate_candidate_commit(repo_path, "main", &conf_commit, &int_wt).await.unwrap();
+    
+    match res {
+        dume_git::integrate::IntegrationResult::Conflict { .. } => {
+            // Target branch ref must remain COMPLETELY UNTOUCHED
+            let current_head = {
+                let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            assert_eq!(current_head, main_updated_head, "Target branch ref was not modified during conflict");
+        }
+        _ => panic!("Expected Conflict result, got {:?}", res),
+    }
+}
+
+#[tokio::test]
+async fn test_r5_branch_ref_ancestry_reconciliation() {
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+    let repo_str = repo_path.to_str().unwrap();
+
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_str])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+
+    std::fs::write(repo_path.join("base.txt"), "base\n").unwrap();
+    run_git(&["add", "base.txt"]);
+    run_git(&["commit", "-m", "Base commit"]);
+
+    let base_commit = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Create candidate commit based on initial base
+    let wt_cand = repo_path.join("wt_cand");
+    dume_git::worktree::create_git_worktree(repo_path, &wt_cand, "main").await.unwrap();
+    std::fs::write(wt_cand.join("feature.txt"), "new feature\n").unwrap();
+    let candidate_commit = dume_git::commit::commit_worktree_changes(&wt_cand, "feat: new feature").await.unwrap();
+    dume_git::worktree::remove_git_worktree(repo_path, &wt_cand).await.unwrap();
+
+    // Advance main with an independent commit so cherry-pick has a new parent and produces a distinct hash
+    std::fs::write(repo_path.join("independent.txt"), "independent work on main\n").unwrap();
+    run_git(&["add", "independent.txt"]);
+    run_git(&["commit", "-m", "independent main work"]);
+
+    // Cherry-pick integrate
+    let int_wt = repo_path.join("wt_int_r5");
+    let int_res = dume_git::integrate::integrate_candidate_commit(repo_path, "main", &candidate_commit, &int_wt).await.unwrap();
+
+
+    let integration_commit = match int_res {
+        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => integration_commit,
+        _ => panic!("Expected integration success"),
+    };
+
+    // Simulate normal subsequent commits created on main after integration
+    std::fs::write(repo_path.join("later.txt"), "later commit\n").unwrap();
+    run_git(&["add", "later.txt"]);
+    run_git(&["commit", "-m", "subsequent commit on main"]);
+
+    // Test Ancestry check (R5):
+    // Check if integration_commit is an ancestor of main
+    let is_ancestor = std::process::Command::new("git")
+        .args(["-C", repo_str, "merge-base", "--is-ancestor", &integration_commit, "main"])
+        .status()
+        .unwrap()
+        .success();
+
+    assert!(is_ancestor, "R5 Ancestry check proves integration_commit is in main branch history even with subsequent commits");
+
+    // Candidate commit hash itself is different from integration_commit hash
+    assert_ne!(candidate_commit, integration_commit, "Candidate commit hash must differ from cherry-picked integration commit");
+}
+
 
 

@@ -91,11 +91,24 @@ impl OpenAiProvider {
                                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                                         let _ = tx.send(StreamEvent::TextDelta(content.to_string())).await;
                                     }
+                                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                        for tc in tool_calls {
+                                            let id = tc.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                                            let args_delta = tc.get("function").and_then(|f| f.get("arguments")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                                            let _ = tx.send(StreamEvent::ToolCallDelta {
+                                                id,
+                                                name,
+                                                arguments_delta: args_delta,
+                                            }).await;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
                 Err(e) => {
                     let _ = tx.send(StreamEvent::Error(e.to_string())).await;
                     break;
