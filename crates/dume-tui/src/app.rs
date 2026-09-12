@@ -258,25 +258,125 @@ async fn dispatch_stream(
     tx: mpsc::Sender<StreamEvent>,
 ) {
     let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    let tools = dume_worker::AgentLoop::tool_definitions();
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let tool_executor = dume_worker::LocalToolExecutor::new(current_dir);
 
-    if let Some(token) = cred_store.resolve_valid_token("anthropic").await {
-        let provider = AnthropicProvider::new(&token);
-        if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-        }
+    enum ActiveProvider {
+        Anthropic(AnthropicProvider),
+        OpenAi(OpenAiProvider),
+        Gemini(GeminiProvider),
+    }
+
+    let active_provider = if let Some(token) = cred_store.resolve_valid_token("anthropic").await {
+        ActiveProvider::Anthropic(AnthropicProvider::new(&token))
     } else if let Some(token) = cred_store.resolve_valid_token("openai").await {
-        let provider = OpenAiProvider::new(&token);
-        if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-        }
+        ActiveProvider::OpenAi(OpenAiProvider::new(&token))
     } else if let Some(token) = cred_store.resolve_valid_token("gemini").await {
-        let provider = GeminiProvider::new(&token);
-        if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-        }
+        ActiveProvider::Gemini(GeminiProvider::new(&token))
     } else {
-        // Fallback or local Ollama check
         let _ = tx.send(StreamEvent::TextDelta("DUM-E native Rust engine connected. (Authenticate with OAuth via `dume login` or set ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).".to_string())).await;
         let _ = tx.send(StreamEvent::Completed { finish_reason: "stop".to_string() }).await;
+        return;
+    };
+
+    let mut current_messages = messages.to_vec();
+    let max_turns = 10;
+
+    for _turn in 0..max_turns {
+        let (sub_tx, mut sub_rx) = mpsc::channel::<StreamEvent>(100);
+        let tx_forward = tx.clone();
+
+        // Forward stream events and collect response
+        let stream_handle = tokio::spawn(async move {
+            let mut assistant_text = String::new();
+            let mut tool_calls: Vec<dume_provider::ToolCall> = Vec::new();
+            let mut current_call: Option<(String, String, String)> = None; // (id, name, args)
+
+            while let Some(event) = sub_rx.recv().await {
+                match &event {
+                    StreamEvent::TextDelta(delta) => {
+                        assistant_text.push_str(delta);
+                        let _ = tx_forward.send(event).await;
+                    }
+                    StreamEvent::ToolCallDelta { id, name, arguments_delta, .. } => {
+                        let _ = tx_forward.send(event.clone()).await;
+                        if let Some(call_id) = id {
+                            if let Some((prev_id, prev_name, prev_args)) = current_call.take() {
+                                tool_calls.push(dume_provider::ToolCall {
+                                    id: prev_id,
+                                    name: prev_name,
+                                    arguments: prev_args,
+                                });
+                            }
+                            current_call = Some((
+                                call_id.clone(),
+                                name.clone().unwrap_or_default(),
+                                arguments_delta.clone(),
+                            ));
+                        } else if let Some((_, _, ref mut args)) = current_call {
+                            args.push_str(arguments_delta);
+                        }
+                    }
+                    StreamEvent::Completed { .. } => {
+                        if let Some((prev_id, prev_name, prev_args)) = current_call.take() {
+                            tool_calls.push(dume_provider::ToolCall {
+                                id: prev_id,
+                                name: prev_name,
+                                arguments: prev_args,
+                            });
+                        }
+                    }
+                    StreamEvent::Error(_) => {
+                        let _ = tx_forward.send(event).await;
+                    }
+                }
+            }
+
+            (assistant_text, tool_calls)
+        });
+
+        let stream_res = match &active_provider {
+            ActiveProvider::Anthropic(p) => p.stream(model, &current_messages, &tools, sub_tx).await,
+            ActiveProvider::OpenAi(p) => p.stream(model, &current_messages, &tools, sub_tx).await,
+            ActiveProvider::Gemini(p) => p.stream(model, &current_messages, &tools, sub_tx).await,
+        };
+
+        if let Err(e) = stream_res {
+            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+            return;
+        }
+
+        let (assistant_text, tool_calls) = match stream_handle.await {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                return;
+            }
+        };
+
+        if tool_calls.is_empty() {
+            let _ = tx.send(StreamEvent::Completed { finish_reason: "stop".to_string() }).await;
+            break;
+        }
+
+        // Add assistant message with tool calls
+        let mut assistant_msg = ChatMessage::assistant(assistant_text);
+        assistant_msg.tool_calls = Some(tool_calls.clone());
+        current_messages.push(assistant_msg);
+
+        // Execute each tool and append tool result messages
+        for call in &tool_calls {
+            let _ = tx.send(StreamEvent::TextDelta(format!("\n[Tool execution: {}]\n", call.name))).await;
+            let args_value = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+            let result = tool_executor.execute(&call.name, &args_value).await;
+            let output_str = match result {
+                Ok(output) => output,
+                Err(err) => format!("Execution failure: {}", err),
+            };
+
+            let _ = tx.send(StreamEvent::TextDelta(format!("[Finished {}]\n", call.name))).await;
+            current_messages.push(ChatMessage::tool(&call.id, &output_str));
+        }
     }
 }

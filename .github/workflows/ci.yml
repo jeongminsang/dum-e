@@ -35,6 +35,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Check and Test
+        run: |
+          cargo check --workspace
+          cargo test --workspace
+
       - name: Check
         run: npm run check
 

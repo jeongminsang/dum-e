@@ -38,16 +38,58 @@ impl ModelCatalog {
     }
 
     pub fn list_all_builtin_models() -> Result<Vec<ModelInfo>> {
-        let mut all = Vec::new();
-        if let Ok(m) = Self::anthropic_models() {
-            all.extend(m.into_values());
+        const ALL_CATALOG_SOURCES: &[&str] = &[
+            include_str!("../catalog/amazon-bedrock.json"),
+            include_str!("../catalog/ant-ling.json"),
+            include_str!("../catalog/anthropic.json"),
+            include_str!("../catalog/azure-openai-responses.json"),
+            include_str!("../catalog/baseten.json"),
+            include_str!("../catalog/cerebras.json"),
+            include_str!("../catalog/cloudflare-ai-gateway.json"),
+            include_str!("../catalog/cloudflare-workers-ai.json"),
+            include_str!("../catalog/deepseek.json"),
+            include_str!("../catalog/fireworks.json"),
+            include_str!("../catalog/github-copilot.json"),
+            include_str!("../catalog/google-vertex.json"),
+            include_str!("../catalog/google.json"),
+            include_str!("../catalog/groq.json"),
+            include_str!("../catalog/huggingface.json"),
+            include_str!("../catalog/kimi-coding.json"),
+            include_str!("../catalog/minimax-cn.json"),
+            include_str!("../catalog/minimax.json"),
+            include_str!("../catalog/mistral.json"),
+            include_str!("../catalog/moonshotai-cn.json"),
+            include_str!("../catalog/moonshotai.json"),
+            include_str!("../catalog/nvidia.json"),
+            include_str!("../catalog/openai-codex.json"),
+            include_str!("../catalog/openai.json"),
+            include_str!("../catalog/opencode-go.json"),
+            include_str!("../catalog/opencode.json"),
+            include_str!("../catalog/openrouter.json"),
+            include_str!("../catalog/qwen-token-plan-cn.json"),
+            include_str!("../catalog/qwen-token-plan-individual.json"),
+            include_str!("../catalog/qwen-token-plan.json"),
+            include_str!("../catalog/together.json"),
+            include_str!("../catalog/vercel-ai-gateway.json"),
+            include_str!("../catalog/xai.json"),
+            include_str!("../catalog/xiaomi-token-plan-ams.json"),
+            include_str!("../catalog/xiaomi-token-plan-cn.json"),
+            include_str!("../catalog/xiaomi-token-plan-sgp.json"),
+            include_str!("../catalog/xiaomi.json"),
+            include_str!("../catalog/zai-coding-cn.json"),
+            include_str!("../catalog/zai.json"),
+        ];
+
+        let mut all_map = HashMap::new();
+        for src in ALL_CATALOG_SOURCES {
+            if let Ok(m) = Self::parse_catalog(src) {
+                for (id, info) in m {
+                    all_map.entry(id).or_insert(info);
+                }
+            }
         }
-        if let Ok(m) = Self::openai_models() {
-            all.extend(m.into_values());
-        }
-        if let Ok(m) = Self::google_models() {
-            all.extend(m.into_values());
-        }
+
+        let mut all: Vec<ModelInfo> = all_map.into_values().collect();
         all.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(all)
     }

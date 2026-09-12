@@ -21,6 +21,7 @@ packages/ai/src/providers/.model-generation-*/
 .zed/
 .idea/
 .claude/
+.gjc/
 *.swp
 *.swo
 *~

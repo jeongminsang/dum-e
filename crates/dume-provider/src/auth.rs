@@ -94,10 +94,10 @@ impl CredentialStore {
         if let (Some(access_token), Some(refresh_token), Some(expires_at)) = (&cred.access_token, &cred.refresh_token, cred.expires_at) {
             if expires_at - now < buffer_ms {
                 // Token expiring soon or expired: perform refresh
-                if provider == "anthropic" {
+                if let Some(config) = crate::oauth::get_oauth_config(provider) {
                     if let Ok(token_resp) = crate::oauth::refresh_oauth_token(
-                        crate::oauth::ANTHROPIC_TOKEN_URL,
-                        crate::oauth::ANTHROPIC_CLIENT_ID,
+                        config.token_url,
+                        config.client_id,
                         refresh_token,
                     ).await {
                         let new_cred = Credential {

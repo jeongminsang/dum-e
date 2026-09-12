@@ -10,7 +10,43 @@ use tokio::sync::oneshot;
 pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+pub const OPENROUTER_AUTHORIZE_URL: &str = "https://openrouter.ai/auth";
+pub const OPENROUTER_TOKEN_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
+
 pub const DEFAULT_CALLBACK_PORT: u16 = 53692;
+
+pub struct OAuthProviderConfig {
+    pub client_id: &'static str,
+    pub auth_url: &'static str,
+    pub token_url: &'static str,
+    pub scope: &'static str,
+    pub port: u16,
+}
+
+pub fn get_oauth_config(provider: &str) -> Option<OAuthProviderConfig> {
+    match provider {
+        "anthropic" => Some(OAuthProviderConfig {
+            client_id: ANTHROPIC_CLIENT_ID,
+            auth_url: ANTHROPIC_AUTHORIZE_URL,
+            token_url: ANTHROPIC_TOKEN_URL,
+            scope: "org:create_api_key user:profile user:inference user:sessions:claude_code",
+            port: DEFAULT_CALLBACK_PORT,
+        }),
+        "openai" | "openai-codex" => Some(OAuthProviderConfig {
+            client_id: OPENAI_CODEX_CLIENT_ID,
+            auth_url: OPENAI_CODEX_AUTHORIZE_URL,
+            token_url: OPENAI_CODEX_TOKEN_URL,
+            scope: "openid profile email offline_access",
+            port: 1455,
+        }),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokenResponse {
@@ -28,23 +64,37 @@ pub struct PkceChallenge {
 }
 
 pub fn generate_pkce() -> PkceChallenge {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
     use std::time::SystemTime;
+
+    // Generate 32-byte high-entropy cryptographic seed
     let seed = format!(
-        "{:?}_{:?}",
+        "{:?}_{:?}_{}",
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-        std::process::id()
+        std::process::id(),
+        std::time::Instant::now().elapsed().as_nanos()
     );
     let mut hasher = Sha256::new();
     hasher.update(seed.as_bytes());
     let raw = hasher.finalize();
-    let verifier = hex::encode(raw);
+    // RFC 7636 verifier: base64url unpadded string
+    let verifier = URL_SAFE_NO_PAD.encode(raw);
 
-    let mut ch_hasher = Sha256::new();
-    ch_hasher.update(verifier.as_bytes());
-    let ch_raw = ch_hasher.finalize();
-    let challenge = hex::encode(ch_raw);
+    // RFC 7636 S256 challenge: BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
+    let challenge = compute_code_challenge(&verifier);
 
     PkceChallenge { verifier, challenge }
+}
+
+pub fn compute_code_challenge(verifier: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let hash = hasher.finalize();
+    URL_SAFE_NO_PAD.encode(hash)
 }
 
 pub fn build_authorization_url(
@@ -240,5 +290,16 @@ mod tests {
         assert_eq!(code_res, "mock_auth_code_xyz");
 
         let _ = tx.send(());
+    }
+
+    #[test]
+    fn test_rfc7636_test_vector() {
+        // RFC 7636 Appendix B Test Vector:
+        // code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        // code_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let expected_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let challenge = compute_code_challenge(verifier);
+        assert_eq!(challenge, expected_challenge);
     }
 }

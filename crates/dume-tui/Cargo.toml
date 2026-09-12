@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 dume-core = { workspace = true }
 dume-provider = { workspace = true }
+dume-worker = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }

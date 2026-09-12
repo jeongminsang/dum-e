@@ -349,18 +349,41 @@ impl AgentLoop {
                         let model_name = self.model.clone();
                         let base_url_opt = self.base_url.clone();
 
+                        let parent_repo = self.worktree_path.clone();
                         let child_prompt = prompt.clone();
+                        let child_wt_clone = child_wt.clone();
+
                         let res = subagent_manager.start_subagent(&sub_id, &prompt, move |_token| async move {
-                            let _ = tokio::fs::create_dir_all(&child_wt).await;
-                            let mut child_agent = AgentLoop::new(&child_wt, &model_name);
+                            // Try creating an isolated Git worktree if in a git repo, otherwise directory
+                            let is_git = parent_repo.join(".git").exists() || tokio::process::Command::new("git")
+                                .args(["-C", parent_repo.to_str().unwrap(), "rev-parse", "--is-inside-work-tree"])
+                                .output().await.map(|o| o.status.success()).unwrap_or(false);
+
+                            let worktree_created = if is_git {
+                                dume_git::create_git_worktree(&parent_repo, &child_wt_clone, "HEAD").await.is_ok()
+                            } else {
+                                false
+                            };
+
+                            if !worktree_created {
+                                let _ = tokio::fs::create_dir_all(&child_wt_clone).await;
+                            }
+
+                            let mut child_agent = AgentLoop::new(&child_wt_clone, &model_name);
                             if let Some(b) = base_url_opt {
                                 child_agent = child_agent.with_base_url(b);
                             }
-                            child_agent.run_task(&child_prompt).await
+                            let task_res = child_agent.run_task(&child_prompt).await;
+
+                            if worktree_created {
+                                let _ = dume_git::remove_git_worktree(&parent_repo, &child_wt_clone).await;
+                            }
+
+                            task_res
                         }).await;
 
                         match res {
-                            Ok(_) => format!("Subagent '{}' started successfully in {}", sub_id, sub_dir),
+                            Ok(_) => format!("Subagent '{}' started successfully in isolated worktree {}", sub_id, sub_dir),
                             Err(e) => format!("Failed to start subagent: {}", e),
                         }
                     }
