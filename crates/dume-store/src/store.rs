@@ -492,13 +492,13 @@ impl HarnessStore {
         Ok(())
     }
 
-    pub fn get_integration_by_candidate(&self, candidate_commit: &str) -> Result<Option<Integration>, StoreError> {
+    pub fn get_integration(&self, target_branch: &str, candidate_commit: &str) -> Result<Option<Integration>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT target_branch, base_commit, candidate_commit, integration_commit, status, error_message, integrated_at
-             FROM integrations WHERE candidate_commit = ?1",
+             FROM integrations WHERE target_branch = ?1 AND candidate_commit = ?2",
         )?;
-        let mut rows = stmt.query(params![candidate_commit])?;
+        let mut rows = stmt.query(params![target_branch, candidate_commit])?;
         if let Some(row) = rows.next()? {
             let status_str: String = row.get(4)?;
             let status: IntegrationStatus = serde_json::from_str(&format!("\"{}\"", status_str))
@@ -515,6 +515,33 @@ impl HarnessStore {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn list_pending_integrations(&self) -> Result<Vec<Integration>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT target_branch, base_commit, candidate_commit, integration_commit, status, error_message, integrated_at
+             FROM integrations WHERE status = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(4)?;
+            let status: IntegrationStatus = serde_json::from_str(&format!("\"{}\"", status_str))
+                .unwrap_or(IntegrationStatus::Pending);
+            Ok(Integration {
+                target_branch: row.get(0)?,
+                base_commit: row.get(1)?,
+                candidate_commit: row.get(2)?,
+                integration_commit: row.get(3)?,
+                status,
+                error_message: row.get(5)?,
+                integrated_at: row.get(6)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
     }
 
     // --- External Operations (Slice 2) ---

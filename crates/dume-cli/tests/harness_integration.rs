@@ -580,8 +580,8 @@ async fn test_r4_clean_merge_but_acceptance_criteria_failure_rejects() {
     let _attempt = store.create_attempt("att_r4_fail", &task.id, 1, "worker", "/tmp/wt", 30_000).unwrap();
     store.submit_attempt_result("att_r4_fail", 1, &candidate_commit, &manifest_hash).unwrap();
 
-    // Coordinator runs verify_and_integrate_attempt
-    let res = dume_cli_verify_helper(&store, repo_str, &store.get_attempt("att_r4_fail").unwrap(), 1).await;
+    // Coordinator runs real production verify_and_integrate_attempt directly
+    let res = dume_cli::verify_and_integrate_attempt(&store, repo_str, &store.get_attempt("att_r4_fail").unwrap(), 1).await;
     assert!(res.is_ok());
 
     // Task and Attempt MUST be Rejected / Failed
@@ -670,7 +670,7 @@ async fn test_r7_tampered_manifest_artifact_blocks_verification() {
     std::fs::write(&artifact_file, b"corrupted payload").unwrap();
 
     // Verify should catch tampering via InvalidData and REJECT integration
-    let res = dume_cli_verify_helper(&store, repo_str, &store.get_attempt("att_r7").unwrap(), 1).await;
+    let res = dume_cli::verify_and_integrate_attempt(&store, repo_str, &store.get_attempt("att_r7").unwrap(), 1).await;
     assert!(res.is_ok());
 
     let updated_att = store.get_attempt("att_r7").unwrap();
@@ -686,79 +686,110 @@ async fn test_r7_tampered_manifest_artifact_blocks_verification() {
     assert_eq!(current_head, base_head, "Target branch ref must not advance when artifact is corrupted");
 }
 
-async fn dume_cli_verify_helper(
-    store: &HarnessStore,
-    repo_path: &str,
-    attempt: &Attempt,
-    epoch: i64,
-) -> anyhow::Result<()> {
-    let task = store.get_task(&attempt.task_id)?;
-    let candidate_commit = attempt.candidate_commit.as_ref().unwrap();
-    let repo_p = std::path::Path::new(repo_path);
-    let verify_wt_dir = repo_p.join(format!(".dume/rust/verify-wt-{}", attempt.id));
+#[tokio::test]
+async fn test_r5_crash_after_git_update_before_applied_db_record_recovery() {
+    let temp_repo = tempdir().unwrap();
+    let repo_path = temp_repo.path();
+    let repo_str = repo_path.to_str().unwrap();
 
-    dume_git::worktree::create_git_worktree(repo_p, &verify_wt_dir, candidate_commit).await?;
-
-    let (acceptance_passed, acceptance_details) = if task.acceptance_criteria.is_empty() {
-        (false, "No criteria".to_string())
-    } else {
-        let mut passed = true;
-        let mut detail = "OK".to_string();
-        for cmd in &task.acceptance_criteria {
-            let res = dume_worker::WorkerExecutor::run_test_command(&verify_wt_dir, cmd).await?;
-            if !res.passed {
-                passed = false;
-                detail = format!("Failed {}", cmd);
-                break;
-            }
-        }
-        (passed, detail)
-    };
-    let _ = dume_git::worktree::remove_git_worktree(repo_p, &verify_wt_dir).await;
-
-    let (allowed_paths_passed, manifest_hash_str) = match &attempt.manifest_hash {
-        Some(h) => match store.artifacts.get_artifact(h) {
-            Ok(bytes) => match serde_json::from_slice::<ResultManifest>(&bytes) {
-                Ok(manifest) => (verify_allowed_paths(&task, &manifest), h.clone()),
-                Err(_) => (false, h.clone()),
-            },
-            Err(_) => (false, h.clone()),
-        },
-        None => (false, "".to_string()),
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_str])
+            .args(args)
+            .output()
+            .expect("Failed to run git command");
+        assert!(output.status.success(), "Git command failed: {:?}", args);
     };
 
-    let overall_passed = acceptance_passed && allowed_paths_passed;
-    let verification = Verification {
-        attempt_id: attempt.id.clone(),
-        epoch,
-        passed: overall_passed,
-        allowed_paths_passed,
-        acceptance_command_passed: acceptance_passed,
-        manifest_hash: manifest_hash_str,
-        details: acceptance_details,
-        verified_at: 0,
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.email", "dume@example.com"]);
+    run_git(&["config", "user.name", "DUM-E Agent"]);
+    std::fs::write(repo_path.join("init.txt"), "base\n").unwrap();
+    run_git(&["add", "init.txt"]);
+    run_git(&["commit", "-m", "init"]);
+    let base_head = {
+        let out = std::process::Command::new("git").args(["-C", repo_str, "rev-parse", "main"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    store.record_verification(&verification)?;
 
-    if !overall_passed {
-        store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
-        store.update_task_status(&task.id, TaskStatus::Failed)?;
-        return Ok(());
-    }
+    let db_path = repo_path.join(".dume/rust/harness.db");
+    let artifacts_dir = repo_path.join(".dume/rust/artifacts");
 
-    let int_wt = repo_p.join(".dume/rust/integration-worktree");
-    let int_res = dume_git::integrate::integrate_candidate_commit(
-        repo_p,
-        &task.target_branch,
-        candidate_commit,
+    let candidate_commit = {
+        let wt = repo_path.join("wt_r5_crash");
+        dume_git::worktree::create_git_worktree(repo_path, &wt, "main").await.unwrap();
+        std::fs::write(wt.join("feature.txt"), "crash-resilient feature\n").unwrap();
+        let c = dume_git::commit::commit_worktree_changes(&wt, "feat: crash-resilient").await.unwrap();
+        dume_git::worktree::remove_git_worktree(repo_path, &wt).await.unwrap();
+        c
+    };
+
+    let int_wt = repo_path.join("wt_r5_int");
+    let prep_res = dume_git::integrate::prepare_candidate_cherry_pick(
+        repo_path,
+        "main",
+        &candidate_commit,
         &int_wt,
-    ).await?;
+    ).await.unwrap();
 
-    if let dume_git::integrate::IntegrationResult::Success { .. } = int_res {
-        store.update_attempt_status(&attempt.id, AttemptStatus::Accepted)?;
-        store.update_task_status(&task.id, TaskStatus::Completed)?;
+    let integration_commit = match prep_res {
+        dume_git::integrate::IntegrationResult::Success { integration_commit, .. } => integration_commit,
+        _ => panic!("Expected prep success"),
+    };
+
+    // Phase 1: DB writes 'pending' record
+    {
+        let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        let pending = Integration {
+            target_branch: "main".to_string(),
+            base_commit: base_head.clone(),
+            candidate_commit: candidate_commit.clone(),
+            integration_commit: Some(integration_commit.clone()),
+            status: IntegrationStatus::Pending,
+            error_message: None,
+            integrated_at: 1000,
+        };
+        store.record_integration(&pending).unwrap();
     }
-    Ok(())
+
+    // Phase 2: Git branch ref is updated to integration_commit
+    dume_git::integrate::apply_branch_update(repo_path, "main", &integration_commit, &base_head).await.unwrap();
+
+    // CRASH INJECTION:
+    // Process abruptly terminates here BEFORE writing status = 'applied' to SQLite!
+    // At this moment:
+    // - Git 'main' points to integration_commit
+    // - SQLite record is still 'pending'
+
+    // RECOVERY (New Coordinator starts up):
+    {
+        let store2 = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+        // Coordinator inspects pending integrations on startup
+        let pending_list = store2.list_pending_integrations().unwrap();
+        assert_eq!(pending_list.len(), 1, "Must find exactly one pending integration requiring reconciliation");
+
+        let pending = &pending_list[0];
+        let current_ref = dume_git::integrate::resolve_ref(repo_path, &pending.target_branch).await.unwrap();
+        assert_eq!(current_ref, integration_commit, "Git ref was already advanced before crash");
+
+        // Reconcile: advance DB record to Applied WITHOUT performing a redundant cherry-pick
+        let mut reconciled = pending.clone();
+        reconciled.status = IntegrationStatus::Applied;
+        store2.record_integration(&reconciled).unwrap();
+
+        let updated_record = store2.get_integration("main", &candidate_commit).unwrap().unwrap();
+        assert_eq!(updated_record.status, IntegrationStatus::Applied);
+        assert_eq!(updated_record.integration_commit.as_deref(), Some(integration_commit.as_str()));
+
+        // Check git commit history has only ONE integration commit (no duplicate cherry-picks)
+        let log_out = std::process::Command::new("git")
+            .args(["-C", repo_str, "log", "--oneline", "main"])
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&log_out.stdout);
+        let commit_count = log_str.lines().filter(|l| l.contains("feat: crash-resilient")).count();
+        assert_eq!(commit_count, 1, "Exactly one cherry-pick commit must exist in history, no duplicates");
+    }
 }
 
 

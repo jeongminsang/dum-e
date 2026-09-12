@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "dume_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dume"
 path = "src/main.rs"

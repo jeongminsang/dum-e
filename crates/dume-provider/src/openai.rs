@@ -39,15 +39,37 @@ impl OpenAiProvider {
         let formatted_msgs: Vec<Value> = messages
             .iter()
             .map(|m| {
-                json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    },
-                    "content": m.content
-                })
+                let mut map = serde_json::Map::new();
+                map.insert("role".to_string(), json!(match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                }));
+                map.insert("content".to_string(), json!(m.content));
+
+                if let Some(tool_call_id) = &m.tool_call_id {
+                    map.insert("tool_call_id".to_string(), json!(tool_call_id));
+                }
+
+                if let Some(tool_calls) = &m.tool_calls {
+                    let tc_val: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments
+                                }
+                            })
+                        })
+                        .collect();
+                    map.insert("tool_calls".to_string(), json!(tc_val));
+                }
+
+                Value::Object(map)
             })
             .collect();
 
@@ -93,16 +115,22 @@ impl OpenAiProvider {
                                     }
                                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                         for tc in tool_calls {
-                                            let id = tc.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                                            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                            let id = tc.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|s| s.as_str()).map(|s| s.to_string());
                                             let args_delta = tc.get("function").and_then(|f| f.get("arguments")).and_then(|s| s.as_str()).unwrap_or_default().to_string();
                                             let _ = tx.send(StreamEvent::ToolCallDelta {
+                                                index,
                                                 id,
                                                 name,
                                                 arguments_delta: args_delta,
                                             }).await;
                                         }
                                     }
+                                }
+                                if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                    let _ = tx.send(StreamEvent::Completed { finish_reason: finish.to_string() }).await;
+                                    break;
                                 }
                             }
                         }
