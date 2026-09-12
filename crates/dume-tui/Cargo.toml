@@ -1,30 +1,23 @@
 [package]
-name = "dume-cli"
+name = "dume-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "dume"
-path = "src/main.rs"
-
 [dependencies]
 dume-core = { workspace = true }
-dume-store = { workspace = true }
-dume-git = { workspace = true }
-dume-worker = { workspace = true }
 dume-provider = { workspace = true }
-dume-tui = { workspace = true }
-clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-

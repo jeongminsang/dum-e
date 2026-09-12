@@ -45,15 +45,20 @@ enum Commands {
         #[arg(long, default_value = ".dume/rust/artifacts")]
         artifacts_dir: String,
     },
+    /// Launch interactive TUI terminal interface
+    Interactive {
+        #[arg(long, default_value = "claude-3-5-sonnet")]
+        model: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Coordinator { db_path, artifacts_dir, repo_path }) => {
+            tracing_subscriber::fmt::init();
             run_coordinator(&db_path, &artifacts_dir, &repo_path).await?;
         }
         Some(Commands::Worker { attempt_id, worktree_path, test_command }) => {
@@ -62,14 +67,18 @@ async fn main() -> Result<()> {
         Some(Commands::Status { db_path, artifacts_dir }) => {
             print_status(&db_path, &artifacts_dir)?;
         }
+        Some(Commands::Interactive { model }) => {
+            dume_tui::run_tui(&model).await?;
+        }
         None => {
-            println!("DUM-E Clean-Engine Autonomous Multi-Agent Harness (Rust)");
-            println!("Run 'dume --help' for available commands.");
+            // Default to interactive TUI
+            dume_tui::run_tui("claude-3-5-sonnet").await?;
         }
     }
 
     Ok(())
 }
+
 
 async fn run_worker_child(
     attempt_id: &str,
