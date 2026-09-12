@@ -129,42 +129,65 @@ async fn run_app<B: ratatui::backend::Backend>(
         tokio::select! {
             maybe_event = reader.next() => {
                 if let Some(Ok(event)) = maybe_event {
-                    if let Event::Key(key) = event {
-                        match handle_key_event(key) {
-                            Action::Quit => break,
-                            Action::Clear => {
-                                app.messages.clear();
-                                app.streaming_text.clear();
-                            }
-                            Action::InsertChar(c) => app.insert_char(c),
-                            Action::DeleteChar => app.delete_char(),
-                            Action::CursorLeft => app.cursor_left(),
-                            Action::CursorRight => app.cursor_right(),
-                            Action::ScrollUp => {
-                                app.scroll_offset = app.scroll_offset.saturating_add(1);
-                            }
-                            Action::ScrollDown => {
-                                app.scroll_offset = app.scroll_offset.saturating_sub(1);
-                            }
-                            Action::SubmitInput => {
-                                if !app.input_buffer.trim().is_empty() && !app.is_busy {
-                                    let content = std::mem::take(&mut app.input_buffer);
-                                    app.cursor_pos = 0;
-                                    app.messages.push(ChatMessage::user(content.clone()));
-                                    app.is_busy = true;
-
-                                    // Spawn streaming task
-                                    let model_name = app.model.clone();
-                                    let msgs = app.messages.clone();
-                                    let tx = stream_tx.clone();
-
-                                    tokio::spawn(async move {
-                                        dispatch_stream(&model_name, &msgs, tx).await;
-                                    });
+                    match event {
+                        Event::Key(key) => {
+                            match handle_key_event(key) {
+                                Action::Quit => break,
+                                Action::Clear => {
+                                    app.messages.clear();
+                                    app.streaming_text.clear();
                                 }
+                                Action::InsertChar(c) => app.insert_char(c),
+                                Action::DeleteChar => app.delete_char(),
+                                Action::CursorLeft => app.cursor_left(),
+                                Action::CursorRight => app.cursor_right(),
+                                Action::CursorHome => app.cursor_pos = 0,
+                                Action::CursorEnd => app.cursor_pos = app.input_buffer.len(),
+                                Action::ScrollUp => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(1);
+                                }
+                                Action::ScrollDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                                }
+                                Action::PageUp => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(10);
+                                }
+                                Action::PageDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                                }
+                                Action::SubmitInput => {
+                                    if !app.input_buffer.trim().is_empty() && !app.is_busy {
+                                        let content = std::mem::take(&mut app.input_buffer);
+                                        app.cursor_pos = 0;
+                                        app.messages.push(ChatMessage::user(content.clone()));
+                                        app.is_busy = true;
+
+                                        // Spawn streaming task
+                                        let model_name = app.model.clone();
+                                        let msgs = app.messages.clone();
+                                        let tx = stream_tx.clone();
+
+                                        tokio::spawn(async move {
+                                            dispatch_stream(&model_name, &msgs, tx).await;
+                                        });
+                                    }
+                                }
+                                Action::None => {}
                             }
-                            Action::None => {}
                         }
+                        Event::Mouse(mouse) => {
+                            use crossterm::event::MouseEventKind;
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(3);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -198,24 +221,26 @@ async fn dispatch_stream(
     messages: &[ChatMessage],
     tx: mpsc::Sender<StreamEvent>,
 ) {
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        let provider = AnthropicProvider::new(&api_key);
+    let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+
+    if let Some(token) = cred_store.get_api_key("anthropic") {
+        let provider = AnthropicProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;
         }
-    } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-        let provider = OpenAiProvider::new(&api_key);
+    } else if let Some(token) = cred_store.get_api_key("openai") {
+        let provider = OpenAiProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;
         }
-    } else if let Ok(api_key) = std::env::var("GEMINI_API_KEY") {
-        let provider = GeminiProvider::new(&api_key);
+    } else if let Some(token) = cred_store.get_api_key("gemini") {
+        let provider = GeminiProvider::new(&token);
         if let Err(e) = provider.stream(model, messages, &[], tx.clone()).await {
             let _ = tx.send(StreamEvent::Error(e.to_string())).await;
         }
     } else {
-        // Mock fallback if no API key is set
-        let _ = tx.send(StreamEvent::TextDelta("Hello from DUM-E native Rust engine! Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to stream from cloud providers.".to_string())).await;
+        // Fallback or local Ollama check
+        let _ = tx.send(StreamEvent::TextDelta("DUM-E native Rust engine connected. (Authenticate with OAuth via `dume login` or set ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).".to_string())).await;
         let _ = tx.send(StreamEvent::Completed { finish_reason: "stop".to_string() }).await;
     }
 }

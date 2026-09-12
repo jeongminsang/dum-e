@@ -53,6 +53,16 @@ enum Commands {
         #[arg(long, default_value = "claude-3-5-sonnet")]
         model: String,
     },
+    /// Login via browser OAuth flow or API key
+    Login {
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+    },
+    /// Logout and clear stored credentials
+    Logout {
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+    },
 }
 
 #[tokio::main]
@@ -73,12 +83,96 @@ async fn main() -> Result<()> {
         Some(Commands::Interactive { model }) => {
             dume_tui::run_tui(&model).await?;
         }
+        Some(Commands::Login { provider }) => {
+            run_login(&provider).await?;
+        }
+        Some(Commands::Logout { provider }) => {
+            run_logout(&provider)?;
+        }
         None => {
             // Default to interactive TUI
             dume_tui::run_tui("claude-3-5-sonnet").await?;
         }
     }
 
+    Ok(())
+}
+
+async fn run_login(provider: &str) -> Result<()> {
+    println!("Initiating login for provider '{}'...", provider);
+    let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+
+    if provider == "anthropic" {
+        let pkce = dume_provider::generate_pkce();
+        let state = format!("dume_state_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+        let redirect_uri = format!("http://localhost:{}/callback", dume_provider::oauth::DEFAULT_CALLBACK_PORT);
+
+        let auth_url = dume_provider::oauth::build_authorization_url(
+            dume_provider::oauth::ANTHROPIC_AUTHORIZE_URL,
+            dume_provider::oauth::ANTHROPIC_CLIENT_ID,
+            &redirect_uri,
+            "org:create_api_key user:profile user:inference user:sessions:claude_code",
+            &state,
+            &pkce.challenge,
+        );
+
+        println!("\nPlease open the following URL in your browser to authenticate:");
+        println!("------------------------------------------------------------");
+        println!("{}", auth_url);
+        println!("------------------------------------------------------------");
+        println!("Waiting for OAuth callback on {}...", redirect_uri);
+
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let code = dume_provider::start_oauth_callback_server(dume_provider::oauth::DEFAULT_CALLBACK_PORT, state, rx).await?;
+        println!("OAuth authorization code received. Exchanging for access token...");
+
+        let token_resp = dume_provider::exchange_code_for_token(
+            dume_provider::oauth::ANTHROPIC_TOKEN_URL,
+            dume_provider::oauth::ANTHROPIC_CLIENT_ID,
+            &code,
+            &redirect_uri,
+            &pkce.verifier,
+        ).await?;
+
+        let cred = dume_provider::Credential {
+            cred_type: "oauth".to_string(),
+            key: None,
+            access_token: Some(token_resp.access_token),
+            refresh_token: token_resp.refresh_token,
+            expires_at: token_resp.expires_in.map(|exp| {
+                (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64) + (exp * 1000)
+            }),
+        };
+
+        cred_store.save(provider, &cred)?;
+        println!("Successfully authenticated and saved credentials for '{}'.", provider);
+    } else {
+        println!("Enter API key for {}: ", provider);
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("API key cannot be empty");
+        }
+
+        let cred = dume_provider::Credential {
+            cred_type: "api_key".to_string(),
+            key: Some(key),
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+        };
+        cred_store.save(provider, &cred)?;
+        println!("Successfully saved API key for '{}'.", provider);
+    }
+
+    Ok(())
+}
+
+fn run_logout(provider: &str) -> Result<()> {
+    let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    cred_store.delete(provider)?;
+    println!("Successfully logged out and removed credentials for '{}'.", provider);
     Ok(())
 }
 

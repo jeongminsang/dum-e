@@ -63,18 +63,9 @@ impl CredentialStore {
         None
     }
 
-    pub fn save_credential(&self, provider: &str, key: &str) -> Result<()> {
+    pub fn save(&self, provider: &str, cred: &Credential) -> Result<()> {
         let mut creds = self.load().unwrap_or_default();
-        creds.insert(
-            provider.to_string(),
-            Credential {
-                cred_type: "api_key".to_string(),
-                key: Some(key.to_string()),
-                access_token: None,
-                refresh_token: None,
-                expires_at: None,
-            },
-        );
+        creds.insert(provider.to_string(), cred.clone());
 
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -82,6 +73,31 @@ impl CredentialStore {
         let serialized = serde_json::to_string_pretty(&creds)?;
         fs::write(&self.file_path, serialized)?;
         Ok(())
+    }
+
+    pub fn delete(&self, provider: &str) -> Result<()> {
+        let mut creds = self.load().unwrap_or_default();
+        creds.remove(provider);
+
+        if let Some(parent) = self.file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let serialized = serde_json::to_string_pretty(&creds)?;
+        fs::write(&self.file_path, serialized)?;
+        Ok(())
+    }
+
+    pub fn save_credential(&self, provider: &str, key: &str) -> Result<()> {
+        self.save(
+            provider,
+            &Credential {
+                cred_type: "api_key".to_string(),
+                key: Some(key.to_string()),
+                access_token: None,
+                refresh_token: None,
+                expires_at: None,
+            },
+        )
     }
 
     fn load(&self) -> Result<HashMap<String, Credential>> {
