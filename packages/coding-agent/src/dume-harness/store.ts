@@ -179,7 +179,7 @@ export class HarnessStore {
 
 			CREATE TABLE IF NOT EXISTS coordinator_locks (
 				id TEXT PRIMARY KEY,
-				ownerId TEXT NOT NULL,
+				ownerId TEXT,
 				epoch INTEGER NOT NULL,
 				heartbeatAt INTEGER NOT NULL
 			);
@@ -200,7 +200,7 @@ export class HarnessStore {
 		const now = Date.now();
 		const current = this.db
 			.query("SELECT ownerId, epoch, heartbeatAt FROM coordinator_locks WHERE id = 'primary'")
-			.get() as { ownerId: string; epoch: number; heartbeatAt: number } | null;
+			.get() as { ownerId: string | null; epoch: number; heartbeatAt: number } | null;
 
 		if (!current) {
 			this.db
@@ -214,7 +214,7 @@ export class HarnessStore {
 			return { acquired: true, epoch: current.epoch };
 		}
 
-		if (now - current.heartbeatAt > ttlMs) {
+		if (!current.ownerId || now - current.heartbeatAt > ttlMs) {
 			const nextEpoch = current.epoch + 1;
 			this.db
 				.query("UPDATE coordinator_locks SET ownerId = ?, epoch = ?, heartbeatAt = ? WHERE id = 'primary'")
@@ -234,7 +234,7 @@ export class HarnessStore {
 
 	releaseCoordinatorLock(ownerId: string, epoch: number): void {
 		this.db
-			.query("DELETE FROM coordinator_locks WHERE id = 'primary' AND ownerId = ? AND epoch = ?")
+			.query("UPDATE coordinator_locks SET ownerId = NULL WHERE id = 'primary' AND ownerId = ? AND epoch = ?")
 			.run(ownerId, epoch);
 	}
 

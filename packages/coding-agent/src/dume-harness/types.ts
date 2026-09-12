@@ -77,6 +77,7 @@ export interface ResultManifest {
 	attemptId: string;
 	taskId: string;
 	baseCommit: string;
+	candidateCommit?: string;
 	changedArtifacts: Record<string, string>; // path -> content SHA-256
 	modifiedFiles: string[];
 	executionLogsHash?: string;
