@@ -40,11 +40,16 @@
 Download and run the native installer script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh -o /tmp/dume-install.sh
-sh /tmp/dume-install.sh
+curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh | sh
 ```
 
-Use `--ref v<version>` to select an exact published native release. The installer verifies `SHA256SUMS` before placing the binary in `~/.local/bin/dume`.
+To install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh | sh -s -- --ref v0.1.0
+```
+
+The installer verifies `SHA256SUMS` and places the standalone native binary in `~/.local/bin/dume`.
 
 ### Build from Source
 
