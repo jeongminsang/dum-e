@@ -263,13 +263,42 @@ impl CredentialStore {
         Ok(())
     }
 
-    fn load(&self) -> Result<HashMap<String, Credential>> {
+    pub fn load(&self) -> Result<HashMap<String, Credential>> {
         let content = match fs::read(&self.file_path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(e.into()),
         };
         serde_json::from_slice(&content).map_err(|_| anyhow::anyhow!("Malformed credential store"))
+    }
+
+    pub fn has_credential(&self, provider: &str) -> bool {
+        let provider = normalize_provider(provider);
+        let env = match provider {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "google" => "GEMINI_API_KEY",
+            _ => "",
+        };
+        if let Ok(key) = std::env::var(env) {
+            if !key.trim().is_empty() {
+                return true;
+            }
+        }
+        if let Ok(map) = self.load() {
+            if let Some(cred) = map.get(provider) {
+                match cred.cred_type.as_str() {
+                    "api_key" => {
+                        return cred.key.as_ref().is_some_and(|k| !k.trim().is_empty());
+                    }
+                    "oauth" => {
+                        return cred.access_token.as_ref().is_some_and(|t| !t.trim().is_empty());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 }
 
