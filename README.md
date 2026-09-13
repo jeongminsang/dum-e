@@ -137,9 +137,8 @@ bash scripts/create-source-archive.sh --version 0.1.0 --out /tmp/dume-native-rel
 
 Substitute the current workspace version and host platform. Packaging requires
 Python 3.11+ in addition to Cargo; installed executables do not. `--offline` is
-available for builds with a hydrated Cargo cache. The remaining TypeScript
-packages and their npm publishing tools are not the native product release path;
-do not use their version/release commands to create native release tags.
+available for builds with a hydrated Cargo cache. The repository is 100% Rust
+and publishes standalone native executables.
 
 ---
 

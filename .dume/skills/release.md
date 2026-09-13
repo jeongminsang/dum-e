@@ -10,7 +10,7 @@ The product release pipeline is native Rust. Do not use the retained TypeScript 
 ## Prepare and verify
 
 1. Set the intended version in `[workspace.package]` in `Cargo.toml` and update `Cargo.lock` with Cargo. All Rust crates inherit this version. Preserve the root license assets.
-2. Run `cargo check --workspace --locked` and `cargo test --workspace --locked`. While TypeScript sources remain, also run the repository-required `npm run check`; it is not a native build dependency.
+2. Run `cargo check --workspace --locked` and `cargo test --workspace --locked`.
 3. Build a local native release with `bash scripts/build-binaries.sh --out /tmp/dume-native-release`. The destination must not contain an existing archive with the same name. Add `--offline` only with an already hydrated Cargo cache.
 4. The build script tests the workspace, builds the release executable, packages licenses, extracts the archive, and runs `--help` and `--version` outside the checkout. Python 3.11+ and the native Rust toolchain are build tools, not installed-product dependencies.
 5. On macOS/Linux, verify the installer using the real archive: `python3 scripts/test-native-install.py --archive /tmp/dume-native-release/dume-<platform>-<arch>.tar.gz --version <version>`.
