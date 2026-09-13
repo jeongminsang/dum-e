@@ -165,7 +165,7 @@ jobs:
             # Recovery never replaces assets. An incomplete or different draft fails closed.
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "$RELEASE_TAG" --generate-notes ./*
+              --title "DUM-E $RELEASE_TAG" --generate-notes ./*
           fi
           actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
           expected="$(printf '%s\n' SHA256SUMS dume-* | sort)"

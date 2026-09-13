@@ -49,7 +49,7 @@ class NativeInstallTests(unittest.TestCase):
         self.commands = self.root / "commands"
         self.commands.mkdir()
         # An explicit executable allowlist excludes Node, Bun, Cargo and Python.
-        for name in ("uname", "curl", "tar", "sed", "grep", "awk", "wc", "tr",
+        for name in ("uname", "curl", "tar", "gzip", "sed", "grep", "awk", "wc", "tr",
                      "mktemp", "sha256sum", "shasum", "chmod", "cp", "mv", "rm", "mkdir"):
             executable = shutil.which(name)
             if executable:
