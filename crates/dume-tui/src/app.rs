@@ -1,4 +1,9 @@
-use crate::component::{render_input_bar, render_status_bar, render_transcript};
+use crate::component::{
+    calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
+    render_input_bar, render_login_selector_modal, render_model_selector_modal,
+    render_oauth_waiting_modal, render_status_bar, render_transcript, AutocompleteItem,
+    LoginProviderChoice, ThinkingLevel,
+};
 use crate::keybinding::{Action, handle_key_event};
 use crate::theme::Theme;
 use anyhow::Result;
@@ -7,8 +12,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use dume_core::skills::SkillRegistry;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
+use dume_provider::ModelInfo;
 use dume_worker::agent_loop::ToolDispatcher;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -26,6 +33,34 @@ enum ConversationEvent {
         messages: Vec<ChatMessage>,
         error: Option<String>,
     },
+    OAuthComplete {
+        provider: String,
+        result: Result<()>,
+    },
+}
+
+pub enum ModalState {
+    None,
+    ModelSelector {
+        models: Vec<ModelInfo>,
+        filtered: Vec<ModelInfo>,
+        selected_idx: usize,
+        filter: String,
+        provider_tabs: Vec<String>,
+        active_tab_idx: usize,
+    },
+    LoginSelector {
+        selected_idx: usize,
+    },
+    ApiKeyInput {
+        provider_id: String,
+        provider_name: String,
+        input: String,
+    },
+    CodexOAuthWaiting {
+        url: String,
+        cancel_token: CancellationToken,
+    },
 }
 
 pub struct App {
@@ -34,23 +69,136 @@ pub struct App {
     pub cursor_pos: usize,
     pub streaming_text: String,
     pub scroll_offset: u16,
+    pub auto_scroll: bool,
     pub is_busy: bool,
     pub model: String,
+    pub thinking: ThinkingLevel,
     pub theme: Theme,
+    pub skills: SkillRegistry,
+    pub autocomplete_index: usize,
+    pub autocomplete_dismissed: bool,
+    pub modal: ModalState,
+    pub last_ctrl_c: Option<std::time::Instant>,
+}
+
+fn get_persisted_or_default_model(model: Option<&str>) -> String {
+    if let Some(m) = model {
+        if !m.is_empty() {
+            return m.to_string();
+        }
+    }
+
+    // Check last-used model from ~/.dume/agent/models-store.json or settings
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
+    if let Ok(content) = std::fs::read_to_string(&store_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(last_model) = val.get("last_used_model").and_then(|v| v.as_str()) {
+                if !last_model.trim().is_empty() {
+                    return last_model.to_string();
+                }
+            }
+        }
+    }
+
+    // Default to gpt 5.6 luna (openai-codex/gpt-5.6-luna)
+    "openai-codex/gpt-5.6-luna".to_string()
+}
+
+pub fn persist_last_used_model(model: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
+    let mut obj = if let Ok(content) = std::fs::read_to_string(&store_path) {
+        serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("last_used_model".to_string(), serde_json::json!(model));
+    }
+    if let Some(parent) = store_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string_pretty(&obj) {
+        let _ = std::fs::write(&store_path, serialized);
+    }
 }
 
 impl App {
     pub fn new(model: impl Into<String>) -> Self {
+        let m = model.into();
+        let effective_model = if m == "anthropic/claude-sonnet-4-5" || m.is_empty() {
+            get_persisted_or_default_model(None)
+        } else {
+            get_persisted_or_default_model(Some(&m))
+        };
+
         Self {
             messages: Vec::new(),
             input_buffer: String::new(),
             cursor_pos: 0, // In characters, not bytes!
             streaming_text: String::new(),
             scroll_offset: 0,
+            auto_scroll: true,
             is_busy: false,
-            model: model.into(),
+            model: effective_model,
+            thinking: ThinkingLevel::Off,
             theme: Theme::default(),
+            skills: SkillRegistry::load_default(),
+            autocomplete_index: 0,
+            autocomplete_dismissed: false,
+            modal: ModalState::None,
+            last_ctrl_c: None,
         }
+    }
+
+    /// Return filtered autocomplete suggestions when input starts with '/'
+    pub fn get_autocomplete_items(&self) -> Vec<AutocompleteItem> {
+        if self.autocomplete_dismissed || !self.input_buffer.starts_with('/') {
+            return Vec::new();
+        }
+
+        // Only show autocomplete when user hasn't typed arguments yet
+        let trimmed = self.input_buffer.trim_start();
+        if trimmed.contains(' ') {
+            return Vec::new();
+        }
+
+        let query = trimmed.strip_prefix('/').unwrap_or("").to_lowercase();
+
+        let mut items = Vec::new();
+
+        // Built-in commands
+        let builtins = [
+            ("/model", "Switch model (e.g. /model anthropic/claude-sonnet-4-5)"),
+            ("/login", "Save provider API key (e.g. /login anthropic <key>)"),
+            ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
+            ("/clear", "Clear conversation transcript"),
+            ("/skills", "List all available skills"),
+            ("/help", "Show help and command list"),
+        ];
+
+        for (cmd, desc) in builtins {
+            if query.is_empty() || cmd.strip_prefix('/').unwrap_or("").starts_with(&query) {
+                items.push(AutocompleteItem {
+                    name: cmd.to_string(),
+                    description: desc.to_string(),
+                });
+            }
+        }
+
+        // Skills from registry
+        for skill in self.skills.list() {
+            let slash_name = format!("/{}", skill.name);
+            if query.is_empty() || skill.name.to_lowercase().starts_with(&query) {
+                items.push(AutocompleteItem {
+                    name: slash_name,
+                    description: skill.description.clone(),
+                });
+            }
+        }
+
+        items
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -113,6 +261,23 @@ impl App {
                 self.streaming_text.clear();
                 self.is_busy = false;
             }
+            ConversationEvent::OAuthComplete { provider, result } => {
+                match result {
+                    Ok(()) => {
+                        self.messages.push(ChatMessage::system(format!(
+                            "Successfully authenticated {}! You can now use this provider.",
+                            provider
+                        )));
+                    }
+                    Err(e) => {
+                        self.messages.push(ChatMessage::system(format!(
+                            "Authentication failed for {}: {}",
+                            provider, e
+                        )));
+                    }
+                }
+                self.modal = ModalState::None;
+            }
         }
     }
 }
@@ -148,6 +313,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         cancellation.clone(),
     )));
     let mut task = None;
+    let mut current_stream_cancel: Option<CancellationToken> = None;
+    let mut anim_tick: usize = 0;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
 
     let result: Result<()> = async {
       loop {
@@ -161,28 +329,154 @@ async fn run_app<B: ratatui::backend::Backend>(
                 ])
                 .split(f.area());
 
+            let transcript_area = chunks[0];
+            let inner_width = transcript_area.width.saturating_sub(2);
+            let inner_height = transcript_area.height.saturating_sub(2);
+            let total_lines = calculate_transcript_height(
+                inner_width,
+                &app.messages,
+                &app.streaming_text,
+            );
+            let max_scroll = total_lines.saturating_sub(inner_height);
+
+            if app.auto_scroll {
+                app.scroll_offset = max_scroll;
+            } else if app.scroll_offset > max_scroll {
+                app.scroll_offset = max_scroll;
+            }
+
             render_transcript(
                 f,
-                chunks[0],
+                transcript_area,
                 &app.messages,
                 &app.streaming_text,
                 app.scroll_offset,
                 &app.theme,
             );
+            let is_exit_warned = app.last_ctrl_c.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2));
             render_input_bar(
                 f,
                 chunks[1],
                 &app.input_buffer,
                 app.cursor_pos,
+                is_exit_warned,
                 &app.theme,
             );
+
+            // Render autocomplete popup above input bar if active
+            let autocomplete_items = app.get_autocomplete_items();
+            if !autocomplete_items.is_empty() {
+                render_autocomplete_dropdown(
+                    f,
+                    chunks[1],
+                    &autocomplete_items,
+                    app.autocomplete_index,
+                    &app.theme,
+                );
+            }
+
             render_status_bar(
                 f,
                 chunks[2],
                 &app.model,
+                app.thinking,
                 app.is_busy,
+                anim_tick,
                 &app.theme,
             );
+
+            // Render active modal on top
+            match &app.modal {
+                ModalState::None => {}
+                ModalState::ModelSelector {
+                    filtered,
+                    selected_idx,
+                    filter,
+                    provider_tabs,
+                    active_tab_idx,
+                    ..
+                } => {
+                    render_model_selector_modal(
+                        f,
+                        f.area(),
+                        filtered,
+                        *selected_idx,
+                        filter,
+                        provider_tabs,
+                        *active_tab_idx,
+                        app.thinking,
+                        &app.model,
+                        &app.theme,
+                    );
+                }
+                ModalState::LoginSelector { selected_idx } => {
+                    let cred_store = dume_provider::CredentialStore::new(
+                        dume_provider::CredentialStore::default_path(),
+                    );
+
+                    let has_anthropic = cred_store.has_credential("anthropic");
+                    let has_openai = cred_store.has_credential("openai");
+                    let has_google = cred_store.has_credential("google");
+                    let has_codex = cred_store.has_credential("openai-codex");
+
+                    let choices = [
+                        LoginProviderChoice {
+                            id: "anthropic",
+                            name: "Anthropic Claude",
+                            auth_type: "API Key",
+                            is_authenticated: has_anthropic,
+                        },
+                        LoginProviderChoice {
+                            id: "openai",
+                            name: "OpenAI ChatGPT",
+                            auth_type: "API Key",
+                            is_authenticated: has_openai,
+                        },
+                        LoginProviderChoice {
+                            id: "google",
+                            name: "Google Gemini",
+                            auth_type: "API Key",
+                            is_authenticated: has_google,
+                        },
+                        LoginProviderChoice {
+                            id: "openai-codex",
+                            name: "OpenAI Codex",
+                            auth_type: "OAuth Browser",
+                            is_authenticated: has_codex,
+                        },
+                    ];
+
+                    render_login_selector_modal(
+                        f,
+                        f.area(),
+                        &choices,
+                        *selected_idx,
+                        &app.theme,
+                    );
+                }
+                ModalState::ApiKeyInput {
+                    provider_name,
+                    input,
+                    ..
+                } => {
+                    render_api_key_modal(
+                        f,
+                        f.area(),
+                        provider_name,
+                        input,
+                        &app.theme,
+                    );
+                }
+                ModalState::CodexOAuthWaiting { url, .. } => {
+                    render_oauth_waiting_modal(
+                        f,
+                        f.area(),
+                        "OpenAI Codex",
+                        url,
+                        &app.theme,
+                    );
+                }
+            }
         })?;
 
         tokio::select! {
@@ -190,52 +484,586 @@ async fn run_app<B: ratatui::backend::Backend>(
                 if let Some(Ok(event)) = maybe_event {
                     match event {
                         Event::Key(key) => {
+                            // 1. Handle Modal Events if modal is active
+                            match &mut app.modal {
+                                ModalState::ModelSelector {
+                                    models,
+                                    filtered,
+                                    selected_idx,
+                                    filter,
+                                    provider_tabs,
+                                    active_tab_idx,
+                                } => {
+                                    match key.code {
+                                        crossterm::event::KeyCode::Esc => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Tab => {
+                                            app.thinking = app.thinking.next();
+                                        }
+                                        crossterm::event::KeyCode::Left => {
+                                            if !provider_tabs.is_empty() {
+                                                if *active_tab_idx == 0 {
+                                                    *active_tab_idx = provider_tabs.len() - 1;
+                                                } else {
+                                                    *active_tab_idx -= 1;
+                                                }
+                                                let tab = &provider_tabs[*active_tab_idx];
+                                                let q = filter.to_lowercase();
+                                                *filtered = models
+                                                    .iter()
+                                                    .filter(|m| {
+                                                        (tab == "All" || m.provider.eq_ignore_ascii_case(tab))
+                                                            && (m.id.to_lowercase().contains(&q)
+                                                                || m.provider.to_lowercase().contains(&q))
+                                                    })
+                                                    .cloned()
+                                                    .collect();
+                                                *selected_idx = 0;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Right => {
+                                            if !provider_tabs.is_empty() {
+                                                if *active_tab_idx + 1 >= provider_tabs.len() {
+                                                    *active_tab_idx = 0;
+                                                } else {
+                                                    *active_tab_idx += 1;
+                                                }
+                                                let tab = &provider_tabs[*active_tab_idx];
+                                                let q = filter.to_lowercase();
+                                                *filtered = models
+                                                    .iter()
+                                                    .filter(|m| {
+                                                        (tab == "All" || m.provider.eq_ignore_ascii_case(tab))
+                                                            && (m.id.to_lowercase().contains(&q)
+                                                                || m.provider.to_lowercase().contains(&q))
+                                                    })
+                                                    .cloned()
+                                                    .collect();
+                                                *selected_idx = 0;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Up => {
+                                            if !filtered.is_empty() {
+                                                if *selected_idx == 0 {
+                                                    *selected_idx = filtered.len() - 1;
+                                                } else {
+                                                    *selected_idx -= 1;
+                                                }
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Down => {
+                                            if !filtered.is_empty() {
+                                                if *selected_idx + 1 >= filtered.len() {
+                                                    *selected_idx = 0;
+                                                } else {
+                                                    *selected_idx += 1;
+                                                }
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Enter => {
+                                            if let Some(selected) = filtered.get(*selected_idx) {
+                                                let new_model = format!("{}/{}", selected.provider, selected.id);
+                                                persist_last_used_model(&new_model);
+                                                app.messages.push(ChatMessage::system(format!("Switched model to '{}'", new_model)));
+                                                app.model = new_model;
+                                            }
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Backspace => {
+                                            filter.pop();
+                                            let q = filter.to_lowercase();
+                                            let tab = &provider_tabs[*active_tab_idx];
+                                            *filtered = models
+                                                .iter()
+                                                .filter(|m| {
+                                                    (tab == "All" || m.provider.eq_ignore_ascii_case(tab))
+                                                        && (m.id.to_lowercase().contains(&q)
+                                                            || m.provider.to_lowercase().contains(&q))
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            *selected_idx = 0;
+                                        }
+                                        crossterm::event::KeyCode::Char(c) => {
+                                            filter.push(c);
+                                            let q = filter.to_lowercase();
+                                            let tab = &provider_tabs[*active_tab_idx];
+                                            *filtered = models
+                                                .iter()
+                                                .filter(|m| {
+                                                    (tab == "All" || m.provider.eq_ignore_ascii_case(tab))
+                                                        && (m.id.to_lowercase().contains(&q)
+                                                            || m.provider.to_lowercase().contains(&q))
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            *selected_idx = 0;
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                                ModalState::LoginSelector { selected_idx } => {
+                                    let provider_ids = ["anthropic", "openai", "google", "openai-codex"];
+                                    let provider_names = ["Anthropic Claude", "OpenAI ChatGPT", "Google Gemini", "OpenAI Codex"];
+
+                                    match key.code {
+                                        crossterm::event::KeyCode::Esc => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Up => {
+                                            if *selected_idx == 0 {
+                                                *selected_idx = provider_ids.len() - 1;
+                                            } else {
+                                                *selected_idx -= 1;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Down => {
+                                            if *selected_idx + 1 >= provider_ids.len() {
+                                                *selected_idx = 0;
+                                            } else {
+                                                *selected_idx += 1;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Enter => {
+                                            let p_id = provider_ids[*selected_idx];
+                                            let p_name = provider_names[*selected_idx];
+
+                                            if p_id == "openai-codex" {
+                                                use dume_provider::oauth;
+                                                match oauth::get_oauth_config("openai-codex") {
+                                                    Some(config) => {
+                                                        match oauth::generate_pkce() {
+                                                            Ok(pkce) => {
+                                                                let state = oauth::generate_state().unwrap_or_else(|_| "dum-e-login".to_string());
+                                                                match oauth::build_authorization_url(&config, &state, &pkce.challenge) {
+                                                                    Ok(auth_url) => {
+                                                                        // Open browser automatically on mac
+                                                                        let _ = std::process::Command::new("open").arg(&auth_url).spawn();
+
+                                                                        let cancel_token = CancellationToken::new();
+                                                                        let tx = stream_tx.clone();
+                                                                        let cancel_child = cancel_token.clone();
+
+                                                                        tokio::spawn(async move {
+                                                                            let flow = async {
+                                                                                let listener = oauth::bind_oauth_callback(config.port).await?;
+                                                                                let code = oauth::wait_for_oauth_callback(listener, config.callback_path, &state).await?;
+                                                                                let token = oauth::exchange_code_for_token(
+                                                                                    &config,
+                                                                                    &code,
+                                                                                    &config.redirect_uri(),
+                                                                                    &pkce.verifier,
+                                                                                    &state,
+                                                                                ).await?;
+                                                                                let cred = dume_provider::Credential::from_oauth("openai-codex", token, None)?;
+                                                                                let store = dume_provider::CredentialStore::new(
+                                                                                    dume_provider::CredentialStore::default_path(),
+                                                                                );
+                                                                                store.save("openai-codex", &cred)?;
+                                                                                Ok::<_, anyhow::Error>(())
+                                                                            };
+
+                                                                            tokio::select! {
+                                                                                res = flow => {
+                                                                                    let _ = tx.send(ConversationEvent::OAuthComplete {
+                                                                                        provider: "OpenAI Codex".to_string(),
+                                                                                        result: res,
+                                                                                    }).await;
+                                                                                }
+                                                                                _ = cancel_child.cancelled() => {}
+                                                                            }
+                                                                        });
+
+                                                                        app.modal = ModalState::CodexOAuthWaiting {
+                                                                            url: auth_url,
+                                                                            cancel_token,
+                                                                        };
+                                                                    }
+                                                                    Err(e) => {
+                                                                        app.messages.push(ChatMessage::system(format!("Failed to build OAuth URL: {}", e)));
+                                                                        app.modal = ModalState::None;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                app.messages.push(ChatMessage::system(format!("PKCE generation failed: {}", e)));
+                                                                app.modal = ModalState::None;
+                                                            }
+                                                        }
+                                                    }
+                                                    None => {
+                                                        app.messages.push(ChatMessage::system("OAuth config for openai-codex not found."));
+                                                        app.modal = ModalState::None;
+                                                    }
+                                                }
+                                            } else {
+                                                app.modal = ModalState::ApiKeyInput {
+                                                    provider_id: p_id.to_string(),
+                                                    provider_name: p_name.to_string(),
+                                                    input: String::new(),
+                                                };
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                                ModalState::ApiKeyInput { provider_id, provider_name, input } => {
+                                    match key.code {
+                                        crossterm::event::KeyCode::Esc => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Backspace => {
+                                            input.pop();
+                                        }
+                                        crossterm::event::KeyCode::Enter => {
+                                            let key = input.trim();
+                                            if !key.is_empty() {
+                                                let cred_store = dume_provider::CredentialStore::new(
+                                                    dume_provider::CredentialStore::default_path(),
+                                                );
+                                                match cred_store.save_credential(provider_id, key) {
+                                                    Ok(()) => {
+                                                        app.messages.push(ChatMessage::system(format!(
+                                                            "Successfully authenticated {} with API key.",
+                                                            provider_name
+                                                        )));
+                                                    }
+                                                    Err(e) => {
+                                                        app.messages.push(ChatMessage::system(format!(
+                                                            "Failed to save credential for {}: {}",
+                                                            provider_name, e
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Char(c) => {
+                                            input.push(c);
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                                ModalState::CodexOAuthWaiting { cancel_token, .. } => {
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        cancel_token.cancel();
+                                        app.modal = ModalState::None;
+                                        app.messages.push(ChatMessage::system("Cancelled OpenAI Codex login."));
+                                    }
+                                    continue;
+                                }
+                                ModalState::None => {}
+                            }
+
+                            // 2. Normal Editor and Transcript Handling
+                            let autocomplete_items = app.get_autocomplete_items();
+                            let is_autocomplete_active = !autocomplete_items.is_empty();
+
                             match handle_key_event(key) {
-                                Action::Quit => break,
+                                Action::Quit => {
+                                    // 1. If currently busy streaming, first Ctrl+C cancels the active turn
+                                    if app.is_busy {
+                                        if let Some(cancel) = current_stream_cancel.take() {
+                                            cancel.cancel();
+                                        }
+                                        app.messages.push(ChatMessage::system("Streaming interrupted by user."));
+                                        app.is_busy = false;
+                                        app.streaming_text.clear();
+                                        app.last_ctrl_c = None;
+                                        continue;
+                                    }
+
+                                    // 2. If input buffer has content, first Ctrl+C clears the buffer to prevent accidental exit
+                                    if !app.input_buffer.is_empty() {
+                                        app.input_buffer.clear();
+                                        app.cursor_pos = 0;
+                                        app.last_ctrl_c = None;
+                                        continue;
+                                    }
+
+                                    // 3. Double Ctrl+C protection: must press Ctrl+C twice within 2 seconds to quit
+                                    let now = std::time::Instant::now();
+                                    if let Some(last_time) = app.last_ctrl_c {
+                                        if now.duration_since(last_time) < std::time::Duration::from_secs(2) {
+                                            break;
+                                        }
+                                    }
+                                    app.last_ctrl_c = Some(now);
+                                    continue;
+                                }
+                                Action::Escape => {
+                                    if is_autocomplete_active {
+                                        app.autocomplete_dismissed = true;
+                                    } else if !app.input_buffer.is_empty() {
+                                        app.input_buffer.clear();
+                                        app.cursor_pos = 0;
+                                    } else if app.is_busy {
+                                        if let Some(cancel) = current_stream_cancel.take() {
+                                            cancel.cancel();
+                                        }
+                                        app.messages.push(ChatMessage::system("Streaming interrupted by user."));
+                                        app.is_busy = false;
+                                        app.streaming_text.clear();
+                                    }
+                                    app.last_ctrl_c = None;
+                                }
                                 Action::Clear if !app.is_busy => {
                                     app.messages.clear();
                                     app.streaming_text.clear();
+                                    app.auto_scroll = true;
+                                    app.scroll_offset = 0;
                                 }
                                 Action::Clear => {}
-                                Action::InsertChar(c) => app.insert_char(c),
-                                Action::DeleteChar => app.delete_char(),
+                                Action::InsertChar(c) => {
+                                    app.autocomplete_dismissed = false;
+                                    app.insert_char(c);
+                                    app.autocomplete_index = 0;
+                                }
+                                Action::DeleteChar => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_char();
+                                    app.autocomplete_index = 0;
+                                }
                                 Action::CursorLeft => app.cursor_left(),
                                 Action::CursorRight => app.cursor_right(),
                                 Action::CursorHome => app.cursor_pos = 0,
-                                Action::CursorEnd => app.cursor_pos = app.input_buffer.len(),
+                                Action::CursorEnd => app.cursor_pos = app.input_buffer.chars().count(),
                                 Action::ScrollUp => {
-                                    app.scroll_offset = app.scroll_offset.saturating_add(1);
+                                    if is_autocomplete_active {
+                                        if app.autocomplete_index == 0 {
+                                            app.autocomplete_index = autocomplete_items.len().saturating_sub(1);
+                                        } else {
+                                            app.autocomplete_index -= 1;
+                                        }
+                                    } else {
+                                        app.auto_scroll = false;
+                                        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                                    }
                                 }
                                 Action::ScrollDown => {
-                                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                                    if is_autocomplete_active {
+                                        if app.autocomplete_index + 1 >= autocomplete_items.len() {
+                                            app.autocomplete_index = 0;
+                                        } else {
+                                            app.autocomplete_index += 1;
+                                        }
+                                    } else {
+                                        app.scroll_offset = app.scroll_offset.saturating_add(1);
+                                    }
+                                }
+                                Action::Tab => {
+                                    if is_autocomplete_active && !autocomplete_items.is_empty() {
+                                        let selected = &autocomplete_items[app.autocomplete_index];
+                                        let mut completion = selected.name.clone();
+                                        completion.push(' ');
+                                        app.input_buffer = completion;
+                                        app.cursor_pos = app.input_buffer.chars().count();
+                                        app.autocomplete_dismissed = true;
+                                    } else {
+                                        app.thinking = app.thinking.next();
+                                    }
                                 }
                                 Action::PageUp => {
-                                    app.scroll_offset = app.scroll_offset.saturating_add(10);
-                                }
-                                Action::PageDown => {
+                                    app.auto_scroll = false;
                                     app.scroll_offset = app.scroll_offset.saturating_sub(10);
                                 }
+                                Action::PageDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(10);
+                                }
                                 Action::SubmitInput => {
+                                    if is_autocomplete_active && !autocomplete_items.is_empty() {
+                                        let selected = &autocomplete_items[app.autocomplete_index];
+                                        app.input_buffer = selected.name.clone();
+                                    }
+
                                     if !app.input_buffer.trim().is_empty() && !app.is_busy {
                                         let content = std::mem::take(&mut app.input_buffer);
                                         app.cursor_pos = 0;
+                                        app.auto_scroll = true;
+                                        app.autocomplete_dismissed = false;
+                                        app.autocomplete_index = 0;
 
-                                        // Slash command handling
                                         let trimmed = content.trim();
-                                        if trimmed.starts_with("/model ") {
+                                        if trimmed == "/model" || trimmed == "/model " {
+                                            // 1. Inspect authenticated providers
+                                            let cred_store = dume_provider::CredentialStore::new(
+                                                dume_provider::CredentialStore::default_path(),
+                                            );
+                                            let has_anthropic = cred_store.has_credential("anthropic");
+                                            let has_openai = cred_store.has_credential("openai");
+                                            let has_google = cred_store.has_credential("google");
+                                            let has_codex = cred_store.has_credential("openai-codex");
+
+                                            let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
+
+                                            // Filter only models whose provider is authenticated
+                                            let models: Vec<_> = all_builtin.into_iter().filter(|m| {
+                                                match m.provider.as_str() {
+                                                    "anthropic" => has_anthropic,
+                                                    "openai" => has_openai,
+                                                    "google" => has_google,
+                                                    "openai-codex" => has_codex,
+                                                    _ => false,
+                                                }
+                                            }).collect();
+
+                                            if models.is_empty() {
+                                                app.messages.push(ChatMessage::system(
+                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex)."
+                                                ));
+                                                continue;
+                                            }
+
+                                            // Build provider tabs
+                                            let mut provider_tabs = vec!["All".to_string()];
+                                            for m in &models {
+                                                if !provider_tabs.iter().any(|t| t.eq_ignore_ascii_case(&m.provider)) {
+                                                    provider_tabs.push(m.provider.clone());
+                                                }
+                                            }
+
+                                            let current = app.model.clone();
+                                            let initial_idx = models.iter().position(|m| m.id == current || format!("{}/{}", m.provider, m.id) == current).unwrap_or(0);
+                                            app.modal = ModalState::ModelSelector {
+                                                filtered: models.clone(),
+                                                models,
+                                                selected_idx: initial_idx,
+                                                filter: String::new(),
+                                                provider_tabs,
+                                                active_tab_idx: 0,
+                                            };
+                                            continue;
+                                        } else if trimmed.starts_with("/model ") {
                                             let new_model = trimmed[7..].trim().to_string();
+                                            persist_last_used_model(&new_model);
                                             app.messages.push(ChatMessage::system(format!("Switched model to '{}'", new_model)));
                                             app.model = new_model;
+                                            continue;
+                                        } else if trimmed == "/login" {
+                                            // Open interactive login provider selector modal
+                                            app.modal = ModalState::LoginSelector { selected_idx: 0 };
+                                            continue;
+                                        } else if trimmed.starts_with("/login ") {
+                                            let rest = trimmed[7..].trim();
+                                            let parts: Vec<&str> = rest.split_whitespace().collect();
+                                            if parts.len() < 2 {
+                                                app.messages.push(ChatMessage::system(
+                                                    "Usage: /login <provider> <api-key>\nExample: /login anthropic sk-ant-..."
+                                                ));
+                                            } else {
+                                                let provider = parts[0];
+                                                let key = parts[1..].join(" ");
+                                                let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+                                                match cred_store.save_credential(provider, &key) {
+                                                    Ok(()) => {
+                                                        app.messages.push(ChatMessage::system(format!(
+                                                            "Successfully saved API key for provider '{}'",
+                                                            provider
+                                                        )));
+                                                    }
+                                                    Err(e) => {
+                                                        app.messages.push(ChatMessage::system(format!(
+                                                            "Failed to save credential for '{}': {}",
+                                                            provider, e
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        } else if trimmed == "/logout" || trimmed.starts_with("/logout ") {
+                                            let provider = if trimmed == "/logout" {
+                                                "anthropic"
+                                            } else {
+                                                trimmed[8..].trim()
+                                            };
+                                            let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+                                            match cred_store.delete(provider) {
+                                                Ok(()) => {
+                                                    app.messages.push(ChatMessage::system(format!(
+                                                        "Logged out from provider '{}'",
+                                                        provider
+                                                    )));
+                                                }
+                                                Err(e) => {
+                                                    app.messages.push(ChatMessage::system(format!(
+                                                        "Failed to logout from '{}': {}",
+                                                        provider, e
+                                                    )));
+                                                }
+                                            }
                                             continue;
                                         } else if trimmed == "/clear" {
                                             app.messages.clear();
                                             app.streaming_text.clear();
+                                            app.auto_scroll = true;
+                                            app.scroll_offset = 0;
+                                            continue;
+                                        } else if trimmed == "/skills" {
+                                            let skills = app.skills.list();
+                                            let mut text = String::from("Available Skills:\n");
+                                            if skills.is_empty() {
+                                                text.push_str("  (No skills found in .dume/skills or ~/.dume/skills)\n");
+                                            } else {
+                                                for skill in skills {
+                                                    text.push_str(&format!("  /{:<18} - {}\n", skill.name, skill.description));
+                                                }
+                                            }
+                                            app.messages.push(ChatMessage::system(text.trim_end().to_string()));
                                             continue;
                                         } else if trimmed == "/help" {
-                                            app.messages.push(ChatMessage::system(
-                                                "DUM-E Commands:\n  /model <provider/model> - Switch model (e.g. anthropic/claude-sonnet-4-5, openai-codex/gpt-5.4)\n  /clear         - Clear conversation transcript\n  /help          - Show this help\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down"
-                                            ));
+                                            let mut help = String::from(
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                            );
+                                            let skills = app.skills.list();
+                                            if !skills.is_empty() {
+                                                help.push_str("\nAvailable Skill Commands:\n");
+                                                for skill in skills {
+                                                    help.push_str(&format!("  /{:<22} - {}\n", skill.name, skill.description));
+                                                }
+                                            }
+                                            app.messages.push(ChatMessage::system(help.trim_end().to_string()));
                                             continue;
+                                        } else if let Some(cmd) = trimmed.strip_prefix('/') {
+                                            let (skill_name, rest_args) = match cmd.split_once(char::is_whitespace) {
+                                                Some((name, rest)) => (name, rest.trim()),
+                                                None => (cmd, ""),
+                                            };
+
+                                            if let Some(skill) = app.skills.get(skill_name).cloned() {
+                                                let prompt_content = if rest_args.is_empty() {
+                                                    format!("Execute skill '{}':\n\n{}", skill.name, skill.content)
+                                                } else {
+                                                    format!("Execute skill '{}' with instructions: {}\n\n{}", skill.name, rest_args, skill.content)
+                                                };
+                                                app.messages.push(ChatMessage::user(format!("/{}", cmd)));
+                                                app.messages.push(ChatMessage::system(format!("Loaded skill '{}': {}", skill.name, skill.description)));
+                                                app.is_busy = true;
+
+                                                let model_name = app.model.clone();
+                                                let mut msgs = app.messages.clone();
+                                                // Replace or append prompt for AI execution
+                                                msgs.push(ChatMessage::user(prompt_content));
+
+                                                let tx = stream_tx.clone();
+                                                let dispatcher = dispatcher.clone();
+                                                let child_cancel = cancellation.child_token();
+                                                current_stream_cancel = Some(child_cancel.clone());
+
+                                                task = Some(tokio::spawn(async move {
+                                                    dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
+                                                }));
+                                                continue;
+                                            } else {
+                                                app.messages.push(ChatMessage::system(format!(
+                                                    "Unknown command '/{}'. Type /help or /skills to see available commands.",
+                                                    skill_name
+                                                )));
+                                                continue;
+                                            }
                                         }
 
                                         app.messages.push(ChatMessage::user(content.clone()));
@@ -246,10 +1074,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         let msgs = app.messages.clone();
                                         let tx = stream_tx.clone();
                                         let dispatcher = dispatcher.clone();
-                                        let cancellation = cancellation.clone();
+                                        let child_cancel = cancellation.child_token();
+                                        current_stream_cancel = Some(child_cancel.clone());
 
                                         task = Some(tokio::spawn(async move {
-                                            dispatch_stream(&model_name, msgs, tx, dispatcher, cancellation).await;
+                                            dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
                                         }));
                                     }
                                 }
@@ -260,10 +1089,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                             use crossterm::event::MouseEventKind;
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => {
-                                    app.scroll_offset = app.scroll_offset.saturating_add(3);
+                                    app.auto_scroll = false;
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
                                 }
                                 MouseEventKind::ScrollDown => {
-                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                                    app.scroll_offset = app.scroll_offset.saturating_add(3);
                                 }
                                 _ => {}
                             }
@@ -274,6 +1104,11 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
             Some(stream_event) = stream_rx.recv() => {
                 app.receive(stream_event);
+            }
+            _ = ticker.tick() => {
+                if app.is_busy {
+                    anim_tick = anim_tick.wrapping_add(1);
+                }
             }
         }
 

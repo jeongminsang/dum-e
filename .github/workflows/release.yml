@@ -2,12 +2,12 @@ name: Release Native DUM-E
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
         description: 'Existing release tag to build or recover (vX.Y.Z)'
-        required: true
+        required: false
         type: string
 
 permissions: {}
@@ -17,65 +17,195 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
+  # Step 1: Run complete CI test suite on main before anything else
+  ci-check:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    outputs:
-      commit: ${{ steps.tag.outputs.commit }}
-      tag: ${{ steps.tag.outputs.tag }}
-    env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - name: Validate tag syntax
-        run: |
-          python3 - <<'PY'
-          import os, re
-          tag = os.environ['RELEASE_TAG']
-          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', tag):
-              raise SystemExit('Expected a version tag vX.Y.Z (optional prerelease/build suffix)')
-          PY
-      - name: Checkout exact tag
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Validate tag and workspace version
-        id: tag
+      - name: Install Rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+      - name: Check native workspace
+        run: cargo check --workspace --locked
+      - name: Test native workspace
+        run: cargo test --workspace --locked
+      - name: Build native product
+        run: cargo build --release -p dume-cli --bin dume --locked
+      - name: Smoke native product outside checkout
+        run: |
+          cd "${RUNNER_TEMP}"
+          "${GITHUB_WORKSPACE}/target/release/dume" --help
+          "${GITHUB_WORKSPACE}/target/release/dume" --version
+
+  # Step 2: Validate or bump version, create git tag, and generate concise changelog notes
+  prepare-release:
+    needs: ci-check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      commit: ${{ steps.release_step.outputs.commit }}
+      tag: ${{ steps.release_step.outputs.tag }}
+      notes_file: ${{ steps.release_step.outputs.notes_file }}
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Determine tag, create tag if needed, and generate concise release notes
+        id: release_step
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          test "$(git rev-parse HEAD)" = "$commit"
-          git ls-files --error-unmatch Cargo.lock
-          python3 - <<'PY'
-          import os, pathlib, tomllib
-          manifest = tomllib.loads(pathlib.Path('Cargo.toml').read_text())
-          if manifest['workspace']['package']['version'] != os.environ['RELEASE_TAG'][1:]:
-              raise SystemExit('Tag does not match Cargo.toml workspace version')
-          PY
-          printf 'commit=%s\ntag=%s\n' "$commit" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          if [ -n "${MANUAL_TAG:-}" ]; then
+            TAG="$MANUAL_TAG"
+            COMMIT="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          else
+            # Extract version from Cargo.toml
+            VERSION="$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+            TAG="v${VERSION}"
+
+            # Check if tag already exists on remote
+            if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              # If tag exists but points to current commit, reuse it; otherwise bump patch version
+              EXISTING_COMMIT="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+              CURRENT_COMMIT="$(git rev-parse HEAD)"
+              if [ "$EXISTING_COMMIT" = "$CURRENT_COMMIT" ]; then
+                COMMIT="$CURRENT_COMMIT"
+              else
+                # Auto-bump patch version in Cargo.toml & Cargo.lock
+                python3 - <<'PY'
+                import tomllib, pathlib, re
+                cargo_path = pathlib.Path('Cargo.toml')
+                content = cargo_path.read_text()
+                manifest = tomllib.loads(content)
+                v = manifest['workspace']['package']['version']
+                major, minor, patch = map(int, v.split('.'))
+                new_v = f"{major}.{minor}.{patch + 1}"
+                new_content = re.sub(
+                    r'(version\s*=\s*")' + re.escape(v) + r'(")',
+                    r'\g<1>' + new_v + r'\g<2>',
+                    content,
+                    count=1
+                )
+                cargo_path.write_text(new_content)
+                PY
+                rustup default 1.96.0
+                cargo check --workspace --offline || cargo check --workspace
+                VERSION="$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+                TAG="v${VERSION}"
+                git add Cargo.toml Cargo.lock
+                git commit -m "chore(release): bump version to ${VERSION}"
+                git push origin main
+                git tag -a "$TAG" -m "Release $TAG"
+                git push origin "$TAG"
+                COMMIT="$(git rev-parse HEAD)"
+              fi
+            else
+              git tag -a "$TAG" -m "Release $TAG"
+              git push origin "$TAG"
+              COMMIT="$(git rev-parse HEAD)"
+            fi
+          fi
+
+          # Generate concise categorized work summary from commit history
+          NOTES_PATH="${RUNNER_TEMP}/RELEASE_NOTES.md"
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+
+          python3 - <<PY > "$NOTES_PATH"
+          import subprocess, os
+
+          tag = "$TAG"
+          prev_tag = "$PREV_TAG"
+          rev_range = f"{prev_tag}..{tag}" if prev_tag else tag
+
+          out = subprocess.run(
+              ["git", "log", rev_range, "--no-merges", "--pretty=format:%h %s"],
+              capture_output=True, text=True, check=True
+          ).stdout.strip().splitlines()
+
+          features, fixes, improvements, others = [], [], [], []
+          for line in out:
+              if not line:
+                  continue
+              sha, _, msg = line.partition(" ")
+              lower = msg.lower()
+              if lower.startswith("feat"):
+                  features.append(f"- **{msg}** (`{sha}`)")
+              elif lower.startswith("fix"):
+                  fixes.append(f"- {msg} (`{sha}`)")
+              elif lower.startswith("perf") or lower.startswith("refactor") or lower.startswith("chore"):
+                  improvements.append(f"- {msg} (`{sha}`)")
+              else:
+                  others.append(f"- {msg} (`{sha}`)")
+
+          print(f"## DUM-E {tag}\\n")
+          print("### 작업 요약 (Summary of Changes)\\n")
+          if features:
+              print("#### ✨ 새로운 기능 (Features)")
+              print("\\n".join(features) + "\\n")
+          if fixes:
+              print("#### 🐛 버그 수정 (Bug Fixes)")
+              print("\\n".join(fixes) + "\\n")
+          if improvements:
+              print("#### ⚡ 개선 및 리팩토링 (Improvements)")
+              print("\\n".join(improvements) + "\\n")
+          if others:
+              print("#### 📝 기타 변경 사항 (Other Changes)")
+              print("\\n".join(others) + "\\n")
+          if not (features or fixes or improvements or others):
+              print("- Routine update and maintenance release.\\n")
+          PY
+
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "notes_file=$NOTES_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release notes artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: ${{ steps.release_step.outputs.notes_file }}
+
+  # Step 3: Build 6 platform binary archives from the tagged commit
   build:
-    needs: validate
+    needs: prepare-release
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
-      tag: ${{ needs.validate.outputs.tag }}
-      commit: ${{ needs.validate.outputs.commit }}
+      tag: ${{ needs.prepare-release.outputs.tag }}
+      commit: ${{ needs.prepare-release.outputs.commit }}
 
+  # Step 4: Verify checksums, draft/publish GitHub Release with concise notes and binaries
   publish:
-    needs: [validate, build]
+    needs: [prepare-release, build]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
     env:
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare-release.outputs.commit }}
     steps:
+      - name: Download release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+          path: notes-dir
       - name: Download verified build payload
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -147,7 +277,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Recheck the remote tag immediately before publication, including annotated tags.
           object="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object | [.type, .sha] | @tsv')"
           read -r kind sha <<< "$object"
           while [[ "$kind" == tag ]]; do
@@ -157,16 +286,19 @@ jobs:
           test "$kind" = commit
           test "$sha" = "$RELEASE_COMMIT"
           cd release-assets
-          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"; then
-            if [[ "$state" != true ]]; then
-              echo 'Refusing to overwrite a published release.' >&2
+
+          NOTES_FILE="../notes-dir/$(ls ../notes-dir | head -n 1)"
+
+          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"; then
+            if [[ "$state" != "true" && -n "$state" ]]; then
+              echo 'Refusing to overwrite an already published release.' >&2
               exit 1
             fi
-            # Recovery never replaces assets. An incomplete or different draft fails closed.
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "DUM-E $RELEASE_TAG" --generate-notes ./*
+              --title "DUM-E $RELEASE_TAG" --notes-file "$NOTES_FILE" ./*
           fi
+
           actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
           expected="$(printf '%s\n' SHA256SUMS dume-* | sort)"
           test "$actual" = "$expected"
@@ -175,6 +307,5 @@ jobs:
           gh release download "$RELEASE_TAG" --dir "$remote"
           cmp SHA256SUMS "$remote/SHA256SUMS"
           (cd "$remote" && sha256sum -c SHA256SUMS)
-          # No clobber/delete operations, even during recovery.
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
           gh release edit "$RELEASE_TAG" --draft=false

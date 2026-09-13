@@ -12,6 +12,7 @@ dume-provider = { workspace = true }
 dume-worker = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+unicode-width = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }

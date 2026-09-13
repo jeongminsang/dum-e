@@ -15,6 +15,8 @@ pub enum Action {
     PageUp,
     PageDown,
     Clear,
+    Tab,
+    Escape,
     None,
 }
 
@@ -24,6 +26,8 @@ pub fn handle_key_event(key: KeyEvent) -> Action {
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Clear,
         KeyCode::Enter => Action::SubmitInput,
+        KeyCode::Tab => Action::Tab,
+        KeyCode::Esc => Action::Escape,
         KeyCode::Backspace => Action::DeleteChar,
         KeyCode::Left => Action::CursorLeft,
         KeyCode::Right => Action::CursorRight,
