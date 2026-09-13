@@ -21,6 +21,7 @@ packages/ai/src/providers/.model-generation-*/
 .zed/
 .idea/
 .claude/
+.gjc/
 *.swp
 *.swo
 *~
@@ -29,18 +30,23 @@ packages/ai/src/providers/.model-generation-*/
 .npm/
 coverage/
 .nyc_output/
-.pi_config/
+.dume_config/
 tui-debug.log
 compaction-results/
 .opencode/
 syntax.jsonl
 out.jsonl
-pi-*.html
+dume-*.html
 out.html
-packages/coding-agent/binaries/
 todo.md
 plans/
-.pi/hf-sessions/
-.pi/hf-sessions-backup/
+.dume/hf-sessions/
+.dume/hf-sessions-backup/
 collect.sh
-packages/agent/docs/extensions/pi-server-artifact/index.md
+
+
+# Rust build artifacts
+target/
+.dume/rust/
+.dume/build/
+.dume/cache/

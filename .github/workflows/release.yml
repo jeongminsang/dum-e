@@ -1,42 +1,180 @@
-name: Release DUM-E Binaries
+name: Release Native DUM-E
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build or recover (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            target: darwin-arm64
-          - os: ubuntu-latest
-            target: linux-x64
-
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build standalone binary
+      - name: Validate tag syntax
         run: |
-          mkdir -p dist-bin
-          bun build --compile --minify ./packages/coding-agent/src/cli.ts --outfile ./dist-bin/dume-${{ matrix.target }}
-          chmod +x ./dist-bin/dume-${{ matrix.target }}
-
-      - name: Upload Binary Asset
-        uses: softprops/action-gh-release@v2
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', tag):
+              raise SystemExit('Expected a version tag vX.Y.Z (optional prerelease/build suffix)')
+          PY
+      - name: Checkout exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          files: ./dist-bin/dume-${{ matrix.target }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and workspace version
+        id: tag
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          test "$(git rev-parse HEAD)" = "$commit"
+          git ls-files --error-unmatch Cargo.lock
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          manifest = tomllib.loads(pathlib.Path('Cargo.toml').read_text())
+          if manifest['workspace']['package']['version'] != os.environ['RELEASE_TAG'][1:]:
+              raise SystemExit('Tag does not match Cargo.toml workspace version')
+          PY
+          printf 'commit=%s\ntag=%s\n' "$commit" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      commit: ${{ needs.validate.outputs.commit }}
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+    steps:
+      - name: Download verified build payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: release-assets
+      - name: Validate exact inventory, contents, and checksums
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path, PurePosixPath
+          import tarfile, zipfile
+          root = Path('release-assets')
+          version = os.environ['RELEASE_TAG'][1:]
+          binaries = ['dume-' + p + ('.zip' if p.startswith('windows-') else '.tar.gz')
+                      for p in ('darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'windows-arm64', 'windows-x64')]
+          source = f'dume-{version}-source.tar.gz'
+          archives = sorted([source, *binaries])
+          checksums = ['source.sha256', *[name + '.sha256' for name in binaries]]
+          if sorted(p.name for p in root.iterdir()) != sorted(archives + checksums):
+              raise SystemExit('Unexpected or missing release assets')
+          expected = {}
+          for name in checksums:
+              lines = (root / name).read_text().splitlines()
+              if len(lines) != 1:
+                  raise SystemExit(f'Invalid checksum sidecar: {name}')
+              digest, filename = lines[0].split('  ', 1)
+              filename = filename.removeprefix('./')
+              if filename in expected or filename not in archives:
+                  raise SystemExit('Duplicate or unexpected checksum entry')
+              expected[filename] = digest
+          if sorted(expected) != archives:
+              raise SystemExit('Incomplete checksums')
+          for name in archives:
+              with (root / name).open('rb') as handle:
+                  if hashlib.file_digest(handle, 'sha256').hexdigest() != expected[name]:
+                      raise SystemExit(f'Checksum mismatch: {name}')
+              if name.endswith('.zip'):
+                  with zipfile.ZipFile(root / name) as handle:
+                      names = handle.namelist()
+                      if handle.testzip() is not None:
+                          raise SystemExit(f'Corrupt zip: {name}')
+              else:
+                  with tarfile.open(root / name) as handle:
+                      members = handle.getmembers()
+                      if any(not (m.isfile() or m.isdir()) for m in members):
+                          raise SystemExit(f'Non-regular archive entry: {name}')
+                      names = [m.name for m in members]
+              prefix = f'dume-{version}' if name == source else 'dume'
+              for entry in names:
+                  parts = PurePosixPath(entry).parts
+                  if not parts or parts[0] != prefix or '..' in parts or '\\' in entry:
+                      raise SystemExit(f'Unsafe archive path: {entry}')
+              required = ([f'{prefix}/Cargo.toml', f'{prefix}/Cargo.lock',
+                           f'{prefix}/crates/dume-cli/src/main.rs',
+                           f'{prefix}/crates/dume-provider/tests/mock_http_fixtures.rs']
+                          if name == source else [f'{prefix}/dume.exe' if name.endswith('.zip') else f'{prefix}/dume'])
+              required.append(f'{prefix}/LICENSE')
+              if not set(required).issubset(names):
+                  raise SystemExit(f'Incomplete archive: {name}')
+              if name == source and any(PurePosixPath(entry).parts[1:2] == ('packages',) for entry in names):
+                  raise SystemExit('Legacy product sources in native archive')
+          (root / 'SHA256SUMS').write_text(''.join(f'{expected[name]}  {name}\n' for name in archives))
+          for name in checksums:
+              (root / name).unlink()
+          PY
+      - name: Stage or recover draft, verify remote assets, then publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Recheck the remote tag immediately before publication, including annotated tags.
+          object="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object | [.type, .sha] | @tsv')"
+          read -r kind sha <<< "$object"
+          while [[ "$kind" == tag ]]; do
+            object="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object | [.type, .sha] | @tsv')"
+            read -r kind sha <<< "$object"
+          done
+          test "$kind" = commit
+          test "$sha" = "$RELEASE_COMMIT"
+          cd release-assets
+          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"; then
+            if [[ "$state" != true ]]; then
+              echo 'Refusing to overwrite a published release.' >&2
+              exit 1
+            fi
+            # Recovery never replaces assets. An incomplete or different draft fails closed.
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "$RELEASE_TAG" --generate-notes ./*
+          fi
+          actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+          expected="$(printf '%s\n' SHA256SUMS dume-* | sort)"
+          test "$actual" = "$expected"
+          remote="$(mktemp -d)"
+          trap 'rm -rf "$remote"' EXIT
+          gh release download "$RELEASE_TAG" --dir "$remote"
+          cmp SHA256SUMS "$remote/SHA256SUMS"
+          (cd "$remote" && sha256sum -c SHA256SUMS)
+          # No clobber/delete operations, even during recovery.
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          gh release edit "$RELEASE_TAG" --draft=false

@@ -5,84 +5,124 @@
 <h1 align="center">D U M - E</h1>
 
 <p align="center">
-  <strong>Clean-Engine Autonomous Multi-Agent Harness</strong>
+  <strong>Clean-Engine Autonomous Multi-Agent Harness (Native Rust)</strong>
   <br/>
-  <sub>Built on the pure Mario Zechner <code>pi</code> core with zero legacy baggage.</sub>
+  <sub>100% standalone native Rust executable with zero Node.js, Bun, or Python runtime dependencies.</sub>
 </p>
 
 <p align="center">
-  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-clean-blue?style=flat-square">
-  <img alt="Bun" src="https://img.shields.io/badge/Bun-1.3%2B-black?style=flat-square">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024%20Edition-red?style=flat-square">
+  <img alt="Ratatui" src="https://img.shields.io/badge/TUI-Ratatui-blue?style=flat-square">
   <img alt="SQLite WAL" src="https://img.shields.io/badge/SQLite-WAL-orange?style=flat-square">
-  <img alt="Zero Legacy" src="https://img.shields.io/badge/Legacy-0%25-brightgreen?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green?style=flat-square">
 </p>
 
 ---
 
-## 🦾 DUM-E Mission
+## DUM-E Mission
 
-**DUM-E** is an autonomous multi-agent coding harness built for long-running, fault-tolerant missions. By choosing the **pure and clean `pi` foundation** rather than bloated monolithic forks, DUM-E achieves:
+**DUM-E** is an autonomous multi-agent coding harness built from scratch in pure Rust for long-running, fault-tolerant missions:
 
-1. **Zero Legacy Overhead**: No vendor-specific locking, no leftover telegram/broker bloat, and minimal dependencies.
-2. **Crash & Restart Recovery**: Preserves goals, attempts, and execution logs in an SQLite WAL store (`~/.dume/agent/harness.db`).
-3. **Epoch Fencing Guard**: Strictly invalidates stale or zombie worker submissions, preventing race conditions or stale overwrites.
-4. **DAG Task Orchestration**: Dynamically schedules multi-agent tasks respecting strict dependency graphs.
-5. **Independent Verification**: Worker submissions are never auto-accepted. Independent acceptance criteria and modified path whitelists are verified before serialized integration.
-6. **Hash-Addressed Blob Storage**: Offloads massive logs and changed blobs to content-addressable storage, avoiding prompt token exhaustion.
+1. **Zero Legacy Overhead**: Clean Rust modular crates (`dume-core`, `dume-store`, `dume-git`, `dume-worker`, `dume-mcp`, `dume-provider`, `dume-tui`, `dume-cli`).
+2. **Native Distribution**: Single standalone binary without Node or Bun runtime dependencies.
+3. **Crash & Restart Recovery**: Preserves goals, attempts, and execution logs in an SQLite WAL store (`~/.dume/rust/harness.db`).
+4. **Epoch Fencing Guard**: Strictly invalidates stale or zombie worker submissions, preventing race conditions or stale overwrites.
+5. **DAG Task Orchestration**: Dynamically schedules multi-agent tasks respecting strict dependency graphs.
+6. **Independent Verification**: Worker submissions are never auto-accepted. Independent acceptance criteria and modified path whitelists are verified in detached git worktrees before serialized integration.
+7. **Hash-Addressed Blob Storage**: Offloads massive logs and changed blobs to content-addressable storage, avoiding prompt token exhaustion.
 
 ---
 
-## 📦 Installation & Setup
+## Installation & Setup
 
-### 1. One-line Standalone Installer (macOS & Linux, No Bun/Node required)
+### Install a Prebuilt Release
+
+Download and run the native installer script:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jeongminsang/dum-e/main/scripts/install.sh -o /tmp/dume-install.sh
+sh /tmp/dume-install.sh
 ```
 
-### 2. From Source / Development
+Use `--ref v<version>` to select an exact published native release. The installer verifies `SHA256SUMS` before placing the binary in `~/.local/bin/dume`.
+
+### Build from Source
+
+Requirements: Rust toolchain (`cargo`), Git.
+
 ```bash
-# Clone and install dependencies
+# Clone repository
 git clone https://github.com/jeongminsang/dum-e.git
 cd dum-e
-bun install
 
-# Link globally as `dume` CLI
-bun --cwd=packages/coding-agent link
-# Or compile local standalone binary
+# Build release binary (native Rust)
+cargo build --release --locked -p dume-cli
+
+# Install binary to PATH
+cargo install --locked --path crates/dume-cli
+```
+
+Local development build and installation can also be run with:
+
+```bash
 sh scripts/install.sh --dev
 ```
 
 ---
 
-## 🚀 Quick Start & CLI Usage
+## Authentication & Model Configuration
 
-DUM-E provides plan-first control with a **resilient autonomous multi-agent execution harness**:
+DUM-E supports OAuth (Anthropic, OpenAI Codex) with automatic token refresh, as well as API key authentication:
 
 ```bash
-# 1. Check DUM-E harness health & SQLite WAL subsystem
-dume doctor
+# OAuth login
+dume login anthropic
+dume login openai-codex
+dume login openai-codex --device
 
-# 2. Start interactive coding session (DUM-E TUI)
-dume
+# API Key login
+dume login openai --api-key
+dume login google --api-key
 
-# 3. Create a durable multi-agent mission goal (DAG tracking)
-dume goal \
-  --title "Implement Distributed Auth" \
-  --requirements "Setup JWT auth routes with verification"
+# Logout and credential management
+dume logout openai-codex
+```
 
-# 4. Check active unfinished attempts
-dume status
+API keys can also be supplied via environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`).
 
-# 5. Non-interactive single-prompt execution
-dume -p "Analyze project dependencies and list top 3 improvements"
+Specify the model provider when launching interactive sessions or checking catalogs:
 
-# 6. Run autonomous harness test suite
-bun run test
+```bash
+# Start interactive TUI session with a specific model
+dume interactive --model anthropic/claude-sonnet-4-5
+dume interactive --model openai-codex/gpt-5.4
+
+# Query catalog across 39 supported providers
+dume models --provider openai-codex
+dume models --provider deepseek
 ```
 
 ---
 
-## 🏗️ Architecture
+## CLI Usage
+
+```bash
+# 1. Start interactive coding session (DUM-E Ratatui TUI)
+dume
+
+# 2. Check DUM-E harness status
+dume status
+
+# 3. Start autonomous coordinator with state recovery
+dume coordinator --repo-path .
+
+# 4. Run workspace test suite offline
+cargo test --workspace --locked --offline
+```
+
+---
+
+## Architecture
 
 <p align="center">
   <img src="assets/dume_banner.jpg" alt="DUM-E Autonomous Multi-Agent Harness Architecture" width="100%" />
@@ -100,3 +140,25 @@ flowchart TD
     VERIFY --> INTEGRATE[Serialized Integration]
     INTEGRATE --> STORE
 ```
+
+---
+
+## Project Status & Contributions
+
+This repository is developed and maintained for personal and dedicated internal use. External contributions, issues, and pull requests are not currently accepted.
+
+---
+
+## Acknowledgements
+
+DUM-E's core concepts, protocol design, and architectural foundation originated from and were inspired by [pi](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic). DUM-E has since been fully re-architected and rewritten from the ground up as a 100% standalone native Rust engine.
+
+---
+
+## License
+
+DUM-E is licensed under either of:
+- Apache License, Version 2.0 ([LICENSE-APACHE](http://www.apache.org/licenses/LICENSE-2.0))
+- MIT license ([LICENSE](LICENSE))
+
+at your option.

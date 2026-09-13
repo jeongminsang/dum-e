@@ -1,48 +1,27 @@
 ---
 name: release
-description: Prepare, publish, verify, and recover DUM-E releases. Use for release preparation, local release smoke tests, publishing, and release recovery.
+description: Prepare, verify, publish, and recover native Rust DUM-E releases.
 ---
 
 # Releasing DUM-E
 
-Run repository commands from the repo root (two directories above this skill), unless instructed otherwise.
+The product release pipeline is native Rust. Do not use the retained TypeScript package release/publish scripts to release the Rust executable. Do not commit, tag, push, or publish without explicit user authorization.
 
-**Lockstep versioning**: all packages share one version; every release updates all together. `patch` = fixes + additions, `minor` = breaking changes. No major releases.
+## Prepare and verify
 
-1. **Update CHANGELOGs**: audit and update each package's `[Unreleased]` section before releasing.
+1. Set the intended version in `[workspace.package]` in `Cargo.toml` and update `Cargo.lock` with Cargo. All Rust crates inherit this version. Preserve the root license assets.
+2. Run `cargo check --workspace --locked` and `cargo test --workspace --locked`.
+3. Build a local native release with `bash scripts/build-binaries.sh --out /tmp/dume-native-release`. The destination must not contain an existing archive with the same name. Add `--offline` only with an already hydrated Cargo cache.
+4. The build script tests the workspace, builds the release executable, packages licenses, extracts the archive, and runs `--help` and `--version` outside the checkout. Python 3.11+ and the native Rust toolchain are build tools, not installed-product dependencies.
+5. On macOS/Linux, verify the installer using the real archive: `python3 scripts/test-native-install.py --archive /tmp/dume-native-release/dume-<platform>-<arch>.tar.gz --version <version>`.
+6. Create the native source archive with `bash scripts/create-source-archive.sh --version <version> --out /tmp/dume-native-release/dume-<version>-source.tar.gz`. It contains Cargo manifests/lockfile, crates and fixtures, native build/install scripts and installer tests, and licenses, not TypeScript packages. Extract into a fresh directory and run locked Cargo tests there.
 
-2. **Local smoke test**: build an unpublished release and smoke test from outside the repo:
-   ```bash
-   npm run release:local -- --out /tmp/dume-local-release --force
-   cd /tmp
+## Publish
 
-   # Node package install smoke tests
-   /tmp/dume-local-release/node/dume --help
-   /tmp/dume-local-release/node/dume --version
-   /tmp/dume-local-release/node/dume --list-models
-   /tmp/dume-local-release/node/dume -p "Say exactly: ok"
-   /tmp/dume-local-release/node/dume
+After explicit approval, commit the reviewed changes including `Cargo.lock`, create the matching `v<workspace.version>` tag, and push it. `.github/workflows/release.yml` is the sole tag publisher. It validates the tag/version, calls the reusable native build workflow, and tests six native platform/architecture combinations before publishing checksummed archives.
 
-   # Bun binary smoke tests
-   /tmp/dume-local-release/bun/dume --help
-   /tmp/dume-local-release/bun/dume --version
-   /tmp/dume-local-release/bun/dume --list-models
-   /tmp/dume-local-release/bun/dume -p "Say exactly: ok"
-   /tmp/dume-local-release/bun/dume
-   ```
-   Verify both Node and Bun startup, model/account listing, interactive startup, and at least one real prompt with the intended default provider. The bare commands `/tmp/dume-local-release/node/dume` and `/tmp/dume-local-release/bun/dume` start interactive mode; run each in tmux, submit a prompt, and wait for the model reply before considering the interactive smoke test passed. Failures are release blockers unless the user explicitly accepts the risk.
+No npm publishing or announcement service is part of native distribution. Do not claim hosted runner success from local tests alone.
 
-   Load and follow [interactive-testing.md](interactive-testing.md) for the tmux workflow. Start each release binary from `/tmp`, not the repo root.
+## Recover
 
-3. **Run the release script**:
-   ```bash
-   DUME_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:patch    # fixes + additions
-   DUME_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:minor    # breaking changes
-   ```
-   Use `npm_config_min_release_age=0` only for the release command. The repo's normal npm age gate can otherwise block the release lockfile refresh when the current workspace package version was published recently. Review any lockfile or shrinkwrap diffs the release creates before push.
-
-   The release script bumps all package versions, updates changelogs, regenerates release artifacts, runs `npm run check`, commits `Release vX.Y.Z`, tags `vX.Y.Z`, adds fresh `## [Unreleased]` changelog sections, commits `Add [Unreleased] section for next cycle`, then pushes `main` and the tag. Do not rerun the release script after a tag was pushed.
-
-4. **CI verifies and announces the npm release**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required. After publishing, `announce-pi-dev-release` verifies every public workspace package resolves at the exact release version and that its npm tarball is available, then writes the verified release marker to R2. `pi.dev/api/latest-version` reads that marker; it must never announce a release from npm before this job succeeds.
-
-5. **If CI publish or announcement fails**: inspect the failed job. The publish helper is idempotent and skips package versions already present on npm; the announcement job rechecks availability before updating the R2 marker. Rerun the failed job or workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
+Use the release workflow's manual `tag` input for an existing tag. It always builds the exact tagged commit. A published release is immutable: never clobber its assets or move its tag. A matching complete draft may be verified and published by rerunning the publication job. An incomplete or different draft fails closed; inspect it and obtain approval before destructive cleanup. Do not silently replace it.
