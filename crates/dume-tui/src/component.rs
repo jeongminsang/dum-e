@@ -347,6 +347,7 @@ pub fn render_status_bar(
     thinking: ThinkingLevel,
     is_busy: bool,
     anim_tick: usize,
+    available_update: Option<&str>,
     theme: &Theme,
 ) {
     let thinking_span = match thinking {
@@ -361,6 +362,15 @@ pub fn render_status_bar(
         Span::styled(format!("| Model: {} |", model), Style::default().fg(theme.status_bar_fg)),
         thinking_span,
     ];
+
+    if let Some(version) = available_update {
+        spans.push(Span::styled(
+            format!(" [UPDATE: v{} available (type /update)] ", version),
+            Style::default()
+                .fg(theme.system_msg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     if is_busy {
         // Braille spinner frames
@@ -692,6 +702,70 @@ pub fn render_oauth_waiting_modal(
             Span::styled(" ▍", Style::default().fg(theme.accent).add_modifier(Modifier::RAPID_BLINK)),
         ]),
     ];
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph, inner);
+}
+
+pub fn render_update_modal(
+    f: &mut Frame,
+    area: Rect,
+    info: &dume_core::UpdateInfo,
+    status_text: &str,
+    in_progress: bool,
+    theme: &Theme,
+) {
+    let width = 74.min(area.width.saturating_sub(4));
+    let height = 16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let title = if in_progress {
+        " In-Place Updating DUM-E (Please wait...) "
+    } else {
+        " DUM-E Update Available (Enter: Install in-place, Esc: Cancel) "
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(title);
+
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Current Version: ", Style::default().fg(theme.status_bar_fg)),
+        Span::styled(format!("v{}", info.current_version), Style::default().fg(theme.border)),
+        Span::styled("  ➔  ", Style::default().fg(theme.accent)),
+        Span::styled("New Version: ", Style::default().fg(theme.status_bar_fg)),
+        Span::styled(format!("v{}", info.latest_version), Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Asset: ", Style::default().fg(theme.status_bar_fg)),
+        Span::styled(&info.asset_name, Style::default().fg(theme.foreground)),
+    ]));
+    lines.push(Line::from(""));
+
+    if !info.release_notes.is_empty() {
+        lines.push(Line::from(Span::styled("Release Notes:", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+        for note_line in info.release_notes.lines().take(4) {
+            lines.push(Line::from(Span::styled(format!("  {}", note_line), Style::default().fg(theme.foreground))));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().fg(theme.status_bar_fg).add_modifier(Modifier::BOLD)),
+        Span::styled(status_text, Style::default().fg(if in_progress { theme.accent } else { theme.user_msg })),
+    ]));
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(block, modal_area);
