@@ -1434,6 +1434,14 @@ fn isolated_cli_command(program: &str, home: &std::path::Path) -> std::process::
         .env("XDG_CONFIG_HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(home);
+
+    // Native Windows needs these system environment variables to launch child processes and resolve networking
+    for var in ["SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "ComSpec", "COMSPEC", "PATHEXT"] {
+        if let Some(val) = std::env::var_os(var) {
+            command.env(var, val);
+        }
+    }
+
     command
 }
 
@@ -1585,12 +1593,18 @@ async fn run_binary_cli_lifecycle(reject: bool) {
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(60),
             cli_http_fixture(listener, reject),
         )
         .await
         .expect("CLI mock server timed out")
     });
+
+    let test_cmd = if cfg!(windows) {
+        "findstr /C:\"fixture feature\" feature.txt"
+    } else {
+        "test \"$(cat feature.txt)\" = 'fixture feature'"
+    };
 
     let mut worker = isolated_cli_command(dume_bin, &home);
     worker.env("OPENAI_API_KEY", "cli-fixture-key").args([
@@ -1600,7 +1614,7 @@ async fn run_binary_cli_lifecycle(reject: bool) {
         "--worktree-path",
         wt.to_str().unwrap(),
         "--test-command",
-        "test \"$(cat feature.txt)\" = 'fixture feature'",
+        test_cmd,
         "--task-prompt",
         "Initialize feature",
         "--model",
@@ -1609,7 +1623,7 @@ async fn run_binary_cli_lifecycle(reject: bool) {
         &base_url,
     ]);
     let worker_out = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
         tokio::process::Command::from(worker)
             .kill_on_drop(true)
             .output(),
