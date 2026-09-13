@@ -45,6 +45,7 @@ eventsource-stream = "0.2"
 futures-util = "0.3"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
 base64 = "0.22"
 
 
