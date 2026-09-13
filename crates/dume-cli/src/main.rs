@@ -3,14 +3,18 @@ use clap::{Parser, Subcommand};
 use dume_core::types::*;
 use dume_store::HarnessStore;
 use dume_worker::executor::WorkerExecutor;
-use dume_worker::ipc::{serialize_message, WorkerToHostMessage};
+use dume_worker::ipc::{WorkerToHostMessage, serialize_message};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "dume", about = "DUM-E Clean-Engine Autonomous Multi-Agent Harness (Rust)")]
+#[command(version)]
+#[command(
+    name = "dume",
+    about = "DUM-E Clean-Engine Autonomous Multi-Agent Harness (Rust)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -37,8 +41,11 @@ enum Commands {
         test_command: Option<String>,
         #[arg(long)]
         task_prompt: Option<String>,
-        #[arg(long, default_value = "claude-3-5-sonnet")]
+        #[arg(long, default_value = "anthropic/claude-sonnet-4-5")]
         model: String,
+        /// Override the selected provider's API root (except Google); sends its resolved credentials to this URL
+        #[arg(long, requires = "task_prompt")]
+        base_url: Option<String>,
     },
 
     /// Show current harness status
@@ -50,7 +57,7 @@ enum Commands {
     },
     /// Launch interactive TUI terminal interface
     Interactive {
-        #[arg(long, default_value = "claude-3-5-sonnet")]
+        #[arg(long, default_value = "anthropic/claude-sonnet-4-5")]
         model: String,
     },
     /// Create a new goal
@@ -90,12 +97,18 @@ enum Commands {
     },
     /// Login via browser OAuth flow or API key
     Login {
-        #[arg(long, default_value = "anthropic")]
+        #[arg(default_value = "anthropic")]
         provider: String,
+        #[arg(long, conflicts_with_all = ["device", "manual"])]
+        api_key: bool,
+        #[arg(long, conflicts_with = "manual")]
+        device: bool,
+        #[arg(long)]
+        manual: bool,
     },
     /// Logout and clear stored credentials
     Logout {
-        #[arg(long, default_value = "anthropic")]
+        #[arg(default_value = "anthropic")]
         provider: String,
     },
 }
@@ -105,25 +118,61 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Coordinator { db_path, artifacts_dir, repo_path }) => {
+        Some(Commands::Coordinator {
+            db_path,
+            artifacts_dir,
+            repo_path,
+        }) => {
             tracing_subscriber::fmt::init();
             run_coordinator(&db_path, &artifacts_dir, &repo_path).await?;
         }
-        Some(Commands::Worker { attempt_id, worktree_path, test_command, task_prompt, model }) => {
-            run_worker_child(&attempt_id, &worktree_path, test_command.as_deref(), task_prompt.as_deref(), &model).await?;
+        Some(Commands::Worker {
+            attempt_id,
+            worktree_path,
+            test_command,
+            task_prompt,
+            model,
+            base_url,
+        }) => {
+            run_worker_child(
+                &attempt_id,
+                &worktree_path,
+                test_command.as_deref(),
+                task_prompt.as_deref(),
+                &model,
+                base_url.as_deref(),
+            )
+            .await?;
         }
-        Some(Commands::Status { db_path, artifacts_dir }) => {
+        Some(Commands::Status {
+            db_path,
+            artifacts_dir,
+        }) => {
             print_status(&db_path, &artifacts_dir)?;
         }
         Some(Commands::Interactive { model }) => {
             dume_tui::run_tui(&model).await?;
         }
-        Some(Commands::Goal { id, description, db_path, artifacts_dir }) => {
+        Some(Commands::Goal {
+            id,
+            description,
+            db_path,
+            artifacts_dir,
+        }) => {
             let store = HarnessStore::open(&db_path, &artifacts_dir)?;
             let goal = store.create_goal(&id, &description)?;
             println!("Created goal '{}': {}", goal.id, goal.description);
         }
-        Some(Commands::Task { id, goal_id, title, description, test_command, target_branch, db_path, artifacts_dir }) => {
+        Some(Commands::Task {
+            id,
+            goal_id,
+            title,
+            description,
+            test_command,
+            target_branch,
+            db_path,
+            artifacts_dir,
+        }) => {
             let store = HarnessStore::open(&db_path, &artifacts_dir)?;
             let task = Task {
                 id: id.clone(),
@@ -143,111 +192,150 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Models { provider }) => {
             let all = dume_provider::ModelCatalog::list_all_builtin_models()?;
-            println!("{:<30} {:<12} {:<10} {:<12} {}", "MODEL ID", "PROVIDER", "REASONING", "MAX TOKENS", "NAME");
+            println!(
+                "{:<30} {:<12} {:<10} {:<12} {}",
+                "MODEL ID", "PROVIDER", "REASONING", "MAX TOKENS", "NAME"
+            );
             println!("{}", "-".repeat(80));
             for m in all {
                 if let Some(ref p) = provider {
-                    if !m.provider.eq_ignore_ascii_case(p) {
+                    if !m
+                        .provider
+                        .eq_ignore_ascii_case(dume_provider::normalize_provider(p))
+                    {
                         continue;
                     }
                 }
-                let max_tok = m.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
-                println!("{:<30} {:<12} {:<10} {:<12} {}", m.id, m.provider, m.reasoning, max_tok, m.name);
+                let max_tok = m
+                    .max_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<30} {:<12} {:<10} {:<12} {}",
+                    m.id, m.provider, m.reasoning, max_tok, m.name
+                );
             }
         }
-        Some(Commands::Login { provider }) => {
-            run_login(&provider).await?;
+        Some(Commands::Login {
+            provider,
+            api_key,
+            device,
+            manual,
+        }) => {
+            tokio::select! {
+                result = run_login(&provider, api_key, device, manual) => result?,
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("Login cancelled"),
+            }
         }
         Some(Commands::Logout { provider }) => {
             run_logout(&provider)?;
         }
         None => {
             // Default to interactive TUI
-            dume_tui::run_tui("claude-3-5-sonnet").await?;
+            dume_tui::run_tui("anthropic/claude-sonnet-4-5").await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_login(provider: &str) -> Result<()> {
-    println!("Initiating login for provider '{}'...", provider);
-    let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+async fn read_login_input() -> Result<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // A detached thread does not prevent runtime shutdown when stdin is cancelled.
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::stdin().read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+    Ok(tokio::time::timeout(Duration::from_secs(300), rx)
+        .await
+        .context("Login input timed out")???)
+}
 
-    if provider == "anthropic" {
-        let pkce = dume_provider::generate_pkce();
-        let state = format!("dume_state_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-        let redirect_uri = format!("http://localhost:{}/callback", dume_provider::oauth::DEFAULT_CALLBACK_PORT);
+fn login_provider(provider: &str) -> Result<&str> {
+    let provider = dume_provider::normalize_provider(provider);
+    anyhow::ensure!(
+        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google"),
+        "Unsupported login provider"
+    );
+    Ok(provider)
+}
 
-        let auth_url = dume_provider::oauth::build_authorization_url(
-            dume_provider::oauth::ANTHROPIC_AUTHORIZE_URL,
-            dume_provider::oauth::ANTHROPIC_CLIENT_ID,
-            &redirect_uri,
-            "org:create_api_key user:profile user:inference user:sessions:claude_code",
-            &state,
-            &pkce.challenge,
+async fn run_login(provider: &str, api_key: bool, device: bool, manual: bool) -> Result<()> {
+    use dume_provider::oauth;
+    let provider = login_provider(provider)?;
+    anyhow::ensure!(
+        !device || provider == "openai-codex",
+        "Device login is only available for openai-codex"
+    );
+    anyhow::ensure!(
+        !api_key || provider != "openai-codex",
+        "Codex requires OAuth login"
+    );
+    let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    if api_key || matches!(provider, "openai" | "google") {
+        anyhow::ensure!(
+            !manual,
+            "Manual OAuth login is unavailable for API-key providers"
         );
-
-        println!("\nPlease open the following URL in your browser to authenticate:");
-        println!("------------------------------------------------------------");
-        println!("{}", auth_url);
-        println!("------------------------------------------------------------");
-        println!("Waiting for OAuth callback on {}...", redirect_uri);
-
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let code = dume_provider::start_oauth_callback_server(dume_provider::oauth::DEFAULT_CALLBACK_PORT, state, rx).await?;
-        println!("OAuth authorization code received. Exchanging for access token...");
-
-        let token_resp = dume_provider::exchange_code_for_token(
-            dume_provider::oauth::ANTHROPIC_TOKEN_URL,
-            dume_provider::oauth::ANTHROPIC_CLIENT_ID,
-            &code,
-            &redirect_uri,
-            &pkce.verifier,
-        ).await?;
-
-        let cred = dume_provider::Credential {
-            cred_type: "oauth".to_string(),
-            key: None,
-            access_token: Some(token_resp.access_token),
-            refresh_token: token_resp.refresh_token,
-            expires_at: token_resp.expires_in.map(|exp| {
-                (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64) + (exp * 1000)
-            }),
-        };
-
-        cred_store.save(provider, &cred)?;
-        println!("Successfully authenticated and saved credentials for '{}'.", provider);
+        println!("Enter API key for {provider} (input is visible):");
+        let key = read_login_input().await?;
+        store.save_credential(provider, key.trim())?;
     } else {
-        println!("Enter API key for {}: ", provider);
-        let mut key = String::new();
-        std::io::stdin().read_line(&mut key)?;
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            anyhow::bail!("API key cannot be empty");
-        }
-
-        let cred = dume_provider::Credential {
-            cred_type: "api_key".to_string(),
-            key: Some(key),
-            access_token: None,
-            refresh_token: None,
-            expires_at: None,
+        let token = if device {
+            oauth::login_codex_device(|url, code| println!("Open {url} and enter code: {code}"))
+                .await?
+        } else {
+            let config =
+                oauth::get_oauth_config(provider).context("OAuth unavailable for this provider")?;
+            let pkce = oauth::generate_pkce()?;
+            let state = if provider == "anthropic" {
+                pkce.verifier.clone()
+            } else {
+                oauth::generate_state()?
+            };
+            let listener = if manual {
+                None
+            } else {
+                Some(oauth::bind_oauth_callback(config.port).await?)
+            };
+            println!(
+                "Open this URL in your browser:\n{}",
+                oauth::build_authorization_url(&config, &state, &pkce.challenge)?
+            );
+            let code = if let Some(listener) = listener {
+                oauth::wait_for_oauth_callback(listener, config.callback_path, &state).await?
+            } else {
+                println!("Paste the authorization code or final redirect URL:");
+                oauth::parse_authorization_input(&read_login_input().await?, &state)?
+            };
+            oauth::exchange_code_for_token(
+                &config,
+                &code,
+                &config.redirect_uri(),
+                &pkce.verifier,
+                &state,
+            )
+            .await?
         };
-        cred_store.save(provider, &cred)?;
-        println!("Successfully saved API key for '{}'.", provider);
+        let credential = dume_provider::Credential::from_oauth(provider, token, None)?;
+        store.save(provider, &credential)?;
     }
-
+    println!("Saved credentials for '{provider}'.");
     Ok(())
 }
 
 fn run_logout(provider: &str) -> Result<()> {
-    let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    let provider = login_provider(provider)?;
+    let cred_store =
+        dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
     cred_store.delete(provider)?;
-    println!("Successfully logged out and removed credentials for '{}'.", provider);
+    println!(
+        "Successfully logged out and removed credentials for '{}'.",
+        provider
+    );
     Ok(())
 }
-
 
 async fn run_worker_child(
     attempt_id: &str,
@@ -255,6 +343,7 @@ async fn run_worker_child(
     test_command: Option<&str>,
     task_prompt: Option<&str>,
     model: &str,
+    base_url: Option<&str>,
 ) -> Result<()> {
     let path = Path::new(worktree_path);
 
@@ -267,7 +356,10 @@ async fn run_worker_child(
 
     // 1. Run actual Agent Loop if task prompt is present
     if let Some(prompt) = task_prompt {
-        let agent = dume_worker::AgentLoop::new(path, model);
+        let mut agent = dume_worker::AgentLoop::new(path, model);
+        if let Some(base_url) = base_url {
+            agent = agent.with_base_url(base_url);
+        }
         let progress_exec = WorkerToHostMessage::Progress {
             attempt_id: attempt_id.to_string(),
             message: format!("Agent loop executing prompt: {}", prompt),
@@ -299,19 +391,15 @@ async fn run_worker_child(
     Ok(())
 }
 
-
-async fn run_coordinator(
-    db_path: &str,
-    artifacts_dir: &str,
-    repo_path: &str,
-) -> Result<()> {
+async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) -> Result<()> {
     let store = Arc::new(HarnessStore::open(db_path, artifacts_dir)?);
     let coordinator_id = "default_coordinator";
     let owner_id = format!("pid_{}", std::process::id());
     let ttl_ms = 15_000;
 
     // 1. Acquire coordinator lock with monotonic epoch fencing
-    let lock = store.acquire_coordinator_lock(coordinator_id, &owner_id, ttl_ms)
+    let lock = store
+        .acquire_coordinator_lock(coordinator_id, &owner_id, ttl_ms)
         .context("Failed to acquire coordinator lock")?;
     let epoch = lock.epoch;
     tracing::info!("Acquired coordinator lock with epoch {}", epoch);
@@ -346,33 +434,58 @@ async fn run_coordinator(
     for pending in pending_integrations {
         if let Some(target_commit) = &pending.integration_commit {
             // Check if Git target branch was already advanced to the integration commit before crash
-            if let Ok(current_ref) = dume_git::integrate::resolve_ref(repo_p, &pending.target_branch).await {
+            if let Ok(current_ref) =
+                dume_git::integrate::resolve_ref(repo_p, &pending.target_branch).await
+            {
                 let is_already_integrated = current_ref == *target_commit
-                    || dume_git::integrate::is_ancestor(repo_p, target_commit, &current_ref).await.unwrap_or(false);
+                    || dume_git::integrate::is_ancestor(repo_p, target_commit, &current_ref)
+                        .await
+                        .unwrap_or(false);
 
                 if is_already_integrated {
                     // Ref was already updated or further advanced by subsequent normal commits: transition DB status to Applied cleanly
                     let mut applied = pending.clone();
                     applied.status = IntegrationStatus::Applied;
                     store.record_integration(&applied)?;
-                    tracing::info!("Reconciled pre-crash pending integration for branch {} (ref: {}) -> Applied", pending.target_branch, current_ref);
+                    tracing::info!(
+                        "Reconciled pre-crash pending integration for branch {} (ref: {}) -> Applied",
+                        pending.target_branch,
+                        current_ref
+                    );
                 } else if current_ref == pending.base_commit {
                     // Ref was not updated: attempt atomic update-ref with CAS
-                    match dume_git::integrate::apply_branch_update(repo_p, &pending.target_branch, target_commit, &pending.base_commit).await {
+                    match dume_git::integrate::apply_branch_update(
+                        repo_p,
+                        &pending.target_branch,
+                        target_commit,
+                        &pending.base_commit,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             let mut applied = pending.clone();
                             applied.status = IntegrationStatus::Applied;
                             store.record_integration(&applied)?;
-                            tracing::info!("Completed pre-crash pending integration for branch {} -> Applied", pending.target_branch);
+                            tracing::info!(
+                                "Completed pre-crash pending integration for branch {} -> Applied",
+                                pending.target_branch
+                            );
                         }
                         Err(cas_err) => {
-                            tracing::warn!("Pre-crash pending integration CAS update-ref failed for branch {}: {}", pending.target_branch, cas_err);
+                            tracing::warn!(
+                                "Pre-crash pending integration CAS update-ref failed for branch {}: {}",
+                                pending.target_branch,
+                                cas_err
+                            );
                         }
                     }
                 } else {
                     tracing::warn!(
                         "Target branch {} moved unexpectedly (current: {}, expected base: {}, candidate: {:?}); CAS update-ref rejected",
-                        pending.target_branch, current_ref, pending.base_commit, pending.integration_commit
+                        pending.target_branch,
+                        current_ref,
+                        pending.base_commit,
+                        pending.integration_commit
                     );
                 }
             }
@@ -387,7 +500,9 @@ async fn run_coordinator(
     // 5. Continuous Coordinator Dispatch Loop:
     // Polls active goals, evaluates TaskDag for ready tasks, spawns workers, and verifies results
     let worker_host = dume_worker::WorkerHost::new(
-        std::env::current_exe()?.to_str().context("Failed to get current executable path")?,
+        std::env::current_exe()?
+            .to_str()
+            .context("Failed to get current executable path")?,
     );
 
     let repo_p = Path::new(repo_path);
@@ -421,7 +536,9 @@ async fn run_coordinator(
                 continue;
             }
 
-            let any_failed = tasks.iter().any(|t| t.status == TaskStatus::Failed || t.status == TaskStatus::NeedsAttention);
+            let any_failed = tasks
+                .iter()
+                .any(|t| t.status == TaskStatus::Failed || t.status == TaskStatus::NeedsAttention);
             if any_failed {
                 store.update_goal_status(&goal.id, GoalStatus::Failed)?;
                 tracing::warn!("Goal {} has failed/blocked tasks", goal.id);
@@ -440,11 +557,18 @@ async fn run_coordinator(
             let ready_tasks = dag.get_ready_tasks();
             for task in ready_tasks {
                 any_work_done = true;
-                let attempt_id = format!("att_{}_{}", task.id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis());
+                let attempt_id = format!(
+                    "att_{}_{}",
+                    task.id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis()
+                );
                 let worktree_dir = repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
 
                 // 1. Create isolated worktree for worker
-                dume_git::worktree::create_git_worktree(repo_p, &worktree_dir, &task.target_branch).await?;
+                dume_git::worktree::create_git_worktree(repo_p, &worktree_dir, &task.target_branch)
+                    .await?;
 
                 // 2. Record attempt in store under current coordinator epoch
                 let attempt = store.create_attempt(
@@ -456,26 +580,33 @@ async fn run_coordinator(
                     30_000,
                 )?;
 
-                tracing::info!("Dispatched task {} (attempt {}) to worker", task.id, attempt.id);
+                tracing::info!(
+                    "Dispatched task {} (attempt {}) to worker",
+                    task.id,
+                    attempt.id
+                );
 
                 // 3. Spawn separate OS worker process
                 let cancel_token = tokio_util::sync::CancellationToken::new();
-                let manifest_res = worker_host.run_attempt(
-                    &attempt.id,
-                    &task.id,
-                    epoch,
-                    &worktree_dir,
-                    task.acceptance_criteria.first().cloned(),
-                    Some(task.description.clone()),
-                    Some("claude-3-5-sonnet".to_string()),
-                    cancel_token,
-                ).await;
+                let manifest_res = worker_host
+                    .run_attempt(
+                        &attempt.id,
+                        &task.id,
+                        epoch,
+                        &worktree_dir,
+                        task.acceptance_criteria.first().cloned(),
+                        Some(task.description.clone()),
+                        Some("anthropic/claude-sonnet-4-5".to_string()),
+                        cancel_token,
+                    )
+                    .await;
 
                 match manifest_res {
                     Ok(manifest) => {
                         // Save manifest artifact
                         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-                        let manifest_hash = store.artifacts.save_artifact(manifest_json.as_bytes())?;
+                        let manifest_hash =
+                            store.artifacts.save_artifact(manifest_json.as_bytes())?;
 
                         // Submit attempt result under epoch guard
                         store.submit_attempt_result(
@@ -486,14 +617,14 @@ async fn run_coordinator(
                         )?;
 
                         let updated_attempt = store.get_attempt(&attempt.id)?;
-                        verify_and_integrate_attempt(&store, repo_path, &updated_attempt, epoch).await?;
+                        verify_and_integrate_attempt(&store, repo_path, &updated_attempt, epoch)
+                            .await?;
                     }
                     Err(e) => {
                         tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
                         store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
                         store.update_task_status(&task.id, TaskStatus::Failed)?;
                     }
-
                 }
 
                 // Clean up worker worktree
@@ -516,6 +647,82 @@ async fn run_coordinator(
 
 pub use dume_cli::verify_and_integrate_attempt;
 
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    #[test]
+    fn login_modes_and_version_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "login", "openai-codex", "--device"])
+                .unwrap()
+                .command,
+            Some(Commands::Login { device: true, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "login", "anthropic", "--manual"])
+                .unwrap()
+                .command,
+            Some(Commands::Login { manual: true, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "login", "google", "--api-key"])
+                .unwrap()
+                .command,
+            Some(Commands::Login { api_key: true, .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["dume", "login", "anthropic", "--api-key", "--device"]).is_err()
+        );
+        assert_eq!(
+            Cli::try_parse_from(["dume", "--version"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
+        assert_eq!(login_provider("gemini").unwrap(), "google");
+        assert!(login_provider("unsupported").is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "models"]).unwrap().command,
+            Some(Commands::Models { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "dume",
+                "worker",
+                "--attempt-id",
+                "a",
+                "--worktree-path",
+                ".",
+                "--task-prompt",
+                "work",
+                "--model",
+                "openai/gpt-5.4",
+                "--base-url",
+                "http://127.0.0.1:1234/v1",
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Worker {
+                base_url: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "dume",
+                "worker",
+                "--attempt-id",
+                "a",
+                "--worktree-path",
+                ".",
+                "--base-url",
+                "http://127.0.0.1:1234/v1",
+            ])
+            .is_err()
+        );
+    }
+}
 
 fn print_status(db_path: &str, artifacts_dir: &str) -> Result<()> {
     let store = HarnessStore::open(db_path, artifacts_dir)?;
@@ -524,9 +731,13 @@ fn print_status(db_path: &str, artifacts_dir: &str) -> Result<()> {
 
     // Coordinator lock status
     if let Ok(Some(lock)) = store.get_coordinator_lock("default_coordinator") {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
         let active = lock.lease_expires_at > now;
-        println!("Coordinator: epoch={}, owner={}, active={}",
+        println!(
+            "Coordinator: epoch={}, owner={}, active={}",
             lock.epoch,
             lock.owner_id.as_deref().unwrap_or("<none>"),
             active
@@ -540,7 +751,13 @@ fn print_status(db_path: &str, artifacts_dir: &str) -> Result<()> {
     println!("Goals: {} total", goals.len());
     for g in goals {
         let tasks = store.list_tasks_for_goal(&g.id)?;
-        println!("  - [{:?}] {} ({}): {} tasks", g.status, g.id, g.description, tasks.len());
+        println!(
+            "  - [{:?}] {} ({}): {} tasks",
+            g.status,
+            g.id,
+            g.description,
+            tasks.len()
+        );
         for t in tasks {
             println!("      * [{:?}] {} - {}", t.status, t.id, t.title);
         }

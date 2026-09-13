@@ -48,5 +48,6 @@ collect.sh
 
 # Rust build artifacts
 target/
-Cargo.lock
-.dume/
+.dume/rust/
+.dume/build/
+.dume/cache/

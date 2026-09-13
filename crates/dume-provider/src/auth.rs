@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credential {
     #[serde(rename = "type")]
     pub cred_type: String,
@@ -12,6 +14,80 @@ pub struct Credential {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("cred_type", &self.cred_type)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn normalize_provider(provider: &str) -> &str {
+    if provider == "gemini" {
+        "google"
+    } else {
+        provider
+    }
+}
+
+fn now_ms() -> Result<i64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
+}
+
+impl Credential {
+    pub fn from_oauth(
+        provider: &str,
+        token: crate::oauth::OAuthTokenResponse,
+        previous: Option<&Credential>,
+    ) -> Result<Self> {
+        let account_id = if provider == "openai-codex" {
+            Some(
+                crate::oauth::extract_account_id(&token.access_token)
+                    .or_else(|| previous.and_then(|c| c.account_id.clone()))
+                    .context("Codex token missing account ID")?,
+            )
+        } else {
+            None
+        };
+        let expires_in = token
+            .expires_in
+            .filter(|v| *v > 0)
+            .context("OAuth token missing expiration")?;
+        let expires_at = now_ms()?
+            .checked_add(
+                expires_in
+                    .checked_mul(1000)
+                    .context("Invalid token expiration")?,
+            )
+            .context("Invalid token expiration")?;
+        anyhow::ensure!(
+            !token.access_token.trim().is_empty(),
+            "Empty OAuth access token"
+        );
+        let refresh_token = token
+            .refresh_token
+            .or_else(|| previous.and_then(|c| c.refresh_token.clone()));
+        anyhow::ensure!(
+            refresh_token.as_ref().is_some_and(|s| !s.trim().is_empty()),
+            "Missing OAuth refresh token"
+        );
+        Ok(Self {
+            cred_type: "oauth".into(),
+            key: None,
+            access_token: Some(token.access_token),
+            refresh_token,
+            expires_at: Some(expires_at),
+            account_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,181 +103,263 @@ impl CredentialStore {
     }
 
     pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".dume/agent/auth.json")
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".dume/agent/auth.json")
     }
 
-    pub fn get_api_key(&self, provider: &str) -> Option<String> {
-        self.get_token(provider)
+    fn parent(&self) -> &Path {
+        self.file_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
     }
 
-    pub fn get_token(&self, provider: &str) -> Option<String> {
-        let env_var = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" | "gemini" => "GEMINI_API_KEY",
-            _ => "",
-        };
-
-        if !env_var.is_empty() {
-            if let Ok(val) = std::env::var(env_var) {
-                if !val.trim().is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-
-        if let Ok(creds) = self.load() {
-            if let Some(cred) = creds.get(provider) {
-                if let Some(ref k) = cred.key {
-                    return Some(k.clone());
-                }
-                if let Some(ref tok) = cred.access_token {
-                    return Some(tok.clone());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Resolve valid token, refreshing OAuth token automatically if expired or expiring within 5 minutes
-    pub async fn resolve_valid_token(&self, provider: &str) -> Option<String> {
-        let env_var = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" | "gemini" => "GEMINI_API_KEY",
-            _ => "",
-        };
-
-        if !env_var.is_empty() {
-            if let Ok(val) = std::env::var(env_var) {
-                if !val.trim().is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-
-        let cred = self.load().ok()?.get(provider).cloned()?;
-        if let Some(ref k) = cred.key {
-            return Some(k.clone());
-        }
-
-        // OAuth token with potential expiration
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        let buffer_ms = 5 * 60 * 1000; // 5 minutes buffer
-
-        if let (Some(access_token), Some(refresh_token), Some(expires_at)) = (&cred.access_token, &cred.refresh_token, cred.expires_at) {
-            if expires_at - now < buffer_ms {
-                // Token expiring soon or expired: perform refresh
-                if let Some(config) = crate::oauth::get_oauth_config(provider) {
-                    if let Ok(token_resp) = crate::oauth::refresh_oauth_token(
-                        config.token_url,
-                        config.client_id,
-                        refresh_token,
-                    ).await {
-                        let new_cred = Credential {
-                            cred_type: "oauth".to_string(),
-                            key: None,
-                            access_token: Some(token_resp.access_token.clone()),
-                            refresh_token: token_resp.refresh_token.or_else(|| Some(refresh_token.clone())),
-                            expires_at: token_resp.expires_in.map(|exp| now + exp * 1000),
-                        };
-                        let _ = self.save(provider, &new_cred);
-                        return Some(token_resp.access_token);
-                    }
-                }
-            }
-            return Some(access_token.clone());
-        }
-
-        cred.access_token
-    }
-
-    pub fn save(&self, provider: &str, cred: &Credential) -> Result<()> {
-        let mut creds = self.load().unwrap_or_default();
-        creds.insert(provider.to_string(), cred.clone());
-
-        if let Some(parent) = self.file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let serialized = serde_json::to_string_pretty(&creds)?;
-
-        // Atomic write via temporary file in same directory
-        let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-        fs::write(temp_file.path(), serialized)?;
-
+    // Stable sidecar inode: never unlink it; replacing the credential file cannot invalidate this lock.
+    fn open_lock(&self) -> Result<File> {
+        fs::create_dir_all(self.parent())?;
+        let mut path = self.file_path.as_os_str().to_os_string();
+        path.push(".lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            let _ = fs::set_permissions(temp_file.path(), permissions);
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        Ok(options.open(PathBuf::from(path))?)
+    }
 
-        temp_file.persist(&self.file_path)?;
-        Ok(())
+    fn lock(&self) -> Result<File> {
+        let file = self.open_lock()?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("Credential store lock timed out")
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
+        }
+    }
+
+    pub async fn resolve_credential(&self, provider: &str) -> Result<Option<Credential>> {
+        let provider = normalize_provider(provider);
+        let env = match provider {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "google" => "GEMINI_API_KEY",
+            _ => "",
+        };
+        if let Ok(key) = std::env::var(env) {
+            if !key.trim().is_empty() {
+                return Ok(Some(Self::api_key(&key)));
+            }
+        }
+        let store = self.clone();
+        let _lock = tokio::task::spawn_blocking(move || store.lock()).await??;
+        let mut credentials = self.load()?;
+        let Some(mut credential) = credentials.get(provider).cloned() else {
+            return Ok(None);
+        };
+        match credential.cred_type.as_str() {
+            "api_key" => {
+                anyhow::ensure!(provider != "openai-codex", "Codex requires OAuth login");
+                anyhow::ensure!(
+                    credential
+                        .key
+                        .as_ref()
+                        .is_some_and(|s| !s.trim().is_empty()),
+                    "Stored API key is empty"
+                );
+            }
+            "oauth" => {
+                let config = crate::oauth::get_oauth_config(provider)
+                    .context("Provider requires API-key login")?;
+                let expires = credential
+                    .expires_at
+                    .context("Stored OAuth credential missing expiration; login again")?;
+                if expires.saturating_sub(now_ms()?) <= 300_000 {
+                    let refresh = credential
+                        .refresh_token
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .context("Missing refresh token; login again")?;
+                    let token = crate::oauth::refresh_oauth_token(&config, refresh).await?;
+                    credential = Credential::from_oauth(provider, token, Some(&credential))?;
+                    credentials.insert(provider.to_owned(), credential.clone());
+                    self.write_all(&credentials)?;
+                }
+                anyhow::ensure!(
+                    credential
+                        .access_token
+                        .as_ref()
+                        .is_some_and(|s| !s.trim().is_empty()),
+                    "Stored OAuth access token is empty"
+                );
+                if provider == "openai-codex" && credential.account_id.is_none() {
+                    credential.account_id = crate::oauth::extract_account_id(
+                        credential.access_token.as_deref().unwrap(),
+                    );
+                    anyhow::ensure!(
+                        credential.account_id.is_some(),
+                        "Codex credential missing account ID; login again"
+                    );
+                    credentials.insert(provider.to_owned(), credential.clone());
+                    self.write_all(&credentials)?;
+                }
+            }
+            _ => anyhow::bail!("Unknown stored credential type"),
+        }
+        Ok(Some(credential))
+    }
+
+    pub fn save(&self, provider: &str, credential: &Credential) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut credentials = self.load()?;
+        credentials.insert(normalize_provider(provider).to_owned(), credential.clone());
+        self.write_all(&credentials)
     }
 
     pub fn delete(&self, provider: &str) -> Result<()> {
-        let mut creds = self.load().unwrap_or_default();
-        creds.remove(provider);
+        let _lock = self.lock()?;
+        let mut credentials = self.load()?;
+        credentials.remove(normalize_provider(provider));
+        self.write_all(&credentials)
+    }
 
-        if let Some(parent) = self.file_path.parent() {
-            fs::create_dir_all(parent)?;
+    fn api_key(key: &str) -> Credential {
+        Credential {
+            cred_type: "api_key".into(),
+            key: Some(key.to_owned()),
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            account_id: None,
         }
-        let serialized = serde_json::to_string_pretty(&creds)?;
-
-        let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-        fs::write(temp_file.path(), serialized)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            let _ = fs::set_permissions(temp_file.path(), permissions);
-        }
-
-        temp_file.persist(&self.file_path)?;
-        Ok(())
     }
 
     pub fn save_credential(&self, provider: &str, key: &str) -> Result<()> {
-        self.save(
-            provider,
-            &Credential {
-                cred_type: "api_key".to_string(),
-                key: Some(key.to_string()),
-                access_token: None,
-                refresh_token: None,
-                expires_at: None,
-            },
-        )
+        anyhow::ensure!(!key.trim().is_empty(), "API key cannot be empty");
+        anyhow::ensure!(provider != "openai-codex", "Codex requires OAuth login");
+        self.save(provider, &Self::api_key(key))
+    }
+
+    fn write_all(&self, credentials: &HashMap<String, Credential>) -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(self.parent())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&serde_json::to_vec_pretty(credentials)?)?;
+        file.as_file().sync_all()?;
+        file.persist(&self.file_path)
+            .map_err(|_| anyhow::anyhow!("Unable to persist credential store"))?;
+        Ok(())
     }
 
     fn load(&self) -> Result<HashMap<String, Credential>> {
-        if !self.file_path.exists() {
-            return Ok(HashMap::new());
-        }
-        let content = fs::read_to_string(&self.file_path)?;
-        let map = serde_json::from_str(&content)?;
-        Ok(map)
+        let content = match fs::read(&self.file_path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(e.into()),
+        };
+        serde_json::from_slice(&content).map_err(|_| anyhow::anyhow!("Malformed credential store"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn test_credential_save_and_retrieve() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        let store = CredentialStore::new(&path);
+    fn updates_preserve_other_credentials_and_normalize_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        store.save_credential("gemini", "google-key").unwrap();
+        store.save_credential("openai", "openai-key").unwrap();
+        store.delete("gemini").unwrap();
+        let map = store.load().unwrap();
+        assert!(!map.contains_key("google"));
+        assert_eq!(map["openai"].key.as_deref(), Some("openai-key"));
+    }
 
-        store.save_credential("anthropic", "sk-ant-test").unwrap();
-        assert_eq!(store.get_api_key("anthropic"), Some("sk-ant-test".to_string()));
+    #[test]
+    fn malformed_store_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(&path, "bad secret content").unwrap();
+        let store = CredentialStore::new(&path);
+        assert!(store.save_credential("openai", "key").is_err());
+        assert!(store.delete("openai").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "bad secret content");
+    }
+
+    #[test]
+    fn concurrent_updates_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        let workers: Vec<_> = (0..12)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .save_credential(&format!("provider-{i}"), "key")
+                        .unwrap()
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.load().unwrap().len(), 12);
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_without_refresh_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        let mut credential = SelfTestCredential::expired();
+        store.save("openai-codex", &credential).unwrap();
+        assert!(store.resolve_credential("openai-codex").await.is_err());
+        credential.expires_at = None;
+        store.save("openai-codex", &credential).unwrap();
+        assert!(store.resolve_credential("openai-codex").await.is_err());
+    }
+
+    struct SelfTestCredential;
+    impl SelfTestCredential {
+        fn expired() -> Credential {
+            Credential {
+                cred_type: "oauth".into(),
+                key: None,
+                access_token: Some("expired".into()),
+                refresh_token: None,
+                expires_at: Some(1),
+                account_id: Some("account".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_preserves_refresh_and_account_metadata() {
+        let mut old = SelfTestCredential::expired();
+        old.refresh_token = Some("refresh".into());
+        let token = crate::oauth::OAuthTokenResponse {
+            access_token: "new".into(),
+            refresh_token: None,
+            expires_in: Some(3600),
+            token_type: None,
+            scope: None,
+        };
+        let new = Credential::from_oauth("openai-codex", token, Some(&old)).unwrap();
+        assert_eq!(new.refresh_token, old.refresh_token);
+        assert_eq!(new.account_id, old.account_id);
+        assert!(!format!("{new:?}").contains("refresh"));
     }
 }

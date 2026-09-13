@@ -25,6 +25,9 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Opaque Responses reasoning items, for stateless Codex replay only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_reasoning: Vec<Value>,
 }
 
 impl ChatMessage {
@@ -34,6 +37,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            codex_reasoning: Vec::new(),
         }
     }
 
@@ -43,15 +47,20 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            codex_reasoning: Vec::new(),
         }
     }
 
-    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
             tool_call_id: None,
             tool_calls: Some(tool_calls),
+            codex_reasoning: Vec::new(),
         }
     }
 
@@ -61,6 +70,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            codex_reasoning: Vec::new(),
         }
     }
 
@@ -70,6 +80,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
+            codex_reasoning: Vec::new(),
         }
     }
 }
@@ -84,6 +95,8 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
+    /// Opaque replay metadata. Never render as transcript or streaming text.
+    CodexReasoning(Vec<Value>),
     ToolCallDelta {
         index: usize,
         id: Option<String>,
