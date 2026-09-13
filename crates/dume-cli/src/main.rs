@@ -57,7 +57,7 @@ enum Commands {
     },
     /// Launch interactive TUI terminal interface
     Interactive {
-        #[arg(long, default_value = "anthropic/claude-sonnet-4-5")]
+        #[arg(long, default_value = "")]
         model: String,
     },
     /// Create a new goal
@@ -232,7 +232,7 @@ async fn main() -> Result<()> {
         }
         None => {
             // Default to interactive TUI
-            dume_tui::run_tui("anthropic/claude-sonnet-4-5").await?;
+            dume_tui::run_tui("").await?;
         }
     }
 
