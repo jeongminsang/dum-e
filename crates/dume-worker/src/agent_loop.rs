@@ -1193,29 +1193,29 @@ mod tests {
         );
 
         // 5. Symlink traversal defense: symlink pointing outside worktree
-        let outside_dir = sandbox_root.join("outside_target");
-        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
         #[cfg(unix)]
         {
+            let outside_dir = sandbox_root.join("outside_target");
+            tokio::fs::create_dir_all(&outside_dir).await.unwrap();
             let symlink_in_wt = worktree_dir.join("symlink_out");
             std::os::unix::fs::symlink(&outside_dir, &symlink_in_wt).unwrap();
-        }
 
-        let bad_symlink_write = serde_json::json!({
-            "path": "symlink_out/pwned.txt",
-            "content": "escape via symlink"
-        });
-        let sym_res = strict_executor
-            .execute("write_file", &bad_symlink_write)
-            .await;
-        assert!(
-            sym_res.is_err(),
-            "Write via symlink pointing outside worktree must fail"
-        );
-        assert!(
-            !outside_dir.join("pwned.txt").exists(),
-            "pwned.txt must not exist in outside directory"
-        );
+            let bad_symlink_write = serde_json::json!({
+                "path": "symlink_out/pwned.txt",
+                "content": "escape via symlink"
+            });
+            let sym_res = strict_executor
+                .execute("write_file", &bad_symlink_write)
+                .await;
+            assert!(
+                sym_res.is_err(),
+                "Write via symlink pointing outside worktree must fail"
+            );
+            assert!(
+                !outside_dir.join("pwned.txt").exists(),
+                "pwned.txt must not exist in outside directory"
+            );
+        }
 
         // Zero side effect check: wt_path must remain completely empty!
         let mut entries = tokio::fs::read_dir(&wt_path).await.unwrap();
