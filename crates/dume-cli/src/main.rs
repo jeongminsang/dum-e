@@ -111,6 +111,12 @@ enum Commands {
         #[arg(default_value = "anthropic")]
         provider: String,
     },
+    /// Check for or install updates in-place
+    Update {
+        /// Only check for updates without downloading or installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -230,12 +236,48 @@ async fn main() -> Result<()> {
         Some(Commands::Logout { provider }) => {
             run_logout(&provider)?;
         }
+        Some(Commands::Update { check }) => {
+            run_update(check).await?;
+        }
         None => {
             // Default to interactive TUI
             dume_tui::run_tui("").await?;
         }
     }
 
+    Ok(())
+}
+
+async fn run_update(check_only: bool) -> Result<()> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("Checking for updates (current version: v{})...", current_version);
+
+    let repo = "jeongminsang/dum-e";
+    match dume_core::updater::check_for_update(repo, current_version)? {
+        Some(info) => {
+            println!("\n🚀 New version available: v{}", info.latest_version);
+            println!("Target platform: {}", dume_core::updater::detect_platform()?);
+            println!("Asset package: {}", info.asset_name);
+            if !info.release_notes.is_empty() {
+                println!("\nRelease Notes:\n{}", info.release_notes.trim());
+            }
+
+            if check_only {
+                println!("\nRun `dume update` to apply this update in-place.");
+                return Ok(());
+            }
+
+            println!("\nApplying hot update in-place...");
+            let replaced_path = dume_core::updater::apply_update(&info, |msg| {
+                println!("  • {}", msg);
+            })?;
+            println!("\n✅ Successfully updated DUM-E in-place to v{}!", info.latest_version);
+            println!("Binary location: {}", replaced_path.display());
+        }
+        None => {
+            println!("✅ DUM-E is already up to date (v{}).", current_version);
+        }
+    }
     Ok(())
 }
 
@@ -721,6 +763,14 @@ mod login_tests {
             ])
             .is_err()
         );
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "update", "--check"]).unwrap().command,
+            Some(Commands::Update { check: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dume", "update"]).unwrap().command,
+            Some(Commands::Update { check: false })
+        ));
     }
 }
 

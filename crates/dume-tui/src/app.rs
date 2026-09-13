@@ -1,8 +1,8 @@
 use crate::component::{
     calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
     render_input_bar, render_login_selector_modal, render_model_selector_modal,
-    render_oauth_waiting_modal, render_status_bar, render_transcript, AutocompleteItem,
-    LoginProviderChoice, ThinkingLevel,
+    render_oauth_waiting_modal, render_status_bar, render_transcript, render_update_modal,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel,
 };
 use crate::keybinding::{Action, handle_key_event};
 use crate::theme::Theme;
@@ -13,6 +13,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use dume_core::skills::SkillRegistry;
+use dume_core::updater::UpdateInfo;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
 use dume_provider::ModelInfo;
@@ -36,6 +37,13 @@ enum ConversationEvent {
     OAuthComplete {
         provider: String,
         result: Result<()>,
+    },
+    UpdateAvailable(UpdateInfo),
+    UpdateProgress {
+        message: String,
+    },
+    UpdateFinished {
+        result: Result<std::path::PathBuf, String>,
     },
 }
 
@@ -61,6 +69,11 @@ pub enum ModalState {
         url: String,
         cancel_token: CancellationToken,
     },
+    Update {
+        info: UpdateInfo,
+        status_text: String,
+        in_progress: bool,
+    },
 }
 
 pub struct App {
@@ -79,6 +92,7 @@ pub struct App {
     pub autocomplete_dismissed: bool,
     pub modal: ModalState,
     pub last_ctrl_c: Option<std::time::Instant>,
+    pub available_update: Option<UpdateInfo>,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -149,6 +163,7 @@ impl App {
             autocomplete_dismissed: false,
             modal: ModalState::None,
             last_ctrl_c: None,
+            available_update: None,
         }
     }
 
@@ -173,6 +188,7 @@ impl App {
             ("/model", "Switch model (e.g. /model anthropic/claude-sonnet-4-5)"),
             ("/login", "Save provider API key (e.g. /login anthropic <key>)"),
             ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
+            ("/update", "Check and install DUM-E in-place update"),
             ("/clear", "Clear conversation transcript"),
             ("/skills", "List all available skills"),
             ("/help", "Show help and command list"),
@@ -278,6 +294,43 @@ impl App {
                 }
                 self.modal = ModalState::None;
             }
+            ConversationEvent::UpdateAvailable(info) => {
+                self.available_update = Some(info.clone());
+                self.messages.push(ChatMessage::system(format!(
+                    "Update available: v{} (Current: v{}). Type /update to install in-place.",
+                    info.latest_version, info.current_version
+                )));
+            }
+            ConversationEvent::UpdateProgress { message } => {
+                if let ModalState::Update { status_text, in_progress, .. } = &mut self.modal {
+                    *status_text = message;
+                    *in_progress = true;
+                }
+            }
+            ConversationEvent::UpdateFinished { result } => {
+                match result {
+                    Ok(path) => {
+                        self.messages.push(ChatMessage::system(format!(
+                            "Successfully updated DUM-E in-place to the latest version! (Binary: {})",
+                            path.display()
+                        )));
+                        if let Some(info) = &self.available_update {
+                            self.messages.push(ChatMessage::system(format!(
+                                "DUM-E is now running on updated binary (v{}). Your session remains active.",
+                                info.latest_version
+                            )));
+                        }
+                        self.available_update = None;
+                    }
+                    Err(e) => {
+                        self.messages.push(ChatMessage::system(format!(
+                            "In-place update failed: {}",
+                            e
+                        )));
+                    }
+                }
+                self.modal = ModalState::None;
+            }
         }
     }
 }
@@ -316,6 +369,16 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+
+    // Spawn non-blocking background task to check for latest release
+    let update_tx = stream_tx.clone();
+    tokio::spawn(async move {
+        let current_version = env!("CARGO_PKG_VERSION");
+        let repo = "jeongminsang/dum-e";
+        if let Ok(Some(info)) = dume_core::updater::check_for_update(repo, current_version) {
+            let _ = update_tx.send(ConversationEvent::UpdateAvailable(info)).await;
+        }
+    });
 
     let result: Result<()> = async {
       loop {
@@ -375,6 +438,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 );
             }
 
+            let update_str = app.available_update.as_ref().map(|u| u.latest_version.as_str());
             render_status_bar(
                 f,
                 chunks[2],
@@ -382,6 +446,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.thinking,
                 app.is_busy,
                 anim_tick,
+                update_str,
                 &app.theme,
             );
 
@@ -473,6 +538,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                         f.area(),
                         "OpenAI Codex",
                         url,
+                        &app.theme,
+                    );
+                }
+                ModalState::Update {
+                    info,
+                    status_text,
+                    in_progress,
+                } => {
+                    render_update_modal(
+                        f,
+                        f.area(),
+                        info,
+                        status_text,
+                        *in_progress,
                         &app.theme,
                     );
                 }
@@ -756,6 +835,41 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     continue;
                                 }
+                                ModalState::Update { info, in_progress, status_text } => {
+                                    if *in_progress {
+                                        // Ignore inputs while update is underway
+                                        continue;
+                                    }
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        app.modal = ModalState::None;
+                                    } else if key.code == crossterm::event::KeyCode::Enter {
+                                        *in_progress = true;
+                                        *status_text = "Starting update...".to_string();
+                                        let update_tx = stream_tx.clone();
+                                        let update_info = info.clone();
+
+                                        tokio::spawn(async move {
+                                            let info_clone = update_info.clone();
+                                            let tx_progress = update_tx.clone();
+                                            let res = tokio::task::spawn_blocking(move || {
+                                                dume_core::updater::apply_update(&info_clone, |msg| {
+                                                    let _ = tx_progress.blocking_send(ConversationEvent::UpdateProgress {
+                                                        message: msg.to_string(),
+                                                    });
+                                                })
+                                            }).await;
+
+                                            let final_res = match res {
+                                                Ok(Ok(path)) => Ok(path),
+                                                Ok(Err(e)) => Err(e.to_string()),
+                                                Err(join_err) => Err(join_err.to_string()),
+                                            };
+
+                                            let _ = update_tx.send(ConversationEvent::UpdateFinished { result: final_res }).await;
+                                        });
+                                    }
+                                    continue;
+                                }
                                 ModalState::None => {}
                             }
 
@@ -1014,9 +1128,48 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             app.messages.push(ChatMessage::system(text.trim_end().to_string()));
                                             continue;
+                                        } else if trimmed == "/update" {
+                                            if let Some(info) = app.available_update.clone() {
+                                                app.modal = ModalState::Update {
+                                                    info,
+                                                    status_text: "Ready to install. Press Enter to proceed.".to_string(),
+                                                    in_progress: false,
+                                                };
+                                            } else {
+                                                app.messages.push(ChatMessage::system("Checking for updates..."));
+                                                let update_tx = stream_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let current_version = env!("CARGO_PKG_VERSION");
+                                                    let repo = "jeongminsang/dum-e";
+                                                    match dume_core::updater::check_for_update(repo, current_version) {
+                                                        Ok(Some(info)) => {
+                                                            let _ = update_tx.send(ConversationEvent::UpdateAvailable(info)).await;
+                                                        }
+                                                        Ok(None) => {
+                                                            let _ = update_tx.send(ConversationEvent::Finished {
+                                                                messages: vec![ChatMessage::system(format!(
+                                                                    "DUM-E is already up to date (v{}).",
+                                                                    current_version
+                                                                ))],
+                                                                error: None,
+                                                            }).await;
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = update_tx.send(ConversationEvent::Finished {
+                                                                messages: vec![ChatMessage::system(format!(
+                                                                    "Update check failed: {}",
+                                                                    e
+                                                                ))],
+                                                                error: None,
+                                                            }).await;
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            continue;
                                         } else if trimmed == "/help" {
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {

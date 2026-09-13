@@ -63,6 +63,7 @@ mod tests {
         let items = app.get_autocomplete_items();
         assert!(!items.is_empty());
         assert!(items.iter().any(|i| i.name == "/model"));
+        assert!(items.iter().any(|i| i.name == "/update"));
         assert!(items.iter().any(|i| i.name == "/skills"));
 
         // Filter with prefix /m
