@@ -11,11 +11,17 @@ impl WorkerExecutor {
         command_str: &str,
     ) -> Result<TestResult> {
         let output = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", command_str])
-                .current_dir(worktree_path)
-                .output()
-                .await?
+            let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            let mut cmd = Command::new(comspec);
+            cmd.args(["/C", command_str])
+                .current_dir(worktree_path);
+            if let Ok(sys_root) = std::env::var("SystemRoot") {
+                cmd.env("SystemRoot", sys_root);
+            }
+            if let Ok(path) = std::env::var("PATH") {
+                cmd.env("PATH", path);
+            }
+            cmd.output().await?
         } else {
             Command::new("sh")
                 .args(["-c", command_str])

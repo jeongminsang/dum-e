@@ -1601,7 +1601,7 @@ async fn run_binary_cli_lifecycle(reject: bool) {
     });
 
     let test_cmd = if cfg!(windows) {
-        "findstr /C:\"fixture feature\" feature.txt"
+        "powershell -NoProfile -Command \"if ((Get-Content feature.txt) -eq 'fixture feature') { exit 0 } else { exit 1 }\""
     } else {
         "test \"$(cat feature.txt)\" = 'fixture feature'"
     };
@@ -1680,7 +1680,13 @@ async fn run_binary_cli_lifecycle(reject: bool) {
         assert_eq!(manifest.attempt_id, "att_cli_1");
         assert_eq!(manifest.modified_files, vec!["feature.txt"]);
         assert_eq!(manifest.test_results.len(), 1);
-        assert!(manifest.test_results[0].passed);
+        assert!(
+            manifest.test_results[0].passed,
+            "Test command failed! exit_code: {}, stdout: {}, stderr: {}",
+            manifest.test_results[0].exit_code,
+            manifest.test_results[0].stdout,
+            manifest.test_results[0].stderr
+        );
         assert_eq!(manifest.test_results[0].exit_code, 0);
         assert_ne!(manifest.candidate_commit, initial_commit.trim());
         let committed = run_git(&[

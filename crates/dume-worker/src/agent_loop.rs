@@ -1195,9 +1195,11 @@ mod tests {
         // 5. Symlink traversal defense: symlink pointing outside worktree
         let outside_dir = sandbox_root.join("outside_target");
         tokio::fs::create_dir_all(&outside_dir).await.unwrap();
-        let symlink_in_wt = worktree_dir.join("symlink_out");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside_dir, &symlink_in_wt).unwrap();
+        {
+            let symlink_in_wt = worktree_dir.join("symlink_out");
+            std::os::unix::fs::symlink(&outside_dir, &symlink_in_wt).unwrap();
+        }
 
         let bad_symlink_write = serde_json::json!({
             "path": "symlink_out/pwned.txt",
