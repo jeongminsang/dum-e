@@ -70,6 +70,19 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
         "openai" => api == "openai-responses" || api == "openai-completions" || api.is_empty(),
         "openai-codex" => api == "openai-codex-responses" || api == "openai-responses" || api.is_empty(),
         "google" => api == "google-generative-ai" || api.is_empty(),
+        "opencode" => {
+            api == "openai-completions"
+                || api == "openai-responses"
+                || api == "anthropic-messages"
+                || api == "google-generative-ai"
+                || api.is_empty()
+        }
+        "opencode-go" => {
+            api == "openai-completions"
+                || api == "openai-responses"
+                || api == "anthropic-messages"
+                || api.is_empty()
+        }
         _ => false,
     }
 }
@@ -80,7 +93,10 @@ pub fn is_model_supported(model: &ModelInfo) -> bool {
 }
 
 fn supported(provider: &str) -> bool {
-    matches!(provider, "anthropic" | "openai" | "openai-codex" | "google")
+    matches!(
+        provider,
+        "anthropic" | "openai" | "openai-codex" | "google" | "opencode" | "opencode-go"
+    )
 }
 
 /// Resolve only supported catalog entries, independently of available credentials.
@@ -113,6 +129,20 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
         !matches.is_empty(),
         "Unknown supported model '{selection}'; select a catalog provider/model"
     );
+    if matches.len() > 1 && provider.is_none() {
+        // Tie-breaker: if query is unqualified (e.g. 'claude-sonnet-4-5'), prefer the primary native provider
+        // (anthropic, openai, openai-codex, google) over proxy/reseller catalogs (opencode, opencode-go).
+        let native_matches: Vec<_> = matches
+            .iter()
+            .filter(|m| matches!(m.provider.as_str(), "anthropic" | "openai" | "openai-codex" | "google"))
+            .cloned()
+            .collect();
+        if native_matches.len() == 1 {
+            return Ok(native_matches.into_iter().next().unwrap());
+        } else if !native_matches.is_empty() {
+            matches = native_matches;
+        }
+    }
     if matches.len() > 1 {
         let choices = matches
             .iter()
@@ -179,6 +209,26 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             credential.key.as_deref(),
             "API key",
         )?)),
+        ("opencode" | "opencode-go", "api_key") => {
+            let key = required(credential.key.as_deref(), "API key")?;
+            let default_base = if model.provider == "opencode-go" {
+                "https://opencode.ai/zen/go/v1"
+            } else {
+                "https://opencode.ai/zen/v1"
+            };
+            let base_url = model.base_url.as_deref().unwrap_or(default_base);
+            match model.api.as_str() {
+                "anthropic-messages" => {
+                    Transport::Anthropic(AnthropicProvider::new(&key).with_base_url(base_url))
+                }
+                "google-generative-ai" => {
+                    Transport::Google(GeminiProvider::new(&key))
+                }
+                _ => {
+                    Transport::OpenAi(OpenAiProvider::new(&key).with_base_url(base_url))
+                }
+            }
+        }
         _ => anyhow::bail!(
             "Unsupported credential type '{}' for {}; OpenAI OAuth requires openai-codex/model",
             credential.cred_type,
@@ -396,10 +446,16 @@ mod tests {
         assert!(is_transport_supported("openai", "openai-completions"));
         assert!(is_transport_supported("openai-codex", "openai-codex-responses"));
         assert!(is_transport_supported("google", "google-generative-ai"));
+        assert!(is_transport_supported("opencode", "openai-completions"));
+        assert!(is_transport_supported("opencode-go", "openai-responses"));
         assert!(!is_transport_supported("bedrock", "bedrock-runtime"));
 
         let claude = resolve_model("claude-sonnet-4-5").unwrap();
         assert_eq!(claude.api, "anthropic-messages");
         assert!(is_model_supported(&claude));
+
+        let opencode_model = resolve_model("opencode/big-pickle").unwrap();
+        assert_eq!(opencode_model.provider, "opencode");
+        assert!(is_model_supported(&opencode_model));
     }
 }

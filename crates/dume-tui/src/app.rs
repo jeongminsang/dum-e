@@ -483,6 +483,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     let has_openai = cred_store.has_credential("openai");
                     let has_google = cred_store.has_credential("google");
                     let has_codex = cred_store.has_credential("openai-codex");
+                    let has_opencode = cred_store.has_credential("opencode");
+                    let has_opencode_go = cred_store.has_credential("opencode-go");
 
                     let choices = [
                         LoginProviderChoice {
@@ -508,6 +510,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                             name: "OpenAI Codex",
                             auth_type: "OAuth Browser",
                             is_authenticated: has_codex,
+                        },
+                        LoginProviderChoice {
+                            id: "opencode",
+                            name: "OpenCode Zen",
+                            auth_type: "API Key",
+                            is_authenticated: has_opencode,
+                        },
+                        LoginProviderChoice {
+                            id: "opencode-go",
+                            name: "OpenCode Go",
+                            auth_type: "API Key",
+                            is_authenticated: has_opencode_go,
                         },
                     ];
 
@@ -684,8 +698,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     continue;
                                 }
                                 ModalState::LoginSelector { selected_idx } => {
-                                    let provider_ids = ["anthropic", "openai", "google", "openai-codex"];
-                                    let provider_names = ["Anthropic Claude", "OpenAI ChatGPT", "Google Gemini", "OpenAI Codex"];
+                                    let provider_ids = [
+                                        "anthropic",
+                                        "openai",
+                                        "google",
+                                        "openai-codex",
+                                        "opencode",
+                                        "opencode-go",
+                                    ];
+                                    let provider_names = [
+                                        "Anthropic Claude",
+                                        "OpenAI ChatGPT",
+                                        "Google Gemini",
+                                        "OpenAI Codex",
+                                        "OpenCode Zen",
+                                        "OpenCode Go",
+                                    ];
 
                                     match key.code {
                                         crossterm::event::KeyCode::Esc => {
@@ -1011,6 +1039,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let has_openai = cred_store.has_credential("openai");
                                             let has_google = cred_store.has_credential("google");
                                             let has_codex = cred_store.has_credential("openai-codex");
+                                            let has_opencode = cred_store.has_credential("opencode");
+                                            let has_opencode_go = cred_store.has_credential("opencode-go");
 
                                             let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
 
@@ -1024,13 +1054,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     "openai" => has_openai,
                                                     "google" => has_google,
                                                     "openai-codex" => has_codex,
+                                                    "opencode" => has_opencode,
+                                                    "opencode-go" => has_opencode_go,
                                                     _ => false,
                                                 }
                                             }).collect();
 
                                             if models.is_empty() {
                                                 app.messages.push(ChatMessage::system(
-                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex)."
+                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex, OpenCode Zen, OpenCode Go)."
                                                 ));
                                                 continue;
                                             }
