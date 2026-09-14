@@ -17,6 +17,7 @@ use dume_core::updater::UpdateInfo;
 use dume_provider::ModelInfo;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
+use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -103,6 +104,11 @@ pub struct App {
     pub available_update: Option<UpdateInfo>,
     pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
     pub session_id: String,
+    pub prompt_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub temp_input: String,
+    pub busy_started_at: Option<std::time::Instant>,
+    pub recent_sessions: Vec<RecentSessionSummary>,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -149,6 +155,17 @@ pub fn persist_last_used_model(model: &str) {
     }
 }
 
+fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
+    let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
+    if let Ok(store) = HarnessStore::open(&db_path, &artifacts_dir) {
+        store.list_recent_sessions(5).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
 impl App {
     pub fn new(model: impl Into<String>) -> Self {
         let m = model.into();
@@ -157,6 +174,8 @@ impl App {
         } else {
             get_persisted_or_default_model(Some(&m))
         };
+
+        let recent_sessions = load_recent_sessions_overview();
 
         Self {
             messages: Vec::new(),
@@ -177,6 +196,11 @@ impl App {
             available_update: None,
             session_usage: (0, 0, 0),
             session_id: dume_provider::types::StreamRequestContext::new().session_id,
+            prompt_history: Vec::new(),
+            history_index: None,
+            temp_input: String::new(),
+            busy_started_at: None,
+            recent_sessions,
         }
     }
 
@@ -278,6 +302,41 @@ impl App {
         }
     }
 
+    pub fn navigate_history_up(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let new_idx = match self.history_index {
+            None => {
+                self.temp_input = self.input_buffer.clone();
+                self.prompt_history.len().saturating_sub(1)
+            }
+            Some(idx) => idx.saturating_sub(1),
+        };
+        self.history_index = Some(new_idx);
+        if let Some(hist) = self.prompt_history.get(new_idx) {
+            self.input_buffer = hist.clone();
+            self.cursor_pos = self.input_buffer.chars().count();
+        }
+    }
+
+    pub fn navigate_history_down(&mut self) {
+        if let Some(idx) = self.history_index {
+            if idx + 1 < self.prompt_history.len() {
+                let new_idx = idx + 1;
+                self.history_index = Some(new_idx);
+                if let Some(hist) = self.prompt_history.get(new_idx) {
+                    self.input_buffer = hist.clone();
+                    self.cursor_pos = self.input_buffer.chars().count();
+                }
+            } else {
+                self.history_index = None;
+                self.input_buffer = std::mem::take(&mut self.temp_input);
+                self.cursor_pos = self.input_buffer.chars().count();
+            }
+        }
+    }
+
     fn receive(&mut self, event: ConversationEvent) {
         match event {
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
@@ -308,6 +367,7 @@ impl App {
                 }
                 self.streaming_text.clear();
                 self.is_busy = false;
+                self.busy_started_at = None;
             }
             ConversationEvent::OAuthComplete { provider, result } => {
                 match result {
@@ -466,6 +526,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 inner_width,
                 &app.messages,
                 &app.streaming_text,
+                app.recent_sessions.len(),
             );
             let max_scroll = total_lines.saturating_sub(inner_height);
 
@@ -481,6 +542,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 &app.messages,
                 &app.streaming_text,
                 app.scroll_offset,
+                &app.recent_sessions,
                 &app.theme,
             );
             let is_exit_warned = app.last_ctrl_c.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2));
@@ -490,6 +552,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 &app.input_buffer,
                 app.cursor_pos,
                 is_exit_warned,
+                app.is_busy,
+                anim_tick,
                 &app.theme,
             );
 
@@ -506,12 +570,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
 
             let update_str = app.available_update.as_ref().map(|u| u.latest_version.as_str());
+            let elapsed_secs = app.busy_started_at.map(|t| t.elapsed().as_secs_f32());
             render_status_bar(
                 f,
                 chunks[2],
                 &app.model,
                 app.thinking,
                 app.is_busy,
+                elapsed_secs,
                 anim_tick,
                 update_str,
                 &app.theme,
@@ -1131,6 +1197,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else {
                                             app.autocomplete_index -= 1;
                                         }
+                                    } else if !app.prompt_history.is_empty() {
+                                        app.navigate_history_up();
                                     } else {
                                         app.auto_scroll = false;
                                         app.scroll_offset = app.scroll_offset.saturating_sub(1);
@@ -1143,6 +1211,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else {
                                             app.autocomplete_index += 1;
                                         }
+                                    } else if app.history_index.is_some() {
+                                        app.navigate_history_down();
                                     } else {
                                         app.scroll_offset = app.scroll_offset.saturating_add(1);
                                     }
@@ -1397,9 +1467,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 } else {
                                                     format!("Execute skill '{}' with instructions: {}\n\n{}", skill.name, rest_args, skill.content)
                                                 };
+                                                app.prompt_history.push(format!("/{}", cmd));
+                                                app.history_index = None;
+                                                app.temp_input.clear();
                                                 app.messages.push(ChatMessage::user(format!("/{}", cmd)));
                                                 app.messages.push(ChatMessage::system(format!("Loaded skill '{}': {}", skill.name, skill.description)));
                                                 app.is_busy = true;
+                                                app.busy_started_at = Some(std::time::Instant::now());
 
                                                 let model_name = app.model.clone();
                                                 let session_id = app.session_id.clone();
@@ -1425,8 +1499,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
 
+                                        app.prompt_history.push(content.clone());
+                                        app.history_index = None;
+                                        app.temp_input.clear();
                                         app.messages.push(ChatMessage::user(content.clone()));
                                         app.is_busy = true;
+                                        app.busy_started_at = Some(std::time::Instant::now());
 
                                         // Spawn streaming task
                                         let model_name = app.model.clone();

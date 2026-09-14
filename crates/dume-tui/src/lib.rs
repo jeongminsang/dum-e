@@ -3,7 +3,7 @@ pub mod component;
 pub mod keybinding;
 pub mod theme;
 
-pub use app::{run_tui, App};
+pub use app::{App, run_tui};
 pub use keybinding::Action;
 pub use theme::Theme;
 
@@ -112,5 +112,50 @@ mod tests {
         });
         assert!(!should_quit_late);
     }
-}
 
+    #[test]
+    fn test_prompt_history_navigation() {
+        let mut app = App::new("test-model");
+        app.prompt_history.push("first command".to_string());
+        app.prompt_history.push("second command".to_string());
+
+        app.insert_char('t');
+        app.insert_char('y');
+        app.insert_char('p');
+        app.insert_char('i');
+        app.insert_char('n');
+        app.insert_char('g');
+
+        // Navigate Up: saves "typing", shows "second command"
+        app.navigate_history_up();
+        assert_eq!(app.input_buffer, "second command");
+        assert_eq!(app.history_index, Some(1));
+
+        // Navigate Up again: shows "first command"
+        app.navigate_history_up();
+        assert_eq!(app.input_buffer, "first command");
+        assert_eq!(app.history_index, Some(0));
+
+        // Navigate Up again: stays at earliest
+        app.navigate_history_up();
+        assert_eq!(app.input_buffer, "first command");
+        assert_eq!(app.history_index, Some(0));
+
+        // Navigate Down: back to "second command"
+        app.navigate_history_down();
+        assert_eq!(app.input_buffer, "second command");
+        assert_eq!(app.history_index, Some(1));
+
+        // Navigate Down again: restores saved temp_input "typing"
+        app.navigate_history_down();
+        assert_eq!(app.input_buffer, "typing");
+        assert_eq!(app.history_index, None);
+    }
+
+    #[test]
+    fn test_rainbow_color_cycle() {
+        let c0 = theme::rainbow_color(0);
+        let c16 = theme::rainbow_color(16);
+        assert_eq!(c0, c16);
+    }
+}

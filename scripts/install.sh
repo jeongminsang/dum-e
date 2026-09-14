@@ -70,9 +70,13 @@ else
     ARCHIVE="dume-${PLATFORM}-${ARCH}.tar.gz"
     if [ -z "$REF" ]; then
         TAG_URL="${GITHUB_API}/repos/${REPO}/releases/latest"
-        if [ -n "${GITHUB_TOKEN:-}" ]; then
+        AUTH_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+        if [ -z "$AUTH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
+            AUTH_TOKEN="$(gh auth token 2>/dev/null || true)"
+        fi
+        if [ -n "$AUTH_TOKEN" ]; then
             curl -fsSL --connect-timeout 15 --max-time 120 \
-                -H "Authorization: Bearer $GITHUB_TOKEN" "$TAG_URL" -o "$TEMP_DIR/latest.json"
+                -H "Authorization: Bearer $AUTH_TOKEN" "$TAG_URL" -o "$TEMP_DIR/latest.json"
         else
             curl -fsSL --connect-timeout 15 --max-time 120 "$TAG_URL" -o "$TEMP_DIR/latest.json"
         fi

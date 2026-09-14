@@ -1,10 +1,11 @@
 use crate::theme::Theme;
 use dume_provider::types::{ChatMessage, Role};
+use dume_store::RecentSessionSummary;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn render_transcript(
@@ -13,20 +14,36 @@ pub fn render_transcript(
     messages: &[ChatMessage],
     streaming_text: &str,
     scroll_offset: u16,
+    recent_sessions: &[RecentSessionSummary],
     theme: &Theme,
 ) {
+    let title = format!(" DUM-E Agent Session (v{}) ", env!("CARGO_PKG_VERSION"));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(" DUM-E Agent Session ");
+        .title(title);
 
     let mut lines = Vec::new();
 
     if messages.is_empty() && streaming_text.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("   ⚡ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("DUM-E Clean-Engine Coding Agent", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "   ⚡ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "DUM-E Coding Agent",
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" [v{}]", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme.border_focused),
+            ),
         ]));
         lines.push(Line::from(Span::styled(
             "   ──────────────────────────────────────────────────────────",
@@ -35,22 +52,106 @@ pub fn render_transcript(
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Press ", Style::default().fg(theme.foreground)),
-            Span::styled("Tab", Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD)),
-            Span::styled(" to cycle thinking intensity (OFF / LOW / MED / HIGH)", Style::default().fg(theme.foreground)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to cycle thinking intensity (OFF / LOW / MED / HIGH)",
+                Style::default().fg(theme.foreground),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Type ", Style::default().fg(theme.foreground)),
-            Span::styled("/model", Style::default().fg(theme.assistant_msg).add_modifier(Modifier::BOLD)),
-            Span::styled(" to switch LLM models by provider tab", Style::default().fg(theme.foreground)),
+            Span::styled(
+                "/model",
+                Style::default()
+                    .fg(theme.assistant_msg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to switch LLM models by provider tab",
+                Style::default().fg(theme.foreground),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Type ", Style::default().fg(theme.foreground)),
-            Span::styled("/login", Style::default().fg(theme.assistant_msg).add_modifier(Modifier::BOLD)),
-            Span::styled(" to authenticate providers (OpenAI Codex, Claude, Gemini, ChatGPT)", Style::default().fg(theme.foreground)),
+            Span::styled(
+                "/login",
+                Style::default()
+                    .fg(theme.assistant_msg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to authenticate providers (OpenAI Codex, Claude, Gemini, ChatGPT)",
+                Style::default().fg(theme.foreground),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   • ", Style::default().fg(theme.accent)),
+            Span::styled("Press ", Style::default().fg(theme.foreground)),
+            Span::styled(
+                "↑ / ↓",
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " in the prompt bar to navigate previous input history",
+                Style::default().fg(theme.foreground),
+            ),
         ]));
         lines.push(Line::from(""));
+
+        // Recent sessions overview section
+        if !recent_sessions.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "   📋 Recent Sessions",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(Span::styled(
+                "   ──────────────────────────────────────────────────────────",
+                Style::default().fg(theme.border),
+            )));
+
+            let max_display = recent_sessions.len().min(5);
+            for s in &recent_sessions[..max_display] {
+                let id_short = if s.session_id.len() >= 8 {
+                    &s.session_id[..8]
+                } else {
+                    &s.session_id
+                };
+                let preview = s.preview.trim().lines().next().unwrap_or("Empty session");
+                let preview_truncated = if preview.chars().count() > 42 {
+                    let s: String = preview.chars().take(39).collect();
+                    format!("{}...", s)
+                } else {
+                    preview.to_string()
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled("   # ", Style::default().fg(theme.border)),
+                    Span::styled(
+                        format!("{:<8} ", id_short),
+                        Style::default()
+                            .fg(theme.border_focused)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("({} msgs) ", s.message_count),
+                        Style::default().fg(theme.border),
+                    ),
+                    Span::styled(preview_truncated, Style::default().fg(theme.foreground)),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
     } else {
         for msg in messages {
             match msg.role {
@@ -58,7 +159,8 @@ pub fn render_transcript(
                     // User prompt block: full-width horizontal bar highlight without 'user' text tag
                     for line in msg.content.lines() {
                         let line_display_width = UnicodeWidthStr::width(line);
-                        let total_pad = (area.width.saturating_sub(4) as usize).saturating_sub(line_display_width);
+                        let total_pad = (area.width.saturating_sub(4) as usize)
+                            .saturating_sub(line_display_width);
                         let padding_spaces = " ".repeat(total_pad);
                         lines.push(
                             Line::from(vec![
@@ -70,7 +172,10 @@ pub fn render_transcript(
                                         .add_modifier(Modifier::BOLD)
                                         .bg(theme.user_msg_bg),
                                 ),
-                                Span::styled(padding_spaces, Style::default().bg(theme.user_msg_bg)),
+                                Span::styled(
+                                    padding_spaces,
+                                    Style::default().bg(theme.user_msg_bg),
+                                ),
                             ])
                             .style(Style::default().bg(theme.user_msg_bg)),
                         );
@@ -91,7 +196,12 @@ pub fn render_transcript(
                     // Tool call / execution output block
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.user_msg)),
-                        Span::styled("tool execution", Style::default().fg(theme.border_focused).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "tool execution",
+                            Style::default()
+                                .fg(theme.border_focused)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ]));
                     for line in msg.content.lines() {
                         lines.push(Line::from(vec![
@@ -102,10 +212,21 @@ pub fn render_transcript(
                     lines.push(Line::from(""));
                 }
                 Role::System => {
+                    // Notice banner format rather than plain conversational chat
                     lines.push(Line::from(vec![
-                        Span::styled("System: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-                        Span::styled(&msg.content, Style::default().fg(theme.status_bar_fg)),
+                        Span::styled(
+                            "  [ NOTICE ] ",
+                            Style::default()
+                                .fg(theme.system_msg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ]));
+                    for line in msg.content.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(theme.system_msg)),
+                            Span::styled(line, Style::default().fg(theme.foreground)),
+                        ]));
+                    }
                     lines.push(Line::from(""));
                 }
             }
@@ -122,7 +243,12 @@ pub fn render_transcript(
             // Streaming cursor indicator
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("▍", Style::default().fg(theme.accent).add_modifier(Modifier::RAPID_BLINK)),
+                Span::styled(
+                    "▍",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::RAPID_BLINK),
+                ),
             ]));
         }
     }
@@ -140,12 +266,19 @@ pub fn calculate_transcript_height(
     width: u16,
     messages: &[ChatMessage],
     streaming_text: &str,
+    recent_sessions_count: usize,
 ) -> u16 {
     let effective_width = width.max(1) as usize;
     let mut total_lines: usize = 0;
 
     if messages.is_empty() && streaming_text.is_empty() {
-        return 7;
+        let base = 8;
+        let recent = if recent_sessions_count > 0 {
+            2 + recent_sessions_count.min(5) + 1
+        } else {
+            0
+        };
+        return (base + recent) as u16;
     }
 
     let prefix_indent = 2; // "  " or "│ "
@@ -160,11 +293,20 @@ pub fn calculate_transcript_height(
                     total_lines += wrapped_count.max(1);
                 }
             }
-            Role::Tool | Role::System => {
-                // 1 header line ("● tool execution" or "system")
+            Role::Tool => {
+                // 1 header line ("● tool execution")
                 total_lines += 1;
                 for line in msg.content.lines() {
                     let line_len = prefix_indent + line.chars().count();
+                    let wrapped_count = (line_len + effective_width - 1) / effective_width;
+                    total_lines += wrapped_count.max(1);
+                }
+            }
+            Role::System => {
+                // 1 header line ("  [ NOTICE ]")
+                total_lines += 1;
+                for line in msg.content.lines() {
+                    let line_len = 4 + line.chars().count();
                     let wrapped_count = (line_len + effective_width - 1) / effective_width;
                     total_lines += wrapped_count.max(1);
                 }
@@ -193,19 +335,22 @@ pub fn calculate_transcript_height(
     total_lines.min(u16::MAX as usize) as u16
 }
 
-
 pub fn render_input_bar(
     f: &mut Frame,
     area: Rect,
     input_buffer: &str,
     cursor_pos: usize,
     is_exit_warned: bool,
+    is_busy: bool,
+    anim_tick: usize,
     theme: &Theme,
 ) {
-    let title = if is_exit_warned {
+    let title = if is_busy {
+        " Working... (Esc / Ctrl+C to cancel) "
+    } else if is_exit_warned {
         " Prompt (Press Ctrl+C again within 2s to exit) "
     } else {
-        " Prompt (Enter to submit, Esc to clear, Ctrl+C to exit) "
+        " Prompt (Enter to submit, ↑/↓ for history, Esc to clear, Ctrl+C to exit) "
     };
 
     let border_color = if is_exit_warned {
@@ -220,12 +365,50 @@ pub fn render_input_bar(
         .title(title);
 
     let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(input_buffer, Style::default().fg(theme.foreground)),
     ]))
     .block(block);
 
     f.render_widget(paragraph, area);
+
+    // If working, render a traveling dot (•) orbiting the input border perimeter
+    if is_busy && area.width >= 2 && area.height >= 2 {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let perimeter = 2 * (w + h) - 4;
+        if perimeter > 0 {
+            let pos = anim_tick % perimeter;
+            let (dx, dy) = if pos < w {
+                // Top border: left to right
+                (pos, 0)
+            } else if pos < w + h - 1 {
+                // Right border: top to bottom
+                (w - 1, pos - (w - 1))
+            } else if pos < 2 * w + h - 2 {
+                // Bottom border: right to left
+                (w - 1 - (pos - (w + h - 1)), h - 1)
+            } else {
+                // Left border: bottom to top
+                (0, h - 1 - (pos - (2 * w + h - 2)))
+            };
+
+            let dot_x = area.x + dx as u16;
+            let dot_y = area.y + dy as u16;
+            let buf = f.buffer_mut();
+            if dot_x < buf.area.width && dot_y < buf.area.height {
+                if let Some(cell) = buf.cell_mut((dot_x, dot_y)) {
+                    cell.set_symbol("•");
+                    cell.set_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+                }
+            }
+        }
+    }
 
     // Position cursor based on visual display width of characters before cursor
     let prefix_width: usize = input_buffer
@@ -279,14 +462,23 @@ pub fn render_autocomplete_dropdown(
     };
 
     let mut lines = Vec::new();
-    for (i, item) in items.iter().enumerate().skip(scroll_offset).take(max_visible) {
+    for (i, item) in items
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(max_visible)
+    {
         let is_selected = i == selected_idx;
         let prefix = if is_selected { "▶ " } else { "  " };
 
         let name_style = if is_selected {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD)
         };
 
         let desc_style = if is_selected {
@@ -301,11 +493,14 @@ pub fn render_autocomplete_dropdown(
             Style::default()
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(prefix, name_style),
-            Span::styled(format!("{:<15}", item.name), name_style),
-            Span::styled(format!(" - {}", item.description), desc_style),
-        ]).style(bg));
+        lines.push(
+            Line::from(vec![
+                Span::styled(prefix, name_style),
+                Span::styled(format!("{:<15}", item.name), name_style),
+                Span::styled(format!(" - {}", item.description), desc_style),
+            ])
+            .style(bg),
+        );
     }
 
     let paragraph = Paragraph::new(lines).block(block);
@@ -346,20 +541,41 @@ pub fn render_status_bar(
     model: &str,
     thinking: ThinkingLevel,
     is_busy: bool,
+    elapsed_secs: Option<f32>,
     anim_tick: usize,
     available_update: Option<&str>,
     theme: &Theme,
 ) {
     let thinking_span = match thinking {
         ThinkingLevel::Off => Span::styled(" Thinking: OFF ", Style::default().fg(theme.border)),
-        ThinkingLevel::Low => Span::styled(" Thinking: LOW ", Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD)),
-        ThinkingLevel::Medium => Span::styled(" Thinking: MED ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        ThinkingLevel::High => Span::styled(" Thinking: HIGH ", Style::default().fg(theme.assistant_msg).add_modifier(Modifier::BOLD)),
+        ThinkingLevel::Low => Span::styled(
+            " Thinking: LOW ",
+            Style::default()
+                .fg(theme.user_msg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ThinkingLevel::Medium => Span::styled(
+            " Thinking: MED ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ThinkingLevel::High => Span::styled(
+            " Thinking: HIGH ",
+            Style::default()
+                .fg(theme.assistant_msg)
+                .add_modifier(Modifier::BOLD),
+        ),
     };
 
     let mut spans = vec![
-        Span::styled(" DUM-E Clean-Engine ", Style::default().fg(theme.status_bar_fg).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("| Model: {} |", model), Style::default().fg(theme.status_bar_fg)),
+        Span::styled(
+            format!(" Model: {} ", model),
+            Style::default()
+                .fg(theme.status_bar_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("|", Style::default().fg(theme.border)),
         thinking_span,
     ];
 
@@ -381,11 +597,7 @@ pub fn render_status_bar(
         const BAR_WIDTH: usize = 9;
         let cycle = (BAR_WIDTH - 1) * 2;
         let pos = (anim_tick / 2) % cycle;
-        let active_idx = if pos < BAR_WIDTH {
-            pos
-        } else {
-            cycle - pos
-        };
+        let active_idx = if pos < BAR_WIDTH { pos } else { cycle - pos };
 
         let mut bar = String::with_capacity(BAR_WIDTH + 2);
         bar.push('[');
@@ -398,14 +610,23 @@ pub fn render_status_bar(
         }
         bar.push(']');
 
+        let time_str = match elapsed_secs {
+            Some(secs) => format!(" ({:.1}s)", secs),
+            None => String::new(),
+        };
+
         spans.push(Span::styled(
-            format!(" {} thinking {} ", spinner_char, bar),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            format!(" {} thinking {}{} ", spinner_char, bar, time_str),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.push(Span::styled(
             " [READY] ",
-            Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.user_msg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -473,18 +694,40 @@ pub fn render_model_selector_modal(
     // 2. Search bar + Thinking level button
     let thinking_style = match thinking {
         ThinkingLevel::Off => Style::default().fg(theme.border),
-        ThinkingLevel::Low => Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD),
-        ThinkingLevel::Medium => Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ThinkingLevel::High => Style::default().fg(theme.assistant_msg).add_modifier(Modifier::BOLD),
+        ThinkingLevel::Low => Style::default()
+            .fg(theme.user_msg)
+            .add_modifier(Modifier::BOLD),
+        ThinkingLevel::Medium => Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+        ThinkingLevel::High => Style::default()
+            .fg(theme.assistant_msg)
+            .add_modifier(Modifier::BOLD),
     };
 
     let search_line = Line::from(vec![
-        Span::styled("Search: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Search: ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(filter, Style::default().fg(theme.foreground)),
-        Span::styled(" ▍", Style::default().fg(theme.accent).add_modifier(Modifier::RAPID_BLINK)),
-        Span::styled(format!("   [ Tab: Thinking Level = {} ]", thinking.label()), thinking_style),
+        Span::styled(
+            " ▍",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::RAPID_BLINK),
+        ),
+        Span::styled(
+            format!("   [ Tab: Thinking Level = {} ]", thinking.label()),
+            thinking_style,
+        ),
     ]);
-    f.render_widget(Paragraph::new(search_line).block(Block::default().borders(Borders::BOTTOM)), chunks[1]);
+    f.render_widget(
+        Paragraph::new(search_line).block(Block::default().borders(Borders::BOTTOM)),
+        chunks[1],
+    );
 
     // 3. Model List
     let list_area = chunks[2];
@@ -499,25 +742,37 @@ pub fn render_model_selector_modal(
     if models.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No authenticated models match the current filter or provider.",
-            Style::default().fg(theme.border).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.border)
+                .add_modifier(Modifier::ITALIC),
         )));
     } else {
-        for (i, m) in models.iter().enumerate().skip(scroll_offset).take(max_visible) {
+        for (i, m) in models
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(max_visible)
+        {
             let is_selected = i == selected_idx;
-            let is_current = m.id == current_model || format!("{}/{}", m.provider, m.id) == current_model;
+            let is_current =
+                m.id == current_model || format!("{}/{}", m.provider, m.id) == current_model;
 
             let prefix = if is_selected { "▶ " } else { "  " };
             let tag = if is_current { " (current)" } else { "" };
             let reasoning_badge = if m.reasoning { " [Reasoning]" } else { "" };
 
             let name_style = if is_selected {
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.foreground)
             };
 
             let prov_style = if is_selected {
-                Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.border)
             };
@@ -528,13 +783,16 @@ pub fn render_model_selector_modal(
                 Style::default()
             };
 
-            lines.push(Line::from(vec![
-                Span::styled(prefix, name_style),
-                Span::styled(format!("{:<15}", m.provider), prov_style),
-                Span::styled(format!("{:<32}", m.id), name_style),
-                Span::styled(reasoning_badge, Style::default().fg(theme.accent)),
-                Span::styled(tag, Style::default().fg(theme.assistant_msg)),
-            ]).style(bg));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(prefix, name_style),
+                    Span::styled(format!("{:<15}", m.provider), prov_style),
+                    Span::styled(format!("{:<32}", m.id), name_style),
+                    Span::styled(reasoning_badge, Style::default().fg(theme.accent)),
+                    Span::styled(tag, Style::default().fg(theme.assistant_msg)),
+                ])
+                .style(bg),
+            );
         }
     }
 
@@ -577,7 +835,9 @@ pub fn render_login_selector_modal(
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "Choose an LLM provider to log in or update credentials:",
-        Style::default().fg(theme.status_bar_fg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.status_bar_fg)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -586,15 +846,24 @@ pub fn render_login_selector_modal(
         let prefix = if is_selected { "▶ " } else { "  " };
 
         let status_span = if p.is_authenticated {
-            Span::styled("[Active ✓]  ", Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "[Active ✓]  ",
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled("[No Auth]   ", Style::default().fg(theme.border))
         };
 
         let name_style = if is_selected {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD)
         };
 
         let bg = if is_selected {
@@ -603,12 +872,18 @@ pub fn render_login_selector_modal(
             Style::default()
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(prefix, name_style),
-            status_span,
-            Span::styled(format!("{:<18}", p.name), name_style),
-            Span::styled(format!("({})", p.auth_type), Style::default().fg(theme.border)),
-        ]).style(bg));
+        lines.push(
+            Line::from(vec![
+                Span::styled(prefix, name_style),
+                status_span,
+                Span::styled(format!("{:<18}", p.name), name_style),
+                Span::styled(
+                    format!("({})", p.auth_type),
+                    Style::default().fg(theme.border),
+                ),
+            ])
+            .style(bg),
+        );
     }
 
     let paragraph = Paragraph::new(lines);
@@ -634,7 +909,10 @@ pub fn render_api_key_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(format!(" Enter API Key for {} (Esc to cancel) ", provider_name));
+        .title(format!(
+            " Enter API Key for {} (Esc to cancel) ",
+            provider_name
+        ));
 
     let inner = modal_area.inner(ratatui::layout::Margin {
         vertical: 1,
@@ -645,14 +923,27 @@ pub fn render_api_key_modal(
 
     let lines = vec![
         Line::from(Span::styled(
-            format!("Paste your {} API key below and press Enter:", provider_name),
+            format!(
+                "Paste your {} API key below and press Enter:",
+                provider_name
+            ),
             Style::default().fg(theme.status_bar_fg),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Key: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Key: ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(&masked, Style::default().fg(theme.foreground)),
-            Span::styled(" ▍", Style::default().fg(theme.accent).add_modifier(Modifier::RAPID_BLINK)),
+            Span::styled(
+                " ▍",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::RAPID_BLINK),
+            ),
         ]),
     ];
 
@@ -679,7 +970,10 @@ pub fn render_oauth_waiting_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(format!(" {} Browser Authentication (Esc to cancel) ", provider_name));
+        .title(format!(
+            " {} Browser Authentication (Esc to cancel) ",
+            provider_name
+        ));
 
     let inner = modal_area.inner(ratatui::layout::Margin {
         vertical: 1,
@@ -693,13 +987,28 @@ pub fn render_oauth_waiting_modal(
         )),
         Line::from(Span::styled(
             url,
-            Style::default().fg(theme.accent).add_modifier(Modifier::UNDERLINED),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::UNDERLINED),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
-            Span::styled("Waiting for OAuth authorization in browser...", Style::default().fg(theme.assistant_msg)),
-            Span::styled(" ▍", Style::default().fg(theme.accent).add_modifier(Modifier::RAPID_BLINK)),
+            Span::styled(
+                "Status: ",
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Waiting for OAuth authorization in browser...",
+                Style::default().fg(theme.assistant_msg),
+            ),
+            Span::styled(
+                " ▍",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::RAPID_BLINK),
+            ),
         ]),
     ];
 
@@ -742,11 +1051,22 @@ pub fn render_update_modal(
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Current Version: ", Style::default().fg(theme.status_bar_fg)),
-        Span::styled(format!("v{}", info.current_version), Style::default().fg(theme.border)),
+        Span::styled(
+            "Current Version: ",
+            Style::default().fg(theme.status_bar_fg),
+        ),
+        Span::styled(
+            format!("v{}", info.current_version),
+            Style::default().fg(theme.border),
+        ),
         Span::styled("  ➔  ", Style::default().fg(theme.accent)),
         Span::styled("New Version: ", Style::default().fg(theme.status_bar_fg)),
-        Span::styled(format!("v{}", info.latest_version), Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("v{}", info.latest_version),
+            Style::default()
+                .fg(theme.user_msg)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("Asset: ", Style::default().fg(theme.status_bar_fg)),
@@ -755,16 +1075,36 @@ pub fn render_update_modal(
     lines.push(Line::from(""));
 
     if !info.release_notes.is_empty() {
-        lines.push(Line::from(Span::styled("Release Notes:", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            "Release Notes:",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
         for note_line in info.release_notes.lines().take(4) {
-            lines.push(Line::from(Span::styled(format!("  {}", note_line), Style::default().fg(theme.foreground))));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", note_line),
+                Style::default().fg(theme.foreground),
+            )));
         }
         lines.push(Line::from(""));
     }
 
     lines.push(Line::from(vec![
-        Span::styled("Status: ", Style::default().fg(theme.status_bar_fg).add_modifier(Modifier::BOLD)),
-        Span::styled(status_text, Style::default().fg(if in_progress { theme.accent } else { theme.user_msg })),
+        Span::styled(
+            "Status: ",
+            Style::default()
+                .fg(theme.status_bar_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            status_text,
+            Style::default().fg(if in_progress {
+                theme.accent
+            } else {
+                theme.user_msg
+            }),
+        ),
     ]));
 
     let paragraph = Paragraph::new(lines);
@@ -807,9 +1147,21 @@ pub fn render_btw_modal(
         )));
         lines.push(Line::from(""));
     } else {
-        for (role, msg) in history.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+        for (role, msg) in history
+            .iter()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             let (prefix, style) = if role == "user" {
-                ("You: ", Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD))
+                (
+                    "You: ",
+                    Style::default()
+                        .fg(theme.user_msg)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 ("AI:  ", Style::default().fg(theme.assistant_msg))
             };
@@ -829,7 +1181,12 @@ pub fn render_btw_modal(
     }
 
     lines.push(Line::from(vec![
-        Span::styled("Query: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Query: ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(input, Style::default().fg(theme.foreground)),
         Span::styled("█", Style::default().fg(theme.accent)),
     ]));
@@ -838,6 +1195,3 @@ pub fn render_btw_modal(
     f.render_widget(block, modal_area);
     f.render_widget(paragraph, inner);
 }
-
-
-

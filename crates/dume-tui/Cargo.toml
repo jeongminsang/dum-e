@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 dume-core = { workspace = true }
+dume-store = { workspace = true }
 dume-provider = { workspace = true }
 dume-worker = { workspace = true }
 ratatui = { workspace = true }

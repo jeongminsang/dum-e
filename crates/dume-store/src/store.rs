@@ -1,7 +1,7 @@
 use crate::artifact::ArtifactStore;
 use crate::schema::initialize_schema;
 use dume_core::types::*;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,15 +15,22 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Lock acquisition failed for coordinator {coordinator_id}: currently held by {owner_id:?}")]
+    #[error(
+        "Lock acquisition failed for coordinator {coordinator_id}: currently held by {owner_id:?}"
+    )]
     LockHeld {
         coordinator_id: String,
         owner_id: Option<String>,
     },
     #[error("Epoch fencing violation: entity epoch {actual} != required {expected}")]
     FencingViolation { expected: i64, actual: i64 },
-    #[error("Stale epoch submission: attempt epoch {attempt_epoch} is superceded by active coordinator epoch {current_coordinator_epoch}")]
-    StaleEpoch { attempt_epoch: i64, current_coordinator_epoch: i64 },
+    #[error(
+        "Stale epoch submission: attempt epoch {attempt_epoch} is superceded by active coordinator epoch {current_coordinator_epoch}"
+    )]
+    StaleEpoch {
+        attempt_epoch: i64,
+        current_coordinator_epoch: i64,
+    },
     #[error("Entity not found: {0}")]
     NotFound(String),
 }
@@ -42,7 +49,10 @@ pub struct HarnessStore {
 }
 
 impl HarnessStore {
-    pub fn open<P: AsRef<Path>, A: AsRef<Path>>(db_path: P, artifacts_dir: A) -> Result<Self, StoreError> {
+    pub fn open<P: AsRef<Path>, A: AsRef<Path>>(
+        db_path: P,
+        artifacts_dir: A,
+    ) -> Result<Self, StoreError> {
         let db_p = db_path.as_ref().to_path_buf();
         if let Some(parent) = db_p.parent() {
             std::fs::create_dir_all(parent)?;
@@ -139,7 +149,12 @@ impl HarnessStore {
         }
     }
 
-    pub fn heartbeat_coordinator(&self, coordinator_id: &str, owner_id: &str, ttl_ms: i64) -> Result<(), StoreError> {
+    pub fn heartbeat_coordinator(
+        &self,
+        coordinator_id: &str,
+        owner_id: &str,
+        ttl_ms: i64,
+    ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
         let expires_at = now + ttl_ms;
@@ -150,13 +165,20 @@ impl HarnessStore {
         )?;
 
         if rows == 0 {
-            Err(StoreError::NotFound(format!("Active lock for coordinator {} and owner {}", coordinator_id, owner_id)))
+            Err(StoreError::NotFound(format!(
+                "Active lock for coordinator {} and owner {}",
+                coordinator_id, owner_id
+            )))
         } else {
             Ok(())
         }
     }
 
-    pub fn release_coordinator_lock(&self, coordinator_id: &str, owner_id: &str) -> Result<(), StoreError> {
+    pub fn release_coordinator_lock(
+        &self,
+        coordinator_id: &str,
+        owner_id: &str,
+    ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE coordinator_locks SET owner_id = NULL WHERE coordinator_id = ?1 AND owner_id = ?2",
@@ -174,7 +196,10 @@ impl HarnessStore {
         Ok(())
     }
 
-    pub fn get_coordinator_lock(&self, coordinator_id: &str) -> Result<Option<CoordinatorLock>, StoreError> {
+    pub fn get_coordinator_lock(
+        &self,
+        coordinator_id: &str,
+    ) -> Result<Option<CoordinatorLock>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT coordinator_id, owner_id, epoch, lease_expires_at, heartbeat_at FROM coordinator_locks WHERE coordinator_id = ?1",
@@ -218,7 +243,8 @@ impl HarnessStore {
         )?;
         let rows = stmt.query_map([], |row| {
             let status_str: String = row.get(2)?;
-            let status: GoalStatus = serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
+            let status: GoalStatus =
+                serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
             Ok(Goal {
                 id: row.get(0)?,
                 description: row.get(1)?,
@@ -241,7 +267,8 @@ impl HarnessStore {
         )?;
         let rows = stmt.query_map([], |row| {
             let status_str: String = row.get(2)?;
-            let status: GoalStatus = serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
+            let status: GoalStatus =
+                serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(GoalStatus::Pending);
             Ok(Goal {
                 id: row.get(0)?,
                 description: row.get(1)?,
@@ -258,10 +285,11 @@ impl HarnessStore {
     }
 
     pub fn update_goal_status(&self, id: &str, status: GoalStatus) -> Result<(), StoreError> {
-
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
-        let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
+        let status_str = serde_json::to_string(&status)?
+            .trim_matches('"')
+            .to_string();
         conn.execute(
             "UPDATE goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status_str, now, id],
@@ -274,8 +302,14 @@ impl HarnessStore {
         let now = now_millis();
         let deps = serde_json::to_string(&task.dependencies)?;
         let crit = serde_json::to_string(&task.acceptance_criteria)?;
-        let paths = task.allowed_paths.as_ref().map(|p| serde_json::to_string(p)).transpose()?;
-        let status_str = serde_json::to_string(&task.status)?.trim_matches('"').to_string();
+        let paths = task
+            .allowed_paths
+            .as_ref()
+            .map(|p| serde_json::to_string(p))
+            .transpose()?;
+        let status_str = serde_json::to_string(&task.status)?
+            .trim_matches('"')
+            .to_string();
 
         conn.execute(
             "INSERT INTO tasks (id, goal_id, title, description, status, dependencies_json, acceptance_criteria_json, allowed_paths_json, target_branch, created_at, updated_at)
@@ -334,7 +368,9 @@ impl HarnessStore {
     pub fn update_task_status(&self, id: &str, status: TaskStatus) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
-        let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
+        let status_str = serde_json::to_string(&status)?
+            .trim_matches('"')
+            .to_string();
         conn.execute(
             "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status_str, now, id],
@@ -355,10 +391,13 @@ impl HarnessStore {
             let crit_str: String = row.get(6)?;
             let paths_str: Option<String> = row.get(7)?;
 
-            let status: TaskStatus = serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(TaskStatus::Blocked);
+            let status: TaskStatus =
+                serde_json::from_str(&format!("\"{}\"", status_str)).unwrap_or(TaskStatus::Blocked);
             let dependencies: Vec<String> = serde_json::from_str(&deps_str).unwrap_or_default();
-            let acceptance_criteria: Vec<String> = serde_json::from_str(&crit_str).unwrap_or_default();
-            let allowed_paths: Option<Vec<String>> = paths_str.and_then(|s| serde_json::from_str(&s).ok());
+            let acceptance_criteria: Vec<String> =
+                serde_json::from_str(&crit_str).unwrap_or_default();
+            let allowed_paths: Option<Vec<String>> =
+                paths_str.and_then(|s| serde_json::from_str(&s).ok());
 
             Ok(Task {
                 id: row.get(0)?,
@@ -446,8 +485,11 @@ impl HarnessStore {
 
         // 2. If coordinator lock has already advanced to a higher epoch (e.g., after crash/failover),
         // any delayed submissions from old epochs MUST be rejected (R2 guard)
-        let current_epoch: i64 = conn
-            .query_row("SELECT COALESCE(MAX(epoch), 0) FROM coordinator_locks", [], |r| r.get(0))?;
+        let current_epoch: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(epoch), 0) FROM coordinator_locks",
+            [],
+            |r| r.get(0),
+        )?;
 
         if current_epoch > 0 && attempt_epoch < current_epoch {
             return Err(StoreError::StaleEpoch {
@@ -456,19 +498,23 @@ impl HarnessStore {
             });
         }
 
-
         conn.execute(
             "UPDATE attempts SET status = 'result_submitted', candidate_commit = ?1, manifest_hash = ?2, updated_at = ?3 WHERE id = ?4",
             params![candidate_commit, manifest_hash, now, attempt_id],
         )?;
         Ok(())
-
     }
 
-    pub fn update_attempt_status(&self, attempt_id: &str, status: AttemptStatus) -> Result<(), StoreError> {
+    pub fn update_attempt_status(
+        &self,
+        attempt_id: &str,
+        status: AttemptStatus,
+    ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
-        let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
+        let status_str = serde_json::to_string(&status)?
+            .trim_matches('"')
+            .to_string();
         conn.execute(
             "UPDATE attempts SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status_str, now, attempt_id],
@@ -526,7 +572,9 @@ impl HarnessStore {
 
     pub fn record_integration(&self, i: &Integration) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let status_str = serde_json::to_string(&i.status)?.trim_matches('"').to_string();
+        let status_str = serde_json::to_string(&i.status)?
+            .trim_matches('"')
+            .to_string();
         conn.execute(
             "INSERT OR REPLACE INTO integrations (target_branch, base_commit, candidate_commit, integration_commit, status, error_message, integrated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -543,7 +591,11 @@ impl HarnessStore {
         Ok(())
     }
 
-    pub fn get_integration(&self, target_branch: &str, candidate_commit: &str) -> Result<Option<Integration>, StoreError> {
+    pub fn get_integration(
+        &self,
+        target_branch: &str,
+        candidate_commit: &str,
+    ) -> Result<Option<Integration>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT target_branch, base_commit, candidate_commit, integration_commit, status, error_message, integrated_at
@@ -632,7 +684,9 @@ impl HarnessStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
-        let status_str = serde_json::to_string(&status)?.trim_matches('"').to_string();
+        let status_str = serde_json::to_string(&status)?
+            .trim_matches('"')
+            .to_string();
 
         conn.execute(
             "UPDATE external_operations SET status = ?1, receipt_data = COALESCE(?2, receipt_data), updated_at = ?3 WHERE id = ?4",
@@ -687,9 +741,12 @@ impl HarnessStore {
 
     // --- Recovery State Inspection ---
 
-    pub fn recover_state(&self, current_epoch: i64) -> Result<(Vec<Attempt>, Vec<Attempt>, Vec<ExternalOperation>), StoreError> {
+    pub fn recover_state(
+        &self,
+        current_epoch: i64,
+    ) -> Result<(Vec<Attempt>, Vec<Attempt>, Vec<ExternalOperation>), StoreError> {
         let conn = self.conn.lock().unwrap();
-        
+
         // 1. Mark stale running attempts from older epochs as needs_attention
         conn.execute(
             "UPDATE attempts SET status = 'needs_attention' WHERE status = 'running' AND coordinator_epoch < ?1",
@@ -707,62 +764,71 @@ impl HarnessStore {
             "SELECT id, task_id, coordinator_epoch, worker_id, worktree_path, status, lease_expires_at, heartbeat_at, candidate_commit, manifest_hash, created_at, updated_at
              FROM attempts WHERE status = 'result_submitted'",
         )?;
-        let ready_for_verify = stmt.query_map([], |row| {
-            Ok(Attempt {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                coordinator_epoch: row.get(2)?,
-                worker_id: row.get(3)?,
-                worktree_path: row.get(4)?,
-                status: AttemptStatus::ResultSubmitted,
-                lease_expires_at: row.get(6)?,
-                heartbeat_at: row.get(7)?,
-                candidate_commit: row.get(8)?,
-                manifest_hash: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let ready_for_verify = stmt
+            .query_map([], |row| {
+                Ok(Attempt {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    coordinator_epoch: row.get(2)?,
+                    worker_id: row.get(3)?,
+                    worktree_path: row.get(4)?,
+                    status: AttemptStatus::ResultSubmitted,
+                    lease_expires_at: row.get(6)?,
+                    heartbeat_at: row.get(7)?,
+                    candidate_commit: row.get(8)?,
+                    manifest_hash: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // 4. Find attempts needing attention
         let mut stmt2 = conn.prepare(
             "SELECT id, task_id, coordinator_epoch, worker_id, worktree_path, status, lease_expires_at, heartbeat_at, candidate_commit, manifest_hash, created_at, updated_at
              FROM attempts WHERE status = 'needs_attention'",
         )?;
-        let needs_attention = stmt2.query_map([], |row| {
-            Ok(Attempt {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                coordinator_epoch: row.get(2)?,
-                worker_id: row.get(3)?,
-                worktree_path: row.get(4)?,
-                status: AttemptStatus::NeedsAttention,
-                lease_expires_at: row.get(6)?,
-                heartbeat_at: row.get(7)?,
-                candidate_commit: row.get(8)?,
-                manifest_hash: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let needs_attention = stmt2
+            .query_map([], |row| {
+                Ok(Attempt {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    coordinator_epoch: row.get(2)?,
+                    worker_id: row.get(3)?,
+                    worktree_path: row.get(4)?,
+                    status: AttemptStatus::NeedsAttention,
+                    lease_expires_at: row.get(6)?,
+                    heartbeat_at: row.get(7)?,
+                    candidate_commit: row.get(8)?,
+                    manifest_hash: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // 5. Find unknown operations needing manual reconciliation
         let mut stmt3 = conn.prepare(
             "SELECT id, attempt_id, idempotency_key, description, status, receipt_data, created_at, updated_at
              FROM external_operations WHERE status = 'outcome_unknown'",
         )?;
-        let unknown_ops = stmt3.query_map([], |row| {
-            Ok(ExternalOperation {
-                id: row.get(0)?,
-                attempt_id: row.get(1)?,
-                idempotency_key: row.get(2)?,
-                description: row.get(3)?,
-                status: ExternalOperationStatus::OutcomeUnknown,
-                receipt_data: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let unknown_ops = stmt3
+            .query_map([], |row| {
+                Ok(ExternalOperation {
+                    id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    description: row.get(3)?,
+                    status: ExternalOperationStatus::OutcomeUnknown,
+                    receipt_data: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok((ready_for_verify, needs_attention, unknown_ops))
     }
@@ -803,7 +869,10 @@ impl HarnessStore {
         Ok(next_idx)
     }
 
-    pub fn list_session_messages(&self, session_id: &str) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
+    pub fn list_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
@@ -829,8 +898,64 @@ impl HarnessStore {
         }
         Ok(out)
     }
+}
 
-    pub fn list_active_context_messages(&self, session_id: &str) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecentSessionSummary {
+    pub session_id: String,
+    pub preview: String,
+    pub message_count: usize,
+    pub updated_at: i64,
+}
+
+impl HarnessStore {
+    pub fn list_recent_sessions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecentSessionSummary>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT 
+                s.session_id,
+                COALESCE(
+                    (SELECT content FROM session_messages WHERE session_id = s.session_id AND role = 'user' ORDER BY message_index ASC LIMIT 1),
+                    (SELECT content FROM session_messages WHERE session_id = s.session_id ORDER BY message_index ASC LIMIT 1),
+                    ''
+                ) as preview,
+                COUNT(*) as msg_count,
+                MAX(created_at) as last_updated
+            FROM session_messages s
+            GROUP BY s.session_id
+            ORDER BY last_updated DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            let session_id: String = r.get(0)?;
+            let preview: String = r.get(1)?;
+            let message_count: i64 = r.get(2)?;
+            let updated_at: i64 = r.get(3)?;
+            Ok(RecentSessionSummary {
+                session_id,
+                preview,
+                message_count: message_count.max(0) as usize,
+                updated_at,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_active_context_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>, Option<String>, bool)>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
@@ -857,7 +982,12 @@ impl HarnessStore {
         Ok(out)
     }
 
-    pub fn compact_session(&self, session_id: &str, summary_content: &str, retain_last_n: usize) -> Result<(), StoreError> {
+    pub fn compact_session(
+        &self,
+        session_id: &str,
+        summary_content: &str,
+        retain_last_n: usize,
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1041,7 +1171,10 @@ impl HarnessStore {
             params![status_str, now, run_id],
         )?;
         if updated == 0 {
-            return Err(StoreError::NotFound(format!("Workflow run '{}' not found", run_id)));
+            return Err(StoreError::NotFound(format!(
+                "Workflow run '{}' not found",
+                run_id
+            )));
         }
         Ok(())
     }
@@ -1154,22 +1287,34 @@ mod tests {
         let store = HarnessStore::in_memory(dir.path()).unwrap();
 
         // Initial acquisition: epoch = 1
-        let lock1 = store.acquire_coordinator_lock("coord_1", "worker_a", 1000).unwrap();
+        let lock1 = store
+            .acquire_coordinator_lock("coord_1", "worker_a", 1000)
+            .unwrap();
         assert_eq!(lock1.epoch, 1);
         assert_eq!(lock1.owner_id.as_deref(), Some("worker_a"));
 
         // Same owner renews: keeps epoch = 1
-        let lock1_renew = store.acquire_coordinator_lock("coord_1", "worker_a", 1000).unwrap();
+        let lock1_renew = store
+            .acquire_coordinator_lock("coord_1", "worker_a", 1000)
+            .unwrap();
         assert_eq!(lock1_renew.epoch, 1);
 
         // Another owner fails while lease active
-        assert!(store.acquire_coordinator_lock("coord_1", "worker_b", 1000).is_err());
+        assert!(
+            store
+                .acquire_coordinator_lock("coord_1", "worker_b", 1000)
+                .is_err()
+        );
 
         // Worker A releases lock
-        store.release_coordinator_lock("coord_1", "worker_a").unwrap();
+        store
+            .release_coordinator_lock("coord_1", "worker_a")
+            .unwrap();
 
         // Worker B acquires released lock: epoch increments monotonically to 2
-        let lock2 = store.acquire_coordinator_lock("coord_1", "worker_b", 1000).unwrap();
+        let lock2 = store
+            .acquire_coordinator_lock("coord_1", "worker_b", 1000)
+            .unwrap();
         assert_eq!(lock2.epoch, 2);
         assert_eq!(lock2.owner_id.as_deref(), Some("worker_b"));
     }
@@ -1195,14 +1340,18 @@ mod tests {
         };
         store.create_task(&task).unwrap();
 
-        let _attempt = store.create_attempt("att_1", "t1", 5, "w1", "/tmp/wt1", 5000).unwrap();
+        let _attempt = store
+            .create_attempt("att_1", "t1", 5, "w1", "/tmp/wt1", 5000)
+            .unwrap();
 
         // Submitting with wrong epoch is rejected
         let res = store.submit_attempt_result("att_1", 4, "commit123", "hash123");
         assert!(matches!(res, Err(StoreError::FencingViolation { .. })));
 
         // Submitting with matching epoch succeeds
-        store.submit_attempt_result("att_1", 5, "commit123", "hash123").unwrap();
+        store
+            .submit_attempt_result("att_1", 5, "commit123", "hash123")
+            .unwrap();
         let updated = store.get_attempt("att_1").unwrap();
         assert_eq!(updated.status, AttemptStatus::ResultSubmitted);
         assert_eq!(updated.candidate_commit.as_deref(), Some("commit123"));
@@ -1216,11 +1365,28 @@ mod tests {
         let session_id = "session_test_42";
 
         // Append 5 messages
-        store.append_session_message(session_id, "user", "Task 1", None, None, false).unwrap();
-        store.append_session_message(session_id, "assistant", "Working on task 1", None, None, false).unwrap();
-        store.append_session_message(session_id, "user", "Task 2", None, None, false).unwrap();
-        store.append_session_message(session_id, "assistant", "Done task 2", None, None, false).unwrap();
-        store.append_session_message(session_id, "user", "Now do task 3", None, None, false).unwrap();
+        store
+            .append_session_message(session_id, "user", "Task 1", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(
+                session_id,
+                "assistant",
+                "Working on task 1",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Task 2", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "assistant", "Done task 2", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Now do task 3", None, None, false)
+            .unwrap();
 
         let msgs = store.list_session_messages(session_id).unwrap();
         assert_eq!(msgs.len(), 5);
@@ -1231,11 +1397,19 @@ mod tests {
 
         let raw_audit_msgs = store.list_session_messages(session_id).unwrap();
         // Raw audit log is fully preserved: 5 original messages + 1 summary = 6 total entries
-        assert_eq!(raw_audit_msgs.len(), 6, "Audit trail must preserve all raw historical messages");
+        assert_eq!(
+            raw_audit_msgs.len(),
+            6,
+            "Audit trail must preserve all raw historical messages"
+        );
 
         // Active context returned to model contains only compacted summary + recent unarchived messages
         let active_msgs = store.list_active_context_messages(session_id).unwrap();
-        assert_eq!(active_msgs.len(), 3, "Active context must contain summary + 2 retained messages");
+        assert_eq!(
+            active_msgs.len(),
+            3,
+            "Active context must contain summary + 2 retained messages"
+        );
         assert_eq!(active_msgs[0].0, "system");
         assert!(active_msgs[0].1.contains("Summary of conversation"));
         assert!(active_msgs[0].4, "Must be flagged as summary");
