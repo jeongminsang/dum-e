@@ -117,6 +117,15 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Show session token usage statistics
+    Usage {
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+        #[arg(long, default_value = "default")]
+        session_id: String,
+    },
 }
 
 #[tokio::main]
@@ -241,6 +250,14 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Update { check }) => {
             run_update(check).await?;
+        }
+        Some(Commands::Usage { db_path, artifacts_dir, session_id }) => {
+            let store = HarnessStore::open(&db_path, &artifacts_dir)?;
+            let usage = store.get_session_usage(&session_id)?;
+            println!("Session Token Usage for '{}':", session_id);
+            println!("  Input Tokens:  {}", usage.input_tokens);
+            println!("  Output Tokens: {}", usage.output_tokens);
+            println!("  Total Tokens:  {}", usage.total_tokens);
         }
         None => {
             // Default to interactive TUI

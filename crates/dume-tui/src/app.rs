@@ -93,6 +93,7 @@ pub struct App {
     pub modal: ModalState,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
+    pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -164,6 +165,7 @@ impl App {
             modal: ModalState::None,
             last_ctrl_c: None,
             available_update: None,
+            session_usage: (0, 0, 0),
         }
     }
 
@@ -189,6 +191,7 @@ impl App {
             ("/login", "Save provider API key (e.g. /login anthropic <key>)"),
             ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
             ("/update", "Check and install DUM-E in-place update"),
+            ("/usage", "Display session token usage statistics"),
             ("/clear", "Clear conversation transcript"),
             ("/skills", "List all available skills"),
             ("/help", "Show help and command list"),
@@ -266,6 +269,11 @@ impl App {
                         .push_str(&format!("\n[Tool Call: {}] ", name));
                 }
                 self.streaming_text.push_str(&arguments_delta);
+            }
+            ConversationEvent::Stream(StreamEvent::Usage(usage)) => {
+                self.session_usage.0 += usage.input_tokens;
+                self.session_usage.1 += usage.output_tokens;
+                self.session_usage.2 += usage.total_tokens;
             }
             ConversationEvent::Stream(_) => {}
             ConversationEvent::Finished { messages, error } => {
@@ -1145,6 +1153,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                             continue;
+                                        } else if trimmed == "/usage" {
+                                            let (input, output, total) = app.session_usage;
+                                            app.messages.push(ChatMessage::system(format!(
+                                                "Session Token Usage:\n  Input Tokens:  {}\n  Output Tokens: {}\n  Total Tokens:  {}",
+                                                input, output, total
+                                            )));
+                                            continue;
                                         } else if trimmed == "/clear" {
                                             app.messages.clear();
                                             app.streaming_text.clear();
@@ -1409,6 +1424,7 @@ impl StreamTurn {
                 }
                 call.arguments.push_str(arguments_delta);
             }
+            StreamEvent::Usage(_) => {}
             StreamEvent::Completed { finish_reason } => {
                 self.finish_reason = Some(finish_reason.clone())
             }
@@ -1469,7 +1485,7 @@ where
                 turn.push(&event)?;
                 if matches!(
                     event,
-                    StreamEvent::TextDelta(_) | StreamEvent::ToolCallDelta { .. }
+                    StreamEvent::TextDelta(_) | StreamEvent::ToolCallDelta { .. } | StreamEvent::Usage(_)
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }

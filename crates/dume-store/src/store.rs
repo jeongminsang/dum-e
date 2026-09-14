@@ -922,6 +922,72 @@ impl HarnessStore {
 
         Ok(())
     }
+
+    pub fn record_session_usage(
+        &self,
+        session_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> Result<SessionUsage, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        let total = input_tokens + output_tokens;
+
+        conn.execute(
+            r#"
+            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(session_id) DO UPDATE SET
+                input_tokens = input_tokens + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                updated_at = excluded.updated_at
+            "#,
+            params![session_id, input_tokens, output_tokens, total, now],
+        )?;
+
+        let row: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+
+        Ok(SessionUsage {
+            session_id: session_id.to_string(),
+            input_tokens: row.0,
+            output_tokens: row.1,
+            total_tokens: row.2,
+            updated_at: row.3,
+        })
+    }
+
+    pub fn get_session_usage(&self, session_id: &str) -> Result<SessionUsage, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(i64, i64, i64, i64)> = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+
+        Ok(match existing {
+            Some((input, output, total, updated)) => SessionUsage {
+                session_id: session_id.to_string(),
+                input_tokens: input,
+                output_tokens: output,
+                total_tokens: total,
+                updated_at: updated,
+            },
+            None => SessionUsage {
+                session_id: session_id.to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                updated_at: now_millis(),
+            },
+        })
+    }
 }
 
 #[cfg(test)]

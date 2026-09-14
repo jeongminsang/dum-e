@@ -111,6 +111,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (session_id, message_index)
         );
+
+        CREATE TABLE IF NOT EXISTS session_usage (
+            session_id TEXT PRIMARY KEY,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )?;
     Ok(())

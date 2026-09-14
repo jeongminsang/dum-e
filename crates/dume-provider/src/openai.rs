@@ -1,5 +1,5 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, ToolDefinition};
+use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
 use anyhow::{Context, Result, bail};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -154,6 +154,9 @@ impl OpenAiProvider {
             "model": model,
             "messages": formatted_msgs,
             "stream": true,
+            "stream_options": {
+                "include_usage": true
+            }
         });
 
         if !tools.is_empty() {
@@ -244,6 +247,18 @@ impl OpenAiProvider {
                                     .context("Stream receiver closed")?;
                                     return Ok(());
                                 }
+                            }
+                        }
+                        if let Some(usage) = parsed.get("usage") {
+                            let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let total_tokens = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(input_tokens + output_tokens);
+                            if input_tokens > 0 || output_tokens > 0 || total_tokens > 0 {
+                                let _ = tx.send(StreamEvent::Usage(TokenUsage {
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                })).await;
                             }
                         }
                     }

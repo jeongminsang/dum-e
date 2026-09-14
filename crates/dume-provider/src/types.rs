@@ -92,6 +92,13 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta(String),
@@ -103,8 +110,10 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments_delta: String,
     },
+    Usage(TokenUsage),
     Completed {
         finish_reason: String,
     },
     Error(String),
 }
+

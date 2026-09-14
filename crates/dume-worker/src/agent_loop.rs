@@ -487,6 +487,7 @@ impl AgentLoop {
                         }
                         ordered_calls[index].2.push_str(&arguments_delta);
                     }
+                    StreamEvent::Usage(_) => {}
                     StreamEvent::Completed { finish_reason } => {
                         stream_completed_normally = true;
                         stream_finish_reason = finish_reason;

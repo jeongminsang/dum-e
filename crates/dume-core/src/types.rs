@@ -150,3 +150,12 @@ pub struct HarnessEvent {
     pub payload: String,
     pub created_at: i64,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub updated_at: i64,
+}
