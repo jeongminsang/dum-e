@@ -32,3 +32,19 @@ impl Default for Theme {
         }
     }
 }
+
+/// Generates smoothly cycling vibrant rainbow colors based on an animation tick.
+pub fn rainbow_color(tick: usize) -> Color {
+    const PALETTE: &[(u8, u8, u8)] = &[
+        (255, 95, 135),  // Coral Pink
+        (255, 135, 95),  // Orange
+        (255, 215, 95),  // Warm Yellow
+        (95, 255, 175),  // Mint Green
+        (95, 215, 255),  // Cyan Blue
+        (135, 135, 255), // Lavender Blue
+        (215, 95, 255),  // Purple Magenta
+        (255, 95, 215),  // Hot Pink
+    ];
+    let (r, g, b) = PALETTE[(tick / 2) % PALETTE.len()];
+    Color::Rgb(r, g, b)
+}

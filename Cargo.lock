@@ -437,6 +437,7 @@ dependencies = [
  "crossterm",
  "dume-core",
  "dume-provider",
+ "dume-store",
  "dume-worker",
  "futures-util",
  "ratatui",
