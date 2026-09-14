@@ -238,6 +238,106 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
     Ok(ResolvedProvider { model, transport })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AgentRole {
+    Default,
+    Planner,
+    Architect,
+    Executor,
+    Critic,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoleModelProfile {
+    pub role: AgentRole,
+    pub candidate_models: Vec<String>,
+}
+
+impl RoleModelProfile {
+    pub fn default_for(role: AgentRole) -> Self {
+        let candidates = match role {
+            AgentRole::Default => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/gpt-4o".into(),
+                "opencode/claude-sonnet-4-5".into(),
+            ],
+            AgentRole::Planner => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-opus-4".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/o3-mini".into(),
+            ],
+            AgentRole::Architect => vec![
+                "anthropic/claude-opus-4".into(),
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/gpt-4o".into(),
+            ],
+            AgentRole::Executor => vec![
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai-codex/gpt-5.6-luna".into(),
+                "opencode/claude-sonnet-4-5".into(),
+                "google/gemini-2.5-pro".into(),
+            ],
+            AgentRole::Critic => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-opus-4".into(),
+                "openai/o1".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+            ],
+        };
+        Self {
+            role,
+            candidate_models: candidates,
+        }
+    }
+}
+
+pub async fn resolve_role_provider(
+    role: AgentRole,
+    override_model: Option<&str>,
+    store: &CredentialStore,
+) -> Result<ResolvedProvider> {
+    if let Some(m) = override_model {
+        if !m.trim().is_empty() {
+            if let Ok(p) = resolve_provider(m, store).await {
+                return Ok(p);
+            }
+        }
+    }
+
+    let profile = RoleModelProfile::default_for(role);
+    let mut last_err = None;
+
+    for candidate in &profile.candidate_models {
+        match resolve_provider(candidate, store).await {
+            Ok(provider) => return Ok(provider),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // If role candidates failed, attempt fallback to any authenticated supported model
+    let all = ModelCatalog::list_all_builtin_models().unwrap_or_default();
+    for m in all {
+        if is_model_supported(&m) && store.has_credential(&m.provider) {
+            let qualified = format!("{}/{}", m.provider, m.id);
+            if let Ok(provider) = resolve_provider(&qualified, store).await {
+                return Ok(provider);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "No authenticated provider model available for role {:?}",
+            role
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
