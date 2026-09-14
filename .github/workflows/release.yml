@@ -228,7 +228,8 @@ jobs:
 
           NOTES_FILE="../notes-dir/$(ls ../notes-dir | head -n 1)"
 
-          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
             if [[ "$state" != "true" && -n "$state" ]]; then
               echo 'Refusing to overwrite an already published release.' >&2
               exit 1
