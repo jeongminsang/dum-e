@@ -416,12 +416,14 @@ impl AgentLoop {
             ChatMessage::user(task_prompt),
         ];
 
+        let session_ctx = dume_provider::types::StreamRequestContext::new();
         for _turn in 0..self.max_turns {
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(50);
             let model_name = self.model.clone();
             let msgs = messages.clone();
             let tools_clone = tools.clone();
+            let turn_ctx = session_ctx.next_request();
 
             let endpoint = self.endpoint.clone();
             // Stream response
@@ -443,7 +445,7 @@ impl AgentLoop {
                 if let Some(Endpoint::Authenticated(base_url)) = endpoint {
                     provider = provider.with_base_url(&base_url)?;
                 }
-                provider.stream(&msgs, &tools_clone, tx).await
+                provider.stream_with_context(&msgs, &tools_clone, Some(&turn_ctx), tx).await
             });
 
             let mut assistant_reply = String::new();

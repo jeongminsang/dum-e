@@ -1,8 +1,8 @@
 use crate::component::{
-    calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
-    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
-    render_oauth_waiting_modal, render_status_bar, render_transcript, render_update_modal,
-    AutocompleteItem, LoginProviderChoice, ThinkingLevel,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
+    render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
+    render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
+    render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, handle_key_event};
 use crate::theme::Theme;
@@ -14,9 +14,9 @@ use crossterm::terminal::{
 };
 use dume_core::skills::SkillRegistry;
 use dume_core::updater::UpdateInfo;
+use dume_provider::ModelInfo;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
-use dume_provider::ModelInfo;
 use dume_worker::agent_loop::ToolDispatcher;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -102,6 +102,7 @@ pub struct App {
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
     pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
+    pub session_id: String,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -132,7 +133,8 @@ pub fn persist_last_used_model(model: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
     let mut obj = if let Ok(content) = std::fs::read_to_string(&store_path) {
-        serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(|_| serde_json::json!({}))
+        serde_json::from_str::<serde_json::Value>(&content)
+            .unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
     };
@@ -174,6 +176,7 @@ impl App {
             last_ctrl_c: None,
             available_update: None,
             session_usage: (0, 0, 0),
+            session_id: dume_provider::types::StreamRequestContext::new().session_id,
         }
     }
 
@@ -195,12 +198,24 @@ impl App {
 
         // Built-in commands
         let builtins = [
-            ("/model", "Switch model (e.g. /model anthropic/claude-sonnet-4-5)"),
-            ("/login", "Save provider API key (e.g. /login anthropic <key>)"),
-            ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
+            (
+                "/model",
+                "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
+            ),
+            (
+                "/login",
+                "Save provider API key (e.g. /login anthropic <key>)",
+            ),
+            (
+                "/logout",
+                "Clear saved provider credentials (e.g. /logout anthropic)",
+            ),
             ("/update", "Check and install DUM-E in-place update"),
             ("/usage", "Display session token usage statistics"),
-            ("/btw", "Isolated side-question chat without tools or session pollution"),
+            (
+                "/btw",
+                "Isolated side-question chat without tools or session pollution",
+            ),
             ("/clear", "Clear conversation transcript"),
             ("/skills", "List all available skills"),
             ("/help", "Show help and command list"),
@@ -319,7 +334,12 @@ impl App {
                 )));
             }
             ConversationEvent::UpdateProgress { message } => {
-                if let ModalState::Update { status_text, in_progress, .. } = &mut self.modal {
+                if let ModalState::Update {
+                    status_text,
+                    in_progress,
+                    ..
+                } = &mut self.modal
+                {
                     *status_text = message;
                     *in_progress = true;
                 }
@@ -349,13 +369,24 @@ impl App {
                 self.modal = ModalState::None;
             }
             ConversationEvent::BtwStreamDelta(delta) => {
-                if let ModalState::BtwChat { streaming_reply, is_streaming, .. } = &mut self.modal {
+                if let ModalState::BtwChat {
+                    streaming_reply,
+                    is_streaming,
+                    ..
+                } = &mut self.modal
+                {
                     streaming_reply.push_str(&delta);
                     *is_streaming = true;
                 }
             }
             ConversationEvent::BtwFinished(res) => {
-                if let ModalState::BtwChat { history, is_streaming, streaming_reply, .. } = &mut self.modal {
+                if let ModalState::BtwChat {
+                    history,
+                    is_streaming,
+                    streaming_reply,
+                    ..
+                } = &mut self.modal
+                {
                     *is_streaming = false;
                     let reply = match res {
                         Ok(text) => text,
@@ -410,7 +441,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         let current_version = env!("CARGO_PKG_VERSION");
         let repo = "jeongminsang/dum-e";
         if let Ok(Some(info)) = dume_core::updater::check_for_update(repo, current_version) {
-            let _ = update_tx.send(ConversationEvent::UpdateAvailable(info)).await;
+            let _ = update_tx
+                .send(ConversationEvent::UpdateAvailable(info))
+                .await;
         }
     });
 
@@ -982,8 +1015,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         }
                                                         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(50);
                                                         let stream_tx = tx.clone();
+                                                        let btw_ctx = dume_provider::types::StreamRequestContext::new();
                                                         tokio::spawn(async move {
-                                                            let _ = provider.stream(&msgs, &[], sub_tx).await;
+                                                            let _ = provider.stream_with_context(&msgs, &[], Some(&btw_ctx), sub_tx).await;
                                                         });
                                                         let mut full_text = String::new();
                                                         while let Some(evt) = sub_rx.recv().await {
@@ -1073,6 +1107,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.streaming_text.clear();
                                     app.auto_scroll = true;
                                     app.scroll_offset = 0;
+                                    app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                 }
                                 Action::Clear => {}
                                 Action::InsertChar(c) => {
@@ -1367,6 +1402,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 app.is_busy = true;
 
                                                 let model_name = app.model.clone();
+                                                let session_id = app.session_id.clone();
                                                 let mut msgs = app.messages.clone();
                                                 // Replace or append prompt for AI execution
                                                 msgs.push(ChatMessage::user(prompt_content));
@@ -1377,7 +1413,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 current_stream_cancel = Some(child_cancel.clone());
 
                                                 task = Some(tokio::spawn(async move {
-                                                    dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
+                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
                                                 }));
                                                 continue;
                                             } else {
@@ -1394,6 +1430,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                         // Spawn streaming task
                                         let model_name = app.model.clone();
+                                        let session_id = app.session_id.clone();
                                         let msgs = app.messages.clone();
                                         let tx = stream_tx.clone();
                                         let dispatcher = dispatcher.clone();
@@ -1401,7 +1438,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         current_stream_cancel = Some(child_cancel.clone());
 
                                         task = Some(tokio::spawn(async move {
-                                            dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
+                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
                                         }));
                                     }
                                 }
@@ -1450,6 +1487,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
 async fn dispatch_stream(
     model: &str,
+    session_id: String,
     mut messages: Vec<ChatMessage>,
     tx: mpsc::Sender<ConversationEvent>,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
@@ -1457,8 +1495,15 @@ async fn dispatch_stream(
 ) {
     let mut dispatcher = dispatcher.lock().await;
     dispatcher.set_model(model);
-    let result =
-        dispatch_authenticated(model, &mut messages, &tx, &mut dispatcher, &cancellation).await;
+    let result = dispatch_authenticated(
+        model,
+        session_id,
+        &mut messages,
+        &tx,
+        &mut dispatcher,
+        &cancellation,
+    )
+    .await;
     dispatcher.cancel_all().await;
     let _ = tx
         .send(ConversationEvent::Finished {
@@ -1470,6 +1515,7 @@ async fn dispatch_stream(
 
 async fn dispatch_authenticated(
     model: &str,
+    session_id: String,
     messages: &mut Vec<ChatMessage>,
     tx: &mpsc::Sender<ConversationEvent>,
     dispatcher: &mut ToolDispatcher,
@@ -1487,10 +1533,13 @@ async fn dispatch_authenticated(
         move |messages, tx| {
             let cred_store = cred_store.clone();
             let model = model.clone();
+            let turn_ctx = dume_provider::types::StreamRequestContext::for_session(&session_id);
             async move {
                 let tools = dume_worker::AgentLoop::tool_definitions();
                 let provider = resolve_provider(&model, &cred_store).await?;
-                provider.stream(&messages, &tools, tx).await
+                provider
+                    .stream_with_context(&messages, &tools, Some(&turn_ctx), tx)
+                    .await
             }
         },
     )
@@ -1605,7 +1654,9 @@ where
                 turn.push(&event)?;
                 if matches!(
                     event,
-                    StreamEvent::TextDelta(_) | StreamEvent::ToolCallDelta { .. } | StreamEvent::Usage(_)
+                    StreamEvent::TextDelta(_)
+                        | StreamEvent::ToolCallDelta { .. }
+                        | StreamEvent::Usage(_)
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }
