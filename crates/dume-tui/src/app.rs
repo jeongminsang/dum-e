@@ -1,6 +1,6 @@
 use crate::component::{
     calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
-    render_input_bar, render_login_selector_modal, render_model_selector_modal,
+    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
     render_oauth_waiting_modal, render_status_bar, render_transcript, render_update_modal,
     AutocompleteItem, LoginProviderChoice, ThinkingLevel,
 };
@@ -45,6 +45,8 @@ enum ConversationEvent {
     UpdateFinished {
         result: Result<std::path::PathBuf, String>,
     },
+    BtwStreamDelta(String),
+    BtwFinished(Result<String, String>),
 }
 
 pub enum ModalState {
@@ -73,6 +75,12 @@ pub enum ModalState {
         info: UpdateInfo,
         status_text: String,
         in_progress: bool,
+    },
+    BtwChat {
+        history: Vec<(String, String)>,
+        input: String,
+        is_streaming: bool,
+        streaming_reply: String,
     },
 }
 
@@ -192,6 +200,7 @@ impl App {
             ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
             ("/update", "Check and install DUM-E in-place update"),
             ("/usage", "Display session token usage statistics"),
+            ("/btw", "Isolated side-question chat without tools or session pollution"),
             ("/clear", "Clear conversation transcript"),
             ("/skills", "List all available skills"),
             ("/help", "Show help and command list"),
@@ -338,6 +347,23 @@ impl App {
                     }
                 }
                 self.modal = ModalState::None;
+            }
+            ConversationEvent::BtwStreamDelta(delta) => {
+                if let ModalState::BtwChat { streaming_reply, is_streaming, .. } = &mut self.modal {
+                    streaming_reply.push_str(&delta);
+                    *is_streaming = true;
+                }
+            }
+            ConversationEvent::BtwFinished(res) => {
+                if let ModalState::BtwChat { history, is_streaming, streaming_reply, .. } = &mut self.modal {
+                    *is_streaming = false;
+                    let reply = match res {
+                        Ok(text) => text,
+                        Err(e) => format!("Error: {}", e),
+                    };
+                    history.push(("assistant".to_string(), reply));
+                    streaming_reply.clear();
+                }
             }
         }
     }
@@ -574,6 +600,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                         info,
                         status_text,
                         *in_progress,
+                        &app.theme,
+                    );
+                }
+                ModalState::BtwChat {
+                    history,
+                    input,
+                    is_streaming,
+                    streaming_reply,
+                } => {
+                    render_btw_modal(
+                        f,
+                        f.area(),
+                        history,
+                        input,
+                        *is_streaming,
+                        streaming_reply,
                         &app.theme,
                     );
                 }
@@ -906,6 +948,71 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     continue;
                                 }
+                                ModalState::BtwChat { history, input, is_streaming, .. } => {
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        app.modal = ModalState::None;
+                                    } else if key.code == crossterm::event::KeyCode::Backspace {
+                                        input.pop();
+                                    } else if key.code == crossterm::event::KeyCode::Enter {
+                                        if !input.trim().is_empty() && !*is_streaming {
+                                            let q = std::mem::take(input);
+                                            history.push(("user".to_string(), q.clone()));
+                                            *is_streaming = true;
+
+                                            let model_name = app.model.clone();
+                                            let btw_history = history.clone();
+                                            let tx = stream_tx.clone();
+
+                                            tokio::spawn(async move {
+                                                let cred_store = dume_provider::CredentialStore::new(
+                                                    dume_provider::CredentialStore::default_path(),
+                                                );
+                                                let provider_res = dume_provider::runtime::resolve_provider(&model_name, &cred_store).await;
+                                                match provider_res {
+                                                    Ok(provider) => {
+                                                        let mut msgs = vec![
+                                                            ChatMessage::system("You are a helpful coding assistant answering a quick side-question without tools. Keep your answer direct and concise.")
+                                                        ];
+                                                        for (r, content) in btw_history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+                                                            if r == "user" {
+                                                                msgs.push(ChatMessage::user(content));
+                                                            } else {
+                                                                msgs.push(ChatMessage::assistant(content));
+                                                            }
+                                                        }
+                                                        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(50);
+                                                        let stream_tx = tx.clone();
+                                                        tokio::spawn(async move {
+                                                            let _ = provider.stream(&msgs, &[], sub_tx).await;
+                                                        });
+                                                        let mut full_text = String::new();
+                                                        while let Some(evt) = sub_rx.recv().await {
+                                                            match evt {
+                                                                StreamEvent::TextDelta(d) => {
+                                                                    full_text.push_str(&d);
+                                                                    let _ = stream_tx.send(ConversationEvent::BtwStreamDelta(d)).await;
+                                                                }
+                                                                StreamEvent::Completed { .. } => break,
+                                                                StreamEvent::Error(err) => {
+                                                                    let _ = stream_tx.send(ConversationEvent::BtwFinished(Err(err))).await;
+                                                                    return;
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                        let _ = stream_tx.send(ConversationEvent::BtwFinished(Ok(full_text))).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx.send(ConversationEvent::BtwFinished(Err(e.to_string()))).await;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else if let crossterm::event::KeyCode::Char(c) = key.code {
+                                        input.push(c);
+                                    }
+                                    continue;
+                                }
                                 ModalState::None => {}
                             }
 
@@ -1159,6 +1266,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 "Session Token Usage:\n  Input Tokens:  {}\n  Output Tokens: {}\n  Total Tokens:  {}",
                                                 input, output, total
                                             )));
+                                            continue;
+                                        } else if trimmed == "/btw" || trimmed.starts_with("/btw ") {
+                                            let initial_query = if trimmed.starts_with("/btw ") {
+                                                trimmed[5..].trim().to_string()
+                                            } else {
+                                                String::new()
+                                            };
+                                            app.modal = ModalState::BtwChat {
+                                                history: Vec::new(),
+                                                input: initial_query,
+                                                is_streaming: false,
+                                                streaming_reply: String::new(),
+                                            };
                                             continue;
                                         } else if trimmed == "/clear" {
                                             app.messages.clear();
