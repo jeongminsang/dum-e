@@ -616,81 +616,107 @@ async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) ->
                 }
             };
 
-            let ready_tasks = dag.get_ready_tasks();
-            for task in ready_tasks {
+            let ready_tasks: Vec<Task> = dag.get_ready_tasks().into_iter().cloned().collect();
+            if !ready_tasks.is_empty() {
                 any_work_done = true;
-                let attempt_id = format!(
-                    "att_{}_{}",
-                    task.id,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_millis()
-                );
-                let worktree_dir = repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+                let integration_lock = Arc::new(tokio::sync::Mutex::new(()));
+                let mut set = tokio::task::JoinSet::new();
 
-                // 1. Create isolated worktree for worker
-                dume_git::worktree::create_git_worktree(repo_p, &worktree_dir, &task.target_branch)
-                    .await?;
+                for task in ready_tasks {
+                    let sem = semaphore.clone();
+                    let int_lock = integration_lock.clone();
+                    let store_clone = store.clone();
+                    let repo_p = repo_p.to_path_buf();
+                    let repo_path = repo_path.to_string();
+                    let owner_id = owner_id.clone();
+                    let worker_host = worker_host.clone();
 
-                // 2. Record attempt in store under current coordinator epoch
-                let attempt = store.create_attempt(
-                    &attempt_id,
-                    &task.id,
-                    epoch,
-                    &owner_id,
-                    worktree_dir.to_str().unwrap(),
-                    30_000,
-                )?;
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await.expect("Semaphore closed");
+                        let attempt_id = format!(
+                            "att_{}_{}",
+                            task.id,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)?
+                                .as_millis()
+                        );
+                        let worktree_dir = repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
 
-                tracing::info!(
-                    "Dispatched task {} (attempt {}) to worker",
-                    task.id,
-                    attempt.id
-                );
+                        // 1. Create isolated worktree for worker
+                        dume_git::worktree::create_git_worktree(&repo_p, &worktree_dir, &task.target_branch)
+                            .await?;
 
-                // 3. Spawn separate OS worker process
-                let cancel_token = tokio_util::sync::CancellationToken::new();
-                let manifest_res = worker_host
-                    .run_attempt(
-                        &attempt.id,
-                        &task.id,
-                        epoch,
-                        &worktree_dir,
-                        task.acceptance_criteria.first().cloned(),
-                        Some(task.description.clone()),
-                        Some("anthropic/claude-sonnet-4-5".to_string()),
-                        cancel_token,
-                    )
-                    .await;
-
-                match manifest_res {
-                    Ok(manifest) => {
-                        // Save manifest artifact
-                        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-                        let manifest_hash =
-                            store.artifacts.save_artifact(manifest_json.as_bytes())?;
-
-                        // Submit attempt result under epoch guard
-                        store.submit_attempt_result(
-                            &attempt.id,
+                        // 2. Record attempt in store under current coordinator epoch
+                        let attempt = store_clone.create_attempt(
+                            &attempt_id,
+                            &task.id,
                             epoch,
-                            &manifest.candidate_commit,
-                            &manifest_hash,
+                            &owner_id,
+                            worktree_dir.to_str().unwrap(),
+                            30_000,
                         )?;
 
-                        let updated_attempt = store.get_attempt(&attempt.id)?;
-                        verify_and_integrate_attempt(&store, repo_path, &updated_attempt, epoch)
-                            .await?;
-                    }
-                    Err(e) => {
-                        tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
-                        store.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
-                        store.update_task_status(&task.id, TaskStatus::Failed)?;
-                    }
+                        tracing::info!(
+                            "Dispatched task {} (attempt {}) to worker (parallel)",
+                            task.id,
+                            attempt.id
+                        );
+
+                        // 3. Spawn separate OS worker process
+                        let cancel_token = tokio_util::sync::CancellationToken::new();
+                        let manifest_res = worker_host
+                            .run_attempt(
+                                &attempt.id,
+                                &task.id,
+                                epoch,
+                                &worktree_dir,
+                                task.acceptance_criteria.first().cloned(),
+                                Some(task.description.clone()),
+                                Some("anthropic/claude-sonnet-4-5".to_string()),
+                                cancel_token,
+                            )
+                            .await;
+
+                        match manifest_res {
+                            Ok(manifest) => {
+                                // Save manifest artifact
+                                let manifest_json = serde_json::to_string_pretty(&manifest)?;
+                                let manifest_hash =
+                                    store_clone.artifacts.save_artifact(manifest_json.as_bytes())?;
+
+                                // Serialized verification and atomic integration
+                                let _guard = int_lock.lock().await;
+
+                                store_clone.submit_attempt_result(
+                                    &attempt.id,
+                                    epoch,
+                                    &manifest.candidate_commit,
+                                    &manifest_hash,
+                                )?;
+
+                                let updated_attempt = store_clone.get_attempt(&attempt.id)?;
+                                verify_and_integrate_attempt(&store_clone, &repo_path, &updated_attempt, epoch)
+                                    .await?;
+                            }
+                            Err(e) => {
+                                tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
+                                store_clone.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
+                                store_clone.update_task_status(&task.id, TaskStatus::Failed)?;
+                            }
+                        }
+
+                        // Clean up worker worktree
+                        let _ = dume_git::worktree::remove_git_worktree(&repo_p, &worktree_dir).await;
+                        Ok::<(), anyhow::Error>(())
+                    });
                 }
 
-                // Clean up worker worktree
-                let _ = dume_git::worktree::remove_git_worktree(repo_p, &worktree_dir).await;
+                while let Some(res) = set.join_next().await {
+                    if let Err(e) = res? {
+                        tracing::error!("Parallel task execution failed: {}", e);
+                    }
+                }
             }
         }
 
