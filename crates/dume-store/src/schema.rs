@@ -119,6 +119,26 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             total_tokens INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS workflow_runs (
+            run_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            goal_id TEXT,
+            params_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_artifacts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id) ON DELETE CASCADE
+        );
         "#,
     )?;
     Ok(())
