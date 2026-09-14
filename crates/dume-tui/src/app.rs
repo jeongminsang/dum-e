@@ -1,8 +1,8 @@
 use crate::component::{
-    calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
-    render_input_bar, render_login_selector_modal, render_model_selector_modal,
-    render_oauth_waiting_modal, render_status_bar, render_transcript, render_update_modal,
-    AutocompleteItem, LoginProviderChoice, ThinkingLevel,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
+    render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
+    render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
+    render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, handle_key_event};
 use crate::theme::Theme;
@@ -14,9 +14,9 @@ use crossterm::terminal::{
 };
 use dume_core::skills::SkillRegistry;
 use dume_core::updater::UpdateInfo;
+use dume_provider::ModelInfo;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
-use dume_provider::ModelInfo;
 use dume_worker::agent_loop::ToolDispatcher;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -45,6 +45,8 @@ enum ConversationEvent {
     UpdateFinished {
         result: Result<std::path::PathBuf, String>,
     },
+    BtwStreamDelta(String),
+    BtwFinished(Result<String, String>),
 }
 
 pub enum ModalState {
@@ -74,6 +76,12 @@ pub enum ModalState {
         status_text: String,
         in_progress: bool,
     },
+    BtwChat {
+        history: Vec<(String, String)>,
+        input: String,
+        is_streaming: bool,
+        streaming_reply: String,
+    },
 }
 
 pub struct App {
@@ -93,6 +101,8 @@ pub struct App {
     pub modal: ModalState,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
+    pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
+    pub session_id: String,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -123,7 +133,8 @@ pub fn persist_last_used_model(model: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
     let mut obj = if let Ok(content) = std::fs::read_to_string(&store_path) {
-        serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(|_| serde_json::json!({}))
+        serde_json::from_str::<serde_json::Value>(&content)
+            .unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
     };
@@ -164,6 +175,8 @@ impl App {
             modal: ModalState::None,
             last_ctrl_c: None,
             available_update: None,
+            session_usage: (0, 0, 0),
+            session_id: dume_provider::types::StreamRequestContext::new().session_id,
         }
     }
 
@@ -185,10 +198,24 @@ impl App {
 
         // Built-in commands
         let builtins = [
-            ("/model", "Switch model (e.g. /model anthropic/claude-sonnet-4-5)"),
-            ("/login", "Save provider API key (e.g. /login anthropic <key>)"),
-            ("/logout", "Clear saved provider credentials (e.g. /logout anthropic)"),
+            (
+                "/model",
+                "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
+            ),
+            (
+                "/login",
+                "Save provider API key (e.g. /login anthropic <key>)",
+            ),
+            (
+                "/logout",
+                "Clear saved provider credentials (e.g. /logout anthropic)",
+            ),
             ("/update", "Check and install DUM-E in-place update"),
+            ("/usage", "Display session token usage statistics"),
+            (
+                "/btw",
+                "Isolated side-question chat without tools or session pollution",
+            ),
             ("/clear", "Clear conversation transcript"),
             ("/skills", "List all available skills"),
             ("/help", "Show help and command list"),
@@ -267,6 +294,11 @@ impl App {
                 }
                 self.streaming_text.push_str(&arguments_delta);
             }
+            ConversationEvent::Stream(StreamEvent::Usage(usage)) => {
+                self.session_usage.0 += usage.input_tokens;
+                self.session_usage.1 += usage.output_tokens;
+                self.session_usage.2 += usage.total_tokens;
+            }
             ConversationEvent::Stream(_) => {}
             ConversationEvent::Finished { messages, error } => {
                 self.messages = messages;
@@ -302,7 +334,12 @@ impl App {
                 )));
             }
             ConversationEvent::UpdateProgress { message } => {
-                if let ModalState::Update { status_text, in_progress, .. } = &mut self.modal {
+                if let ModalState::Update {
+                    status_text,
+                    in_progress,
+                    ..
+                } = &mut self.modal
+                {
                     *status_text = message;
                     *in_progress = true;
                 }
@@ -330,6 +367,34 @@ impl App {
                     }
                 }
                 self.modal = ModalState::None;
+            }
+            ConversationEvent::BtwStreamDelta(delta) => {
+                if let ModalState::BtwChat {
+                    streaming_reply,
+                    is_streaming,
+                    ..
+                } = &mut self.modal
+                {
+                    streaming_reply.push_str(&delta);
+                    *is_streaming = true;
+                }
+            }
+            ConversationEvent::BtwFinished(res) => {
+                if let ModalState::BtwChat {
+                    history,
+                    is_streaming,
+                    streaming_reply,
+                    ..
+                } = &mut self.modal
+                {
+                    *is_streaming = false;
+                    let reply = match res {
+                        Ok(text) => text,
+                        Err(e) => format!("Error: {}", e),
+                    };
+                    history.push(("assistant".to_string(), reply));
+                    streaming_reply.clear();
+                }
             }
         }
     }
@@ -376,7 +441,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         let current_version = env!("CARGO_PKG_VERSION");
         let repo = "jeongminsang/dum-e";
         if let Ok(Some(info)) = dume_core::updater::check_for_update(repo, current_version) {
-            let _ = update_tx.send(ConversationEvent::UpdateAvailable(info)).await;
+            let _ = update_tx
+                .send(ConversationEvent::UpdateAvailable(info))
+                .await;
         }
     });
 
@@ -483,6 +550,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     let has_openai = cred_store.has_credential("openai");
                     let has_google = cred_store.has_credential("google");
                     let has_codex = cred_store.has_credential("openai-codex");
+                    let has_opencode = cred_store.has_credential("opencode");
+                    let has_opencode_go = cred_store.has_credential("opencode-go");
 
                     let choices = [
                         LoginProviderChoice {
@@ -508,6 +577,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                             name: "OpenAI Codex",
                             auth_type: "OAuth Browser",
                             is_authenticated: has_codex,
+                        },
+                        LoginProviderChoice {
+                            id: "opencode",
+                            name: "OpenCode Zen",
+                            auth_type: "API Key",
+                            is_authenticated: has_opencode,
+                        },
+                        LoginProviderChoice {
+                            id: "opencode-go",
+                            name: "OpenCode Go",
+                            auth_type: "API Key",
+                            is_authenticated: has_opencode_go,
                         },
                     ];
 
@@ -552,6 +633,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                         info,
                         status_text,
                         *in_progress,
+                        &app.theme,
+                    );
+                }
+                ModalState::BtwChat {
+                    history,
+                    input,
+                    is_streaming,
+                    streaming_reply,
+                } => {
+                    render_btw_modal(
+                        f,
+                        f.area(),
+                        history,
+                        input,
+                        *is_streaming,
+                        streaming_reply,
                         &app.theme,
                     );
                 }
@@ -684,8 +781,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     continue;
                                 }
                                 ModalState::LoginSelector { selected_idx } => {
-                                    let provider_ids = ["anthropic", "openai", "google", "openai-codex"];
-                                    let provider_names = ["Anthropic Claude", "OpenAI ChatGPT", "Google Gemini", "OpenAI Codex"];
+                                    let provider_ids = [
+                                        "anthropic",
+                                        "openai",
+                                        "google",
+                                        "openai-codex",
+                                        "opencode",
+                                        "opencode-go",
+                                    ];
+                                    let provider_names = [
+                                        "Anthropic Claude",
+                                        "OpenAI ChatGPT",
+                                        "Google Gemini",
+                                        "OpenAI Codex",
+                                        "OpenCode Zen",
+                                        "OpenCode Go",
+                                    ];
 
                                     match key.code {
                                         crossterm::event::KeyCode::Esc => {
@@ -870,6 +981,72 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     continue;
                                 }
+                                ModalState::BtwChat { history, input, is_streaming, .. } => {
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        app.modal = ModalState::None;
+                                    } else if key.code == crossterm::event::KeyCode::Backspace {
+                                        input.pop();
+                                    } else if key.code == crossterm::event::KeyCode::Enter {
+                                        if !input.trim().is_empty() && !*is_streaming {
+                                            let q = std::mem::take(input);
+                                            history.push(("user".to_string(), q.clone()));
+                                            *is_streaming = true;
+
+                                            let model_name = app.model.clone();
+                                            let btw_history = history.clone();
+                                            let tx = stream_tx.clone();
+
+                                            tokio::spawn(async move {
+                                                let cred_store = dume_provider::CredentialStore::new(
+                                                    dume_provider::CredentialStore::default_path(),
+                                                );
+                                                let provider_res = dume_provider::runtime::resolve_provider(&model_name, &cred_store).await;
+                                                match provider_res {
+                                                    Ok(provider) => {
+                                                        let mut msgs = vec![
+                                                            ChatMessage::system("You are a helpful coding assistant answering a quick side-question without tools. Keep your answer direct and concise.")
+                                                        ];
+                                                        for (r, content) in btw_history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+                                                            if r == "user" {
+                                                                msgs.push(ChatMessage::user(content));
+                                                            } else {
+                                                                msgs.push(ChatMessage::assistant(content));
+                                                            }
+                                                        }
+                                                        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(50);
+                                                        let stream_tx = tx.clone();
+                                                        let btw_ctx = dume_provider::types::StreamRequestContext::new();
+                                                        tokio::spawn(async move {
+                                                            let _ = provider.stream_with_context(&msgs, &[], Some(&btw_ctx), sub_tx).await;
+                                                        });
+                                                        let mut full_text = String::new();
+                                                        while let Some(evt) = sub_rx.recv().await {
+                                                            match evt {
+                                                                StreamEvent::TextDelta(d) => {
+                                                                    full_text.push_str(&d);
+                                                                    let _ = stream_tx.send(ConversationEvent::BtwStreamDelta(d)).await;
+                                                                }
+                                                                StreamEvent::Completed { .. } => break,
+                                                                StreamEvent::Error(err) => {
+                                                                    let _ = stream_tx.send(ConversationEvent::BtwFinished(Err(err))).await;
+                                                                    return;
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                        let _ = stream_tx.send(ConversationEvent::BtwFinished(Ok(full_text))).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx.send(ConversationEvent::BtwFinished(Err(e.to_string()))).await;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else if let crossterm::event::KeyCode::Char(c) = key.code {
+                                        input.push(c);
+                                    }
+                                    continue;
+                                }
                                 ModalState::None => {}
                             }
 
@@ -930,6 +1107,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.streaming_text.clear();
                                     app.auto_scroll = true;
                                     app.scroll_offset = 0;
+                                    app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                 }
                                 Action::Clear => {}
                                 Action::InsertChar(c) => {
@@ -1011,23 +1189,30 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let has_openai = cred_store.has_credential("openai");
                                             let has_google = cred_store.has_credential("google");
                                             let has_codex = cred_store.has_credential("openai-codex");
+                                            let has_opencode = cred_store.has_credential("opencode");
+                                            let has_opencode_go = cred_store.has_credential("opencode-go");
 
                                             let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
 
-                                            // Filter only models whose provider is authenticated
+                                            // Filter only models whose provider is supported and authenticated
                                             let models: Vec<_> = all_builtin.into_iter().filter(|m| {
+                                                if !dume_provider::is_model_supported(m) {
+                                                    return false;
+                                                }
                                                 match m.provider.as_str() {
                                                     "anthropic" => has_anthropic,
                                                     "openai" => has_openai,
                                                     "google" => has_google,
                                                     "openai-codex" => has_codex,
+                                                    "opencode" => has_opencode,
+                                                    "opencode-go" => has_opencode_go,
                                                     _ => false,
                                                 }
                                             }).collect();
 
                                             if models.is_empty() {
                                                 app.messages.push(ChatMessage::system(
-                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex)."
+                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex, OpenCode Zen, OpenCode Go)."
                                                 ));
                                                 continue;
                                             }
@@ -1109,6 +1294,26 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     )));
                                                 }
                                             }
+                                            continue;
+                                        } else if trimmed == "/usage" {
+                                            let (input, output, total) = app.session_usage;
+                                            app.messages.push(ChatMessage::system(format!(
+                                                "Session Token Usage:\n  Input Tokens:  {}\n  Output Tokens: {}\n  Total Tokens:  {}",
+                                                input, output, total
+                                            )));
+                                            continue;
+                                        } else if trimmed == "/btw" || trimmed.starts_with("/btw ") {
+                                            let initial_query = if trimmed.starts_with("/btw ") {
+                                                trimmed[5..].trim().to_string()
+                                            } else {
+                                                String::new()
+                                            };
+                                            app.modal = ModalState::BtwChat {
+                                                history: Vec::new(),
+                                                input: initial_query,
+                                                is_streaming: false,
+                                                streaming_reply: String::new(),
+                                            };
                                             continue;
                                         } else if trimmed == "/clear" {
                                             app.messages.clear();
@@ -1197,6 +1402,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 app.is_busy = true;
 
                                                 let model_name = app.model.clone();
+                                                let session_id = app.session_id.clone();
                                                 let mut msgs = app.messages.clone();
                                                 // Replace or append prompt for AI execution
                                                 msgs.push(ChatMessage::user(prompt_content));
@@ -1207,7 +1413,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 current_stream_cancel = Some(child_cancel.clone());
 
                                                 task = Some(tokio::spawn(async move {
-                                                    dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
+                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
                                                 }));
                                                 continue;
                                             } else {
@@ -1224,6 +1430,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                         // Spawn streaming task
                                         let model_name = app.model.clone();
+                                        let session_id = app.session_id.clone();
                                         let msgs = app.messages.clone();
                                         let tx = stream_tx.clone();
                                         let dispatcher = dispatcher.clone();
@@ -1231,7 +1438,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         current_stream_cancel = Some(child_cancel.clone());
 
                                         task = Some(tokio::spawn(async move {
-                                            dispatch_stream(&model_name, msgs, tx, dispatcher, child_cancel).await;
+                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
                                         }));
                                     }
                                 }
@@ -1280,6 +1487,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
 async fn dispatch_stream(
     model: &str,
+    session_id: String,
     mut messages: Vec<ChatMessage>,
     tx: mpsc::Sender<ConversationEvent>,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
@@ -1287,8 +1495,15 @@ async fn dispatch_stream(
 ) {
     let mut dispatcher = dispatcher.lock().await;
     dispatcher.set_model(model);
-    let result =
-        dispatch_authenticated(model, &mut messages, &tx, &mut dispatcher, &cancellation).await;
+    let result = dispatch_authenticated(
+        model,
+        session_id,
+        &mut messages,
+        &tx,
+        &mut dispatcher,
+        &cancellation,
+    )
+    .await;
     dispatcher.cancel_all().await;
     let _ = tx
         .send(ConversationEvent::Finished {
@@ -1300,6 +1515,7 @@ async fn dispatch_stream(
 
 async fn dispatch_authenticated(
     model: &str,
+    session_id: String,
     messages: &mut Vec<ChatMessage>,
     tx: &mpsc::Sender<ConversationEvent>,
     dispatcher: &mut ToolDispatcher,
@@ -1317,10 +1533,13 @@ async fn dispatch_authenticated(
         move |messages, tx| {
             let cred_store = cred_store.clone();
             let model = model.clone();
+            let turn_ctx = dume_provider::types::StreamRequestContext::for_session(&session_id);
             async move {
                 let tools = dume_worker::AgentLoop::tool_definitions();
                 let provider = resolve_provider(&model, &cred_store).await?;
-                provider.stream(&messages, &tools, tx).await
+                provider
+                    .stream_with_context(&messages, &tools, Some(&turn_ctx), tx)
+                    .await
             }
         },
     )
@@ -1374,6 +1593,7 @@ impl StreamTurn {
                 }
                 call.arguments.push_str(arguments_delta);
             }
+            StreamEvent::Usage(_) => {}
             StreamEvent::Completed { finish_reason } => {
                 self.finish_reason = Some(finish_reason.clone())
             }
@@ -1434,7 +1654,9 @@ where
                 turn.push(&event)?;
                 if matches!(
                     event,
-                    StreamEvent::TextDelta(_) | StreamEvent::ToolCallDelta { .. }
+                    StreamEvent::TextDelta(_)
+                        | StreamEvent::ToolCallDelta { .. }
+                        | StreamEvent::Usage(_)
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }

@@ -60,6 +60,11 @@ impl GeminiProvider {
             match event_res {
                 Ok(event) => {
                     if let Ok(val) = serde_json::from_str::<Value>(&event.data) {
+                        if let Some(err) = val.get("error") {
+                            let message = format!("Google API error: {err}");
+                            let _ = tx.send(StreamEvent::Error(message.clone())).await;
+                            anyhow::bail!(message);
+                        }
                         if let Some(candidates) = val.get("candidates").and_then(|c| c.as_array()) {
                             if let Some(first) = candidates.first() {
                                 if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
@@ -69,18 +74,28 @@ impl GeminiProvider {
                                         }
                                     }
                                 }
+                                if let Some(finish) = first.get("finishReason").and_then(|f| f.as_str()) {
+                                    let reason = match finish {
+                                        "STOP" => "stop",
+                                        "MAX_TOKENS" => "length",
+                                        _ => finish,
+                                    };
+                                    let _ = tx.send(StreamEvent::Completed { finish_reason: reason.to_string() }).await;
+                                    return Ok(());
+                                }
                             }
                         }
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    break;
+                    return Err(e.into());
                 }
             }
         }
 
-        let _ = tx.send(StreamEvent::Completed { finish_reason: "stop".to_string() }).await;
-        Ok(())
+        let message = "Google stream ended prematurely without finish reason";
+        let _ = tx.send(StreamEvent::Error(message.to_string())).await;
+        anyhow::bail!(message);
     }
 }

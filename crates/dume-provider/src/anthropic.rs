@@ -1,5 +1,5 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, ToolDefinition};
+use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -371,7 +371,32 @@ impl AnthropicProvider {
                                         }
                                     }
                                 }
+                                "message_start" => {
+                                    if let Some(msg) = parsed.get("message") {
+                                         if let Some(usage) = msg.get("usage") {
+                                             let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                             let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                             if input > 0 || output > 0 {
+                                                 let _ = tx.send(StreamEvent::Usage(TokenUsage {
+                                                     input_tokens: input,
+                                                     output_tokens: output,
+                                                     total_tokens: input + output,
+                                                 })).await;
+                                             }
+                                         }
+                                     }
+                                }
                                 "message_delta" => {
+                                    if let Some(usage) = parsed.get("usage") {
+                                         let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                         if output > 0 {
+                                             let _ = tx.send(StreamEvent::Usage(TokenUsage {
+                                                 input_tokens: 0,
+                                                 output_tokens: output,
+                                                 total_tokens: output,
+                                             })).await;
+                                         }
+                                    }
                                     if let Some(stop) = parsed
                                         .get("delta")
                                         .and_then(|d| d.get("stop_reason"))

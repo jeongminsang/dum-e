@@ -772,5 +772,72 @@ pub fn render_update_modal(
     f.render_widget(paragraph, inner);
 }
 
+pub fn render_btw_modal(
+    f: &mut Frame,
+    area: Rect,
+    history: &[(String, String)], // (role, content)
+    input: &str,
+    is_streaming: bool,
+    streaming_reply: &str,
+    theme: &Theme,
+) {
+    let width = 74.min(area.width.saturating_sub(4));
+    let height = 22.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" /btw Side-Chat (Isolated Context, No Tools | Esc: Close, Enter: Ask) ");
+
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines = Vec::new();
+    if history.is_empty() && streaming_reply.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Quickly ask questions without contaminating the main agent task session history.",
+            Style::default().fg(theme.status_bar_fg),
+        )));
+        lines.push(Line::from(""));
+    } else {
+        for (role, msg) in history.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+            let (prefix, style) = if role == "user" {
+                ("You: ", Style::default().fg(theme.user_msg).add_modifier(Modifier::BOLD))
+            } else {
+                ("AI:  ", Style::default().fg(theme.assistant_msg))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(msg, Style::default().fg(theme.foreground)),
+            ]));
+        }
+        if is_streaming {
+            lines.push(Line::from(vec![
+                Span::styled("AI:  ", Style::default().fg(theme.assistant_msg)),
+                Span::styled(streaming_reply, Style::default().fg(theme.foreground)),
+                Span::styled("▌", Style::default().fg(theme.accent)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Query: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(input, Style::default().fg(theme.foreground)),
+        Span::styled("█", Style::default().fg(theme.accent)),
+    ]));
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph, inner);
+}
+
 
 

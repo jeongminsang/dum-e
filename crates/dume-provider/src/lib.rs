@@ -20,5 +20,8 @@ pub use oauth::{
     refresh_oauth_token, wait_for_oauth_callback,
 };
 pub use openai::OpenAiProvider;
-pub use runtime::{ResolvedProvider, resolve_model, resolve_provider};
+pub use runtime::{
+    AgentRole, ResolvedProvider, RoleModelProfile, is_model_supported, is_transport_supported,
+    resolve_model, resolve_provider, resolve_role_provider,
+};
 pub use types::{ChatMessage, Role, StreamEvent, ToolCall, ToolDefinition};

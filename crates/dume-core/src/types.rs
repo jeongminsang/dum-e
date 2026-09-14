@@ -150,3 +150,46 @@ pub struct HarnessEvent {
     pub payload: String,
     pub created_at: i64,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStatus {
+    Pending,
+    Active,
+    AwaitingApproval,
+    Approved,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub run_id: String,
+    pub kind: String,
+    pub status: WorkflowStatus,
+    pub goal_id: Option<String>,
+    pub params_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifact {
+    pub id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub digest: String,
+    pub content: String,
+    pub created_at: i64,
+}
+

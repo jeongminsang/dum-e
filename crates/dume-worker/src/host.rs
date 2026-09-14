@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone)]
 pub struct WorkerHost {
     binary_path: String,
 }

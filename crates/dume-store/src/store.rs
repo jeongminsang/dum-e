@@ -922,6 +922,225 @@ impl HarnessStore {
 
         Ok(())
     }
+
+    pub fn record_session_usage(
+        &self,
+        session_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> Result<SessionUsage, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        let total = input_tokens + output_tokens;
+
+        conn.execute(
+            r#"
+            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(session_id) DO UPDATE SET
+                input_tokens = input_tokens + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                updated_at = excluded.updated_at
+            "#,
+            params![session_id, input_tokens, output_tokens, total, now],
+        )?;
+
+        let row: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+
+        Ok(SessionUsage {
+            session_id: session_id.to_string(),
+            input_tokens: row.0,
+            output_tokens: row.1,
+            total_tokens: row.2,
+            updated_at: row.3,
+        })
+    }
+
+    pub fn get_session_usage(&self, session_id: &str) -> Result<SessionUsage, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(i64, i64, i64, i64)> = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+
+        Ok(match existing {
+            Some((input, output, total, updated)) => SessionUsage {
+                session_id: session_id.to_string(),
+                input_tokens: input,
+                output_tokens: output,
+                total_tokens: total,
+                updated_at: updated,
+            },
+            None => SessionUsage {
+                session_id: session_id.to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                updated_at: now_millis(),
+            },
+        })
+    }
+
+    // --- Workflow Engine Storage ---
+
+    pub fn create_workflow_run(
+        &self,
+        run_id: &str,
+        kind: &str,
+        goal_id: Option<&str>,
+        params_json: &str,
+    ) -> Result<WorkflowRun, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+
+        conn.execute(
+            r#"
+            INSERT INTO workflow_runs (run_id, kind, status, goal_id, params_json, created_at, updated_at)
+            VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6)
+            "#,
+            params![run_id, kind, goal_id, params_json, now, now],
+        )?;
+
+        Ok(WorkflowRun {
+            run_id: run_id.to_string(),
+            kind: kind.to_string(),
+            status: WorkflowStatus::Pending,
+            goal_id: goal_id.map(|s| s.to_string()),
+            params_json: params_json.to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn update_workflow_status(
+        &self,
+        run_id: &str,
+        status: WorkflowStatus,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let status_str = match status {
+            WorkflowStatus::Pending => "pending",
+            WorkflowStatus::Active => "active",
+            WorkflowStatus::AwaitingApproval => "awaiting_approval",
+            WorkflowStatus::Approved => "approved",
+            WorkflowStatus::Completed => "completed",
+            WorkflowStatus::Failed => "failed",
+            WorkflowStatus::Cancelled => "cancelled",
+        };
+        let now = now_millis();
+        let updated = conn.execute(
+            "UPDATE workflow_runs SET status = ?1, updated_at = ?2 WHERE run_id = ?3",
+            params![status_str, now, run_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("Workflow run '{}' not found", run_id)));
+        }
+        Ok(())
+    }
+
+    pub fn get_workflow_run(&self, run_id: &str) -> Result<WorkflowRun, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: (String, String, Option<String>, String, i64, i64) = conn
+            .query_row(
+                "SELECT kind, status, goal_id, params_json, created_at, updated_at FROM workflow_runs WHERE run_id = ?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("Workflow run '{}' not found", run_id)))?;
+
+        let status = match row.1.as_str() {
+            "pending" => WorkflowStatus::Pending,
+            "active" => WorkflowStatus::Active,
+            "awaiting_approval" => WorkflowStatus::AwaitingApproval,
+            "approved" => WorkflowStatus::Approved,
+            "completed" => WorkflowStatus::Completed,
+            "failed" => WorkflowStatus::Failed,
+            "cancelled" => WorkflowStatus::Cancelled,
+            _ => WorkflowStatus::Failed,
+        };
+
+        Ok(WorkflowRun {
+            run_id: run_id.to_string(),
+            kind: row.0,
+            status,
+            goal_id: row.2,
+            params_json: row.3,
+            created_at: row.4,
+            updated_at: row.5,
+        })
+    }
+
+    pub fn save_workflow_artifact(
+        &self,
+        id: &str,
+        run_id: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<WorkflowArtifact, StoreError> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+
+        conn.execute(
+            r#"
+            INSERT INTO workflow_artifacts (id, run_id, kind, digest, content, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![id, run_id, kind, digest, content, now],
+        )?;
+
+        Ok(WorkflowArtifact {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
+            kind: kind.to_string(),
+            digest,
+            content: content.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn get_workflow_artifact(&self, id: &str) -> Result<WorkflowArtifact, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: (String, String, String, String, i64) = conn
+            .query_row(
+                "SELECT run_id, kind, digest, content, created_at FROM workflow_artifacts WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("Workflow artifact '{}' not found", id)))?;
+
+        // Verify SHA-256 digest integrity
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(row.3.as_bytes());
+        let actual_digest = format!("{:x}", hasher.finalize());
+        if actual_digest != row.2 {
+            return Err(StoreError::Db(rusqlite::Error::InvalidQuery));
+        }
+
+        Ok(WorkflowArtifact {
+            id: id.to_string(),
+            run_id: row.0,
+            kind: row.1,
+            digest: row.2,
+            content: row.3,
+            created_at: row.4,
+        })
+    }
 }
 
 #[cfg(test)]

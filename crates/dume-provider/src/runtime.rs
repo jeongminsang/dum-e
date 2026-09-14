@@ -51,20 +51,67 @@ impl ResolvedProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
+        self.stream_with_context(messages, tools, None, tx).await
+    }
+
+    pub async fn stream_with_context(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<()> {
         let model = &self.model.id;
         match &self.transport {
             Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
                 p.stream(model, messages, tools, tx).await
             }
-            Transport::OpenAi(p) => p.stream(model, messages, tools, tx).await,
+            Transport::OpenAi(p) => {
+                p.stream_with_context(model, messages, tools, context, tx)
+                    .await
+            }
             Transport::Codex(p) => p.stream(model, messages, tools, tx).await,
             Transport::Google(p) => p.stream(model, messages, tools, tx).await,
         }
     }
 }
 
+/// Check if a provider and its wire protocol (api) are supported by local execution transports.
+pub fn is_transport_supported(provider: &str, api: &str) -> bool {
+    match provider {
+        "anthropic" => api == "anthropic-messages" || api.is_empty(),
+        "openai" => api == "openai-responses" || api == "openai-completions" || api.is_empty(),
+        "openai-codex" => {
+            api == "openai-codex-responses" || api == "openai-responses" || api.is_empty()
+        }
+        "google" => api == "google-generative-ai" || api.is_empty(),
+        "opencode" => {
+            api == "openai-completions"
+                || api == "openai-responses"
+                || api == "anthropic-messages"
+                || api == "google-generative-ai"
+                || api.is_empty()
+        }
+        "opencode-go" => {
+            api == "openai-completions"
+                || api == "openai-responses"
+                || api == "anthropic-messages"
+                || api.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Check if a catalog model info is supported by local execution transports.
+pub fn is_model_supported(model: &ModelInfo) -> bool {
+    is_transport_supported(&model.provider, &model.api)
+}
+
 fn supported(provider: &str) -> bool {
-    matches!(provider, "anthropic" | "openai" | "openai-codex" | "google")
+    matches!(
+        provider,
+        "anthropic" | "openai" | "openai-codex" | "google" | "opencode" | "opencode-go"
+    )
 }
 
 /// Resolve only supported catalog entries, independently of available credentials.
@@ -88,7 +135,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
     let mut matches: Vec<_> = ModelCatalog::list_all_builtin_models()?
         .into_iter()
         .filter(|model| {
-            supported(&model.provider)
+            is_model_supported(model)
                 && model.id == id
                 && provider.is_none_or(|provider| model.provider == provider)
         })
@@ -97,6 +144,25 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
         !matches.is_empty(),
         "Unknown supported model '{selection}'; select a catalog provider/model"
     );
+    if matches.len() > 1 && provider.is_none() {
+        // Tie-breaker: if query is unqualified (e.g. 'claude-sonnet-4-5'), prefer the primary native provider
+        // (anthropic, openai, openai-codex, google) over proxy/reseller catalogs (opencode, opencode-go).
+        let native_matches: Vec<_> = matches
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.provider.as_str(),
+                    "anthropic" | "openai" | "openai-codex" | "google"
+                )
+            })
+            .cloned()
+            .collect();
+        if native_matches.len() == 1 {
+            return Ok(native_matches.into_iter().next().unwrap());
+        } else if !native_matches.is_empty() {
+            matches = native_matches;
+        }
+    }
     if matches.len() > 1 {
         let choices = matches
             .iter()
@@ -163,6 +229,29 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             credential.key.as_deref(),
             "API key",
         )?)),
+        ("opencode" | "opencode-go", "api_key") => {
+            let key = required(credential.key.as_deref(), "API key")?;
+            let default_base = if model.provider == "opencode-go" {
+                "https://opencode.ai/zen/go/v1"
+            } else {
+                "https://opencode.ai/zen/v1"
+            };
+            let base_url = model.base_url.as_deref().unwrap_or(default_base);
+            match model.api.as_str() {
+                "openai-completions" | "" => {
+                    let is_free = model.is_free_model();
+                    Transport::OpenAi(
+                        OpenAiProvider::new(&key)
+                            .with_base_url(base_url)
+                            .with_opencode_profile(is_free),
+                    )
+                }
+                api => anyhow::bail!(
+                    "Unsupported OpenCode API protocol '{api}' for {}; only openai-completions is currently supported",
+                    model.provider
+                ),
+            }
+        }
         _ => anyhow::bail!(
             "Unsupported credential type '{}' for {}; OpenAI OAuth requires openai-codex/model",
             credential.cred_type,
@@ -170,6 +259,106 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
         ),
     };
     Ok(ResolvedProvider { model, transport })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AgentRole {
+    Default,
+    Planner,
+    Architect,
+    Executor,
+    Critic,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoleModelProfile {
+    pub role: AgentRole,
+    pub candidate_models: Vec<String>,
+}
+
+impl RoleModelProfile {
+    pub fn default_for(role: AgentRole) -> Self {
+        let candidates = match role {
+            AgentRole::Default => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/gpt-4o".into(),
+                "opencode/claude-sonnet-4-5".into(),
+            ],
+            AgentRole::Planner => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-opus-4".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/o3-mini".into(),
+            ],
+            AgentRole::Architect => vec![
+                "anthropic/claude-opus-4".into(),
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai/gpt-4o".into(),
+            ],
+            AgentRole::Executor => vec![
+                "anthropic/claude-sonnet-4-5".into(),
+                "openai-codex/gpt-5.6-luna".into(),
+                "opencode/claude-sonnet-4-5".into(),
+                "google/gemini-2.5-pro".into(),
+            ],
+            AgentRole::Critic => vec![
+                "openai-codex/gpt-5.6-luna".into(),
+                "anthropic/claude-opus-4".into(),
+                "openai/o1".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+            ],
+        };
+        Self {
+            role,
+            candidate_models: candidates,
+        }
+    }
+}
+
+pub async fn resolve_role_provider(
+    role: AgentRole,
+    override_model: Option<&str>,
+    store: &CredentialStore,
+) -> Result<ResolvedProvider> {
+    if let Some(m) = override_model {
+        if !m.trim().is_empty() {
+            if let Ok(p) = resolve_provider(m, store).await {
+                return Ok(p);
+            }
+        }
+    }
+
+    let profile = RoleModelProfile::default_for(role);
+    let mut last_err = None;
+
+    for candidate in &profile.candidate_models {
+        match resolve_provider(candidate, store).await {
+            Ok(provider) => return Ok(provider),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // If role candidates failed, attempt fallback to any authenticated supported model
+    let all = ModelCatalog::list_all_builtin_models().unwrap_or_default();
+    for m in all {
+        if is_model_supported(&m) && store.has_credential(&m.provider) {
+            let qualified = format!("{}/{}", m.provider, m.id);
+            if let Ok(provider) = resolve_provider(&qualified, store).await {
+                return Ok(provider);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "No authenticated provider model available for role {:?}",
+            role
+        )
+    }))
 }
 
 #[cfg(test)]
@@ -370,5 +559,45 @@ mod tests {
         std::fs::write(&path, "{").unwrap();
         let error = resolve_provider(selection, &store).await.err().unwrap();
         assert!(format!("{error:#}").contains("Malformed credential store"));
+    }
+
+    #[test]
+    fn test_transport_capability_matching() {
+        assert!(is_transport_supported("anthropic", "anthropic-messages"));
+        assert!(!is_transport_supported("anthropic", "unknown-protocol"));
+        assert!(is_transport_supported("openai", "openai-responses"));
+        assert!(is_transport_supported("openai", "openai-completions"));
+        assert!(is_transport_supported(
+            "openai-codex",
+            "openai-codex-responses"
+        ));
+        assert!(is_transport_supported("google", "google-generative-ai"));
+        assert!(is_transport_supported("opencode", "openai-completions"));
+        assert!(is_transport_supported("opencode-go", "openai-responses"));
+        assert!(!is_transport_supported("bedrock", "bedrock-runtime"));
+
+        let claude = resolve_model("claude-sonnet-4-5").unwrap();
+        assert_eq!(claude.api, "anthropic-messages");
+        assert!(is_model_supported(&claude));
+
+        let opencode_model = resolve_model("opencode/big-pickle").unwrap();
+        assert_eq!(opencode_model.provider, "opencode");
+        assert!(is_model_supported(&opencode_model));
+    }
+
+    #[test]
+    fn opencode_bind_credential_configures_transport() {
+        let mut model = resolve_model("opencode/nemotron-3.5-lightning-free").unwrap();
+        let cred = credential("api_key");
+        let resolved = bind_credential(model.clone(), cred.clone()).unwrap();
+        assert!(matches!(resolved.transport, Transport::OpenAi(_)));
+
+        // Non-supported protocol on opencode rejects cleanly
+        model.api = "anthropic-messages".to_string();
+        let err = bind_credential(model, cred).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("only openai-completions is currently supported")
+        );
     }
 }
