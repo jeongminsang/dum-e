@@ -2,6 +2,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelCost {
+    #[serde(default)]
+    pub input: Option<f64>,
+    #[serde(default)]
+    pub output: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -19,6 +27,25 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     #[serde(rename = "maxTokens", default)]
     pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost: Option<ModelCost>,
+}
+
+impl ModelInfo {
+    pub fn is_free_model(&self) -> bool {
+        if self.id.ends_with("-free") {
+            return true;
+        }
+        if self.id == "big-pickle" {
+            return true;
+        }
+        if let Some(cost) = &self.cost {
+            if cost.input == Some(0.0) && cost.output == Some(0.0) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct ModelCatalog;

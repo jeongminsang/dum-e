@@ -117,3 +117,49 @@ pub enum StreamEvent {
     Error(String),
 }
 
+/// Request and session context for model invocations.
+/// Transports that require session tracking (e.g. OpenCode) use these fields,
+/// while other transports ignore them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRequestContext {
+    pub session_id: String,
+    pub request_id: String,
+}
+
+impl StreamRequestContext {
+    /// Create a new session context with fresh random opaque session and request IDs.
+    pub fn new() -> Self {
+        Self {
+            session_id: Self::generate_opaque_id(),
+            request_id: Self::generate_opaque_id(),
+        }
+    }
+
+    /// Create a new request context for an existing session with a new opaque request ID.
+    pub fn for_session(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            request_id: Self::generate_opaque_id(),
+        }
+    }
+
+    /// Produce a new request context retaining the current session ID but with a fresh request ID.
+    pub fn next_request(&self) -> Self {
+        Self {
+            session_id: self.session_id.clone(),
+            request_id: Self::generate_opaque_id(),
+        }
+    }
+
+    fn generate_opaque_id() -> String {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("Failed to generate random bytes for request context");
+        hex::encode(bytes)
+    }
+}
+
+impl Default for StreamRequestContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}

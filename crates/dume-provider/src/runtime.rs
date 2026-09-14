@@ -51,12 +51,25 @@ impl ResolvedProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
+        self.stream_with_context(messages, tools, None, tx).await
+    }
+
+    pub async fn stream_with_context(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<()> {
         let model = &self.model.id;
         match &self.transport {
             Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
                 p.stream(model, messages, tools, tx).await
             }
-            Transport::OpenAi(p) => p.stream(model, messages, tools, tx).await,
+            Transport::OpenAi(p) => {
+                p.stream_with_context(model, messages, tools, context, tx)
+                    .await
+            }
             Transport::Codex(p) => p.stream(model, messages, tools, tx).await,
             Transport::Google(p) => p.stream(model, messages, tools, tx).await,
         }
@@ -68,7 +81,9 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
     match provider {
         "anthropic" => api == "anthropic-messages" || api.is_empty(),
         "openai" => api == "openai-responses" || api == "openai-completions" || api.is_empty(),
-        "openai-codex" => api == "openai-codex-responses" || api == "openai-responses" || api.is_empty(),
+        "openai-codex" => {
+            api == "openai-codex-responses" || api == "openai-responses" || api.is_empty()
+        }
         "google" => api == "google-generative-ai" || api.is_empty(),
         "opencode" => {
             api == "openai-completions"
@@ -134,7 +149,12 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
         // (anthropic, openai, openai-codex, google) over proxy/reseller catalogs (opencode, opencode-go).
         let native_matches: Vec<_> = matches
             .iter()
-            .filter(|m| matches!(m.provider.as_str(), "anthropic" | "openai" | "openai-codex" | "google"))
+            .filter(|m| {
+                matches!(
+                    m.provider.as_str(),
+                    "anthropic" | "openai" | "openai-codex" | "google"
+                )
+            })
             .cloned()
             .collect();
         if native_matches.len() == 1 {
@@ -218,15 +238,18 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             };
             let base_url = model.base_url.as_deref().unwrap_or(default_base);
             match model.api.as_str() {
-                "anthropic-messages" => {
-                    Transport::Anthropic(AnthropicProvider::new(&key).with_base_url(base_url))
+                "openai-completions" | "" => {
+                    let is_free = model.is_free_model();
+                    Transport::OpenAi(
+                        OpenAiProvider::new(&key)
+                            .with_base_url(base_url)
+                            .with_opencode_profile(is_free),
+                    )
                 }
-                "google-generative-ai" => {
-                    Transport::Google(GeminiProvider::new(&key))
-                }
-                _ => {
-                    Transport::OpenAi(OpenAiProvider::new(&key).with_base_url(base_url))
-                }
+                api => anyhow::bail!(
+                    "Unsupported OpenCode API protocol '{api}' for {}; only openai-completions is currently supported",
+                    model.provider
+                ),
             }
         }
         _ => anyhow::bail!(
@@ -544,7 +567,10 @@ mod tests {
         assert!(!is_transport_supported("anthropic", "unknown-protocol"));
         assert!(is_transport_supported("openai", "openai-responses"));
         assert!(is_transport_supported("openai", "openai-completions"));
-        assert!(is_transport_supported("openai-codex", "openai-codex-responses"));
+        assert!(is_transport_supported(
+            "openai-codex",
+            "openai-codex-responses"
+        ));
         assert!(is_transport_supported("google", "google-generative-ai"));
         assert!(is_transport_supported("opencode", "openai-completions"));
         assert!(is_transport_supported("opencode-go", "openai-responses"));
@@ -557,5 +583,21 @@ mod tests {
         let opencode_model = resolve_model("opencode/big-pickle").unwrap();
         assert_eq!(opencode_model.provider, "opencode");
         assert!(is_model_supported(&opencode_model));
+    }
+
+    #[test]
+    fn opencode_bind_credential_configures_transport() {
+        let mut model = resolve_model("opencode/nemotron-3.5-lightning-free").unwrap();
+        let cred = credential("api_key");
+        let resolved = bind_credential(model.clone(), cred.clone()).unwrap();
+        assert!(matches!(resolved.transport, Transport::OpenAi(_)));
+
+        // Non-supported protocol on opencode rejects cleanly
+        model.api = "anthropic-messages".to_string();
+        let err = bind_credential(model, cred).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("only openai-completions is currently supported")
+        );
     }
 }
