@@ -1,4 +1,4 @@
-use crate::theme::{Theme, rainbow_color};
+use crate::theme::Theme;
 use dume_provider::types::{ChatMessage, Role};
 use dume_store::RecentSessionSummary;
 use ratatui::Frame;
@@ -353,9 +353,7 @@ pub fn render_input_bar(
         " Prompt (Enter to submit, ↑/↓ for history, Esc to clear, Ctrl+C to exit) "
     };
 
-    let border_color = if is_busy {
-        rainbow_color(anim_tick)
-    } else if is_exit_warned {
+    let border_color = if is_exit_warned {
         theme.accent
     } else {
         theme.border_focused
@@ -363,18 +361,14 @@ pub fn render_input_bar(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color).add_modifier(if is_busy {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        }))
+        .border_style(Style::default().fg(border_color))
         .title(title);
 
     let paragraph = Paragraph::new(Line::from(vec![
         Span::styled(
             "> ",
             Style::default()
-                .fg(if is_busy { border_color } else { theme.accent })
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(input_buffer, Style::default().fg(theme.foreground)),
@@ -382,6 +376,39 @@ pub fn render_input_bar(
     .block(block);
 
     f.render_widget(paragraph, area);
+
+    // If working, render a traveling dot (•) orbiting the input border perimeter
+    if is_busy && area.width >= 2 && area.height >= 2 {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let perimeter = 2 * (w + h) - 4;
+        if perimeter > 0 {
+            let pos = anim_tick % perimeter;
+            let (dx, dy) = if pos < w {
+                // Top border: left to right
+                (pos, 0)
+            } else if pos < w + h - 1 {
+                // Right border: top to bottom
+                (w - 1, pos - (w - 1))
+            } else if pos < 2 * w + h - 2 {
+                // Bottom border: right to left
+                (w - 1 - (pos - (w + h - 1)), h - 1)
+            } else {
+                // Left border: bottom to top
+                (0, h - 1 - (pos - (2 * w + h - 2)))
+            };
+
+            let dot_x = area.x + dx as u16;
+            let dot_y = area.y + dy as u16;
+            let buf = f.buffer_mut();
+            if dot_x < buf.area.width && dot_y < buf.area.height {
+                if let Some(cell) = buf.cell_mut((dot_x, dot_y)) {
+                    cell.set_symbol("•");
+                    cell.set_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+                }
+            }
+        }
+    }
 
     // Position cursor based on visual display width of characters before cursor
     let prefix_width: usize = input_buffer
