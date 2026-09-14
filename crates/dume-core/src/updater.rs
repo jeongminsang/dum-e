@@ -68,6 +68,31 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+/// Resolves an ambient GitHub token from environment variables or the `gh` CLI.
+pub fn resolve_ambient_github_token() -> Option<String> {
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Fall back to local `gh auth token` if available
+    let output = Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    None
+}
+
 /// Checks GitHub Releases for updates without blocking or stalling if network fails.
 pub fn check_for_update(repo: &str, current_version: &str) -> Result<Option<UpdateInfo>> {
     let platform = detect_platform()?;
@@ -85,10 +110,8 @@ pub fn check_for_update(repo: &str, current_version: &str) -> Result<Option<Upda
         "User-Agent: dume-updater",
     ]);
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            cmd.args(["-H", &format!("Authorization: Bearer {}", token.trim())]);
-        }
+    if let Some(token) = resolve_ambient_github_token() {
+        cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
     }
 
     cmd.arg(&url);
@@ -156,10 +179,8 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
         "User-Agent: dume-updater",
     ]);
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            cmd.args(["-H", &format!("Authorization: Bearer {}", token.trim())]);
-        }
+    if let Some(token) = resolve_ambient_github_token() {
+        cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
     }
 
     cmd.args(["-o", dest.to_str().context("Invalid destination path")?, url]);
