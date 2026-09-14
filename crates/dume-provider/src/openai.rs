@@ -99,12 +99,6 @@ impl OpenAiProvider {
                 .map(|v| v.trim() == "1")
                 .unwrap_or(false);
 
-            if profile.is_free_model && !free_compat_enabled {
-                bail!(
-                    "This OpenCode Zen free model requires the experimental DUME_OPENCODE_FREE_COMPAT=1 compatibility mode."
-                );
-            }
-
             let default_ctx;
             let ctx = match context {
                 Some(ctx) => ctx,
@@ -114,7 +108,7 @@ impl OpenAiProvider {
                 }
             };
 
-            if profile.is_free_model && free_compat_enabled {
+            if profile.is_free_model || free_compat_enabled {
                 headers.insert(USER_AGENT, HeaderValue::from_static("opencode"));
                 headers.insert(
                     HeaderName::from_static("x-opencode-client"),
@@ -421,40 +415,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_free_model_fails_when_compat_disabled() {
+    async fn opencode_free_model_works_without_compat_env() {
         unsafe {
             std::env::remove_var("DUME_OPENCODE_FREE_COMPAT");
         }
-        let (tx, _rx) = mpsc::channel(8);
-        let provider = OpenAiProvider::new("zen-key")
-            .with_base_url("http://127.0.0.1:9")
-            .with_opencode_profile(true);
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]})
+        );
+        let (url, server) = crate::codex::tests::fixture(sse);
+        let (tx, mut rx) = mpsc::channel(8);
 
-        let res = provider
-            .stream("opencode/nemotron-3.5-lightning-free", &[], &[], tx)
-            .await;
-        assert!(res.is_err());
-        let err_msg = res.unwrap_err().to_string();
-        assert!(err_msg.contains("This OpenCode Zen free model requires the experimental DUME_OPENCODE_FREE_COMPAT=1 compatibility mode."));
-    }
+        let ctx = StreamRequestContext {
+            session_id: "free-sess-default".to_string(),
+            request_id: "free-req-default".to_string(),
+        };
 
-    #[tokio::test]
-    async fn opencode_free_model_fails_with_invalid_compat_value() {
-        unsafe {
-            std::env::set_var("DUME_OPENCODE_FREE_COMPAT", "true");
-        }
-        let (tx, _rx) = mpsc::channel(8);
-        let provider = OpenAiProvider::new("zen-key")
-            .with_base_url("http://127.0.0.1:9")
-            .with_opencode_profile(true);
+        OpenAiProvider::new("zen-key")
+            .with_base_url(&url)
+            .with_opencode_profile(true)
+            .stream_with_context(
+                "nemotron-free",
+                &[ChatMessage::user("Hi")],
+                &[],
+                Some(&ctx),
+                tx,
+            )
+            .await
+            .unwrap();
 
-        let res = provider
-            .stream("opencode/nemotron-3.5-lightning-free", &[], &[], tx)
-            .await;
-        assert!(res.is_err());
-        unsafe {
-            std::env::remove_var("DUME_OPENCODE_FREE_COMPAT");
-        }
+        let (headers, _body) = server.join().unwrap();
+        assert!(headers.contains("user-agent: opencode"));
+        assert!(headers.contains("x-opencode-client: desktop"));
+        assert!(headers.contains("x-opencode-project: global"));
+        assert!(headers.contains("x-opencode-session: free-sess-default"));
+        assert!(headers.contains("x-opencode-request: free-req-default"));
+        assert_eq!(rx.recv().await, Some(StreamEvent::TextDelta("ok".into())));
     }
 
     #[tokio::test]
