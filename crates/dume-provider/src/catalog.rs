@@ -7,6 +7,8 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub provider: String,
+    #[serde(default)]
+    pub api: String,
     #[serde(rename = "baseUrl", default)]
     pub base_url: Option<String>,
     #[serde(default)]

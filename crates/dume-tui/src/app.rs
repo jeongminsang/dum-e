@@ -1014,8 +1014,11 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                             let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
 
-                                            // Filter only models whose provider is authenticated
+                                            // Filter only models whose provider is supported and authenticated
                                             let models: Vec<_> = all_builtin.into_iter().filter(|m| {
+                                                if !dume_provider::is_model_supported(m) {
+                                                    return false;
+                                                }
                                                 match m.provider.as_str() {
                                                     "anthropic" => has_anthropic,
                                                     "openai" => has_openai,

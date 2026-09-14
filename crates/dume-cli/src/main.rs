@@ -204,6 +204,9 @@ async fn main() -> Result<()> {
             );
             println!("{}", "-".repeat(80));
             for m in all {
+                if !dume_provider::is_model_supported(&m) {
+                    continue;
+                }
                 if let Some(ref p) = provider {
                     if !m
                         .provider

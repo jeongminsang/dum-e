@@ -114,9 +114,26 @@ impl CredentialStore {
             .unwrap_or_else(|| Path::new("."))
     }
 
+    fn ensure_parent_dir(&self) -> Result<()> {
+        let parent = self.parent();
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(parent) {
+                let mut permissions = metadata.permissions();
+                if permissions.mode() & 0o077 != 0 {
+                    permissions.set_mode(0o700);
+                    let _ = fs::set_permissions(parent, permissions);
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Stable sidecar inode: never unlink it; replacing the credential file cannot invalidate this lock.
     fn open_lock(&self) -> Result<File> {
-        fs::create_dir_all(self.parent())?;
+        self.ensure_parent_dir()?;
         let mut path = self.file_path.as_os_str().to_os_string();
         path.push(".lock");
         let mut options = OpenOptions::new();
@@ -390,5 +407,24 @@ mod tests {
         assert_eq!(new.refresh_token, old.refresh_token);
         assert_eq!(new.account_id, old.account_id);
         assert!(!format!("{new:?}").contains("refresh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_credential_store_file_and_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("secure_sub");
+        let path = sub.join("auth.json");
+        let store = CredentialStore::new(&path);
+
+        store.save_credential("anthropic", "sk-ant-test").unwrap();
+
+        let dir_perm = fs::metadata(&sub).unwrap().permissions().mode();
+        assert_eq!(dir_perm & 0o077, 0, "Directory permissions should not be world or group accessible: {:o}", dir_perm);
+
+        let file_perm = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(file_perm & 0o077, 0, "File permissions should not be world or group accessible: {:o}", file_perm);
     }
 }

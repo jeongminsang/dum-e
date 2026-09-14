@@ -63,6 +63,22 @@ impl ResolvedProvider {
     }
 }
 
+/// Check if a provider and its wire protocol (api) are supported by local execution transports.
+pub fn is_transport_supported(provider: &str, api: &str) -> bool {
+    match provider {
+        "anthropic" => api == "anthropic-messages" || api.is_empty(),
+        "openai" => api == "openai-responses" || api == "openai-completions" || api.is_empty(),
+        "openai-codex" => api == "openai-codex-responses" || api == "openai-responses" || api.is_empty(),
+        "google" => api == "google-generative-ai" || api.is_empty(),
+        _ => false,
+    }
+}
+
+/// Check if a catalog model info is supported by local execution transports.
+pub fn is_model_supported(model: &ModelInfo) -> bool {
+    is_transport_supported(&model.provider, &model.api)
+}
+
 fn supported(provider: &str) -> bool {
     matches!(provider, "anthropic" | "openai" | "openai-codex" | "google")
 }
@@ -88,7 +104,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
     let mut matches: Vec<_> = ModelCatalog::list_all_builtin_models()?
         .into_iter()
         .filter(|model| {
-            supported(&model.provider)
+            is_model_supported(model)
                 && model.id == id
                 && provider.is_none_or(|provider| model.provider == provider)
         })
@@ -370,5 +386,20 @@ mod tests {
         std::fs::write(&path, "{").unwrap();
         let error = resolve_provider(selection, &store).await.err().unwrap();
         assert!(format!("{error:#}").contains("Malformed credential store"));
+    }
+
+    #[test]
+    fn test_transport_capability_matching() {
+        assert!(is_transport_supported("anthropic", "anthropic-messages"));
+        assert!(!is_transport_supported("anthropic", "unknown-protocol"));
+        assert!(is_transport_supported("openai", "openai-responses"));
+        assert!(is_transport_supported("openai", "openai-completions"));
+        assert!(is_transport_supported("openai-codex", "openai-codex-responses"));
+        assert!(is_transport_supported("google", "google-generative-ai"));
+        assert!(!is_transport_supported("bedrock", "bedrock-runtime"));
+
+        let claude = resolve_model("claude-sonnet-4-5").unwrap();
+        assert_eq!(claude.api, "anthropic-messages");
+        assert!(is_model_supported(&claude));
     }
 }
