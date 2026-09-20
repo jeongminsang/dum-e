@@ -297,12 +297,18 @@ impl OpenAiProvider {
                                 .get("total_tokens")
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(input_tokens + output_tokens);
+                            let cache_read_tokens = usage
+                                .get("prompt_tokens_details")
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(|v| v.as_i64());
                             if input_tokens > 0 || output_tokens > 0 || total_tokens > 0 {
                                 let _ = tx
                                     .send(StreamEvent::Usage(TokenUsage {
                                         input_tokens,
                                         output_tokens,
                                         total_tokens,
+                                        cache_read_tokens,
+                                        cache_write_tokens: None,
                                     }))
                                     .await;
                             }

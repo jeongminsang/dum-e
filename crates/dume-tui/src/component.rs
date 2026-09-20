@@ -8,25 +8,73 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub fn render_transcript(
-    f: &mut Frame,
-    area: Rect,
+fn wrap_text_line(prefix: &str, text: &str, width: usize) -> Vec<String> {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available_width = width.saturating_sub(prefix_width).max(1);
+    let mut wrapped = Vec::new();
+
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for word in text.split_inclusive(char::is_whitespace) {
+        let word_width = UnicodeWidthStr::width(word);
+        if current_width + word_width <= available_width {
+            current_line.push_str(word);
+            current_width += word_width;
+        } else {
+            if !current_line.is_empty() {
+                wrapped.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            }
+            if word_width <= available_width {
+                current_line.push_str(word);
+                current_width += word_width;
+            } else {
+                // Word is longer than available width, break by characters
+                for ch in word.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_width + ch_width <= available_width {
+                        current_line.push(ch);
+                        current_width += ch_width;
+                    } else {
+                        if !current_line.is_empty() {
+                            wrapped.push(current_line);
+                            current_line = String::new();
+                            current_width = 0;
+                        }
+                        current_line.push(ch);
+                        current_width += ch_width;
+                    }
+                }
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        wrapped.push(current_line);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+pub fn build_transcript_lines(
     messages: &[ChatMessage],
     streaming_text: &str,
-    scroll_offset: u16,
     recent_sessions: &[RecentSessionSummary],
+    effective_width: usize,
     theme: &Theme,
-) {
-    let title = format!(" DUM-E Agent Session (v{}) ", env!("CARGO_PKG_VERSION"));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .title(title);
-
+) -> (Vec<Line<'static>>, Vec<bool>) {
     let mut lines = Vec::new();
+    let mut is_user_logical_line = Vec::new();
 
     if messages.is_empty() && streaming_text.is_empty() {
         lines.push(Line::from(""));
+        is_user_logical_line.push(false);
         lines.push(Line::from(vec![
             Span::styled(
                 "   ⚡ ",
@@ -45,10 +93,12 @@ pub fn render_transcript(
                 Style::default().fg(theme.border_focused),
             ),
         ]));
+        is_user_logical_line.push(false);
         lines.push(Line::from(Span::styled(
             "   ──────────────────────────────────────────────────────────",
             Style::default().fg(theme.border),
         )));
+        is_user_logical_line.push(false);
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Press ", Style::default().fg(theme.foreground)),
@@ -63,6 +113,7 @@ pub fn render_transcript(
                 Style::default().fg(theme.foreground),
             ),
         ]));
+        is_user_logical_line.push(false);
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Type ", Style::default().fg(theme.foreground)),
@@ -77,6 +128,7 @@ pub fn render_transcript(
                 Style::default().fg(theme.foreground),
             ),
         ]));
+        is_user_logical_line.push(false);
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Type ", Style::default().fg(theme.foreground)),
@@ -91,6 +143,7 @@ pub fn render_transcript(
                 Style::default().fg(theme.foreground),
             ),
         ]));
+        is_user_logical_line.push(false);
         lines.push(Line::from(vec![
             Span::styled("   • ", Style::default().fg(theme.accent)),
             Span::styled("Press ", Style::default().fg(theme.foreground)),
@@ -105,7 +158,9 @@ pub fn render_transcript(
                 Style::default().fg(theme.foreground),
             ),
         ]));
+        is_user_logical_line.push(false);
         lines.push(Line::from(""));
+        is_user_logical_line.push(false);
 
         // Recent sessions overview section
         if !recent_sessions.is_empty() {
@@ -115,10 +170,12 @@ pub fn render_transcript(
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )]));
+            is_user_logical_line.push(false);
             lines.push(Line::from(Span::styled(
                 "   ──────────────────────────────────────────────────────────",
                 Style::default().fg(theme.border),
             )));
+            is_user_logical_line.push(false);
 
             let max_display = recent_sessions.len().min(5);
             for s in &recent_sessions[..max_display] {
@@ -149,48 +206,52 @@ pub fn render_transcript(
                     ),
                     Span::styled(preview_truncated, Style::default().fg(theme.foreground)),
                 ]));
+                is_user_logical_line.push(false);
             }
             lines.push(Line::from(""));
+            is_user_logical_line.push(false);
         }
     } else {
         for msg in messages {
             match msg.role {
                 Role::User => {
-                    // User prompt block: full-width horizontal bar highlight without 'user' text tag
+                    // User prompt block: top and bottom padding lines
+                    lines.push(Line::from(""));
+                    is_user_logical_line.push(true);
                     for line in msg.content.lines() {
-                        let line_display_width = UnicodeWidthStr::width(line);
-                        let total_pad = (area.width.saturating_sub(4) as usize)
-                            .saturating_sub(line_display_width);
-                        let padding_spaces = " ".repeat(total_pad);
-                        lines.push(
-                            Line::from(vec![
-                                Span::styled(" ", Style::default().bg(theme.user_msg_bg)),
+                        let wrapped = wrap_text_line("  ", line, effective_width);
+                        for w in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::raw("  "),
                                 Span::styled(
-                                    line,
+                                    w,
                                     Style::default()
                                         .fg(theme.user_msg)
-                                        .add_modifier(Modifier::BOLD)
-                                        .bg(theme.user_msg_bg),
+                                        .add_modifier(Modifier::BOLD),
                                 ),
-                                Span::styled(
-                                    padding_spaces,
-                                    Style::default().bg(theme.user_msg_bg),
-                                ),
-                            ])
-                            .style(Style::default().bg(theme.user_msg_bg)),
-                        );
+                            ]));
+                            is_user_logical_line.push(true);
+                        }
                     }
                     lines.push(Line::from(""));
+                    is_user_logical_line.push(true);
+                    lines.push(Line::from(""));
+                    is_user_logical_line.push(false);
                 }
                 Role::Assistant => {
                     // Assistant response block: clean plain output without 'dum-e' tag
                     for line in msg.content.lines() {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(line, Style::default().fg(theme.foreground)),
-                        ]));
+                        let wrapped = wrap_text_line("  ", line, effective_width);
+                        for w in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::raw("  "),
+                                Span::styled(w, Style::default().fg(theme.foreground)),
+                            ]));
+                            is_user_logical_line.push(false);
+                        }
                     }
                     lines.push(Line::from(""));
+                    is_user_logical_line.push(false);
                 }
                 Role::Tool => {
                     // Tool call / execution output block
@@ -203,13 +264,19 @@ pub fn render_transcript(
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
+                    is_user_logical_line.push(false);
                     for line in msg.content.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(theme.border)),
-                            Span::styled(line, Style::default().fg(theme.status_bar_fg)),
-                        ]));
+                        let wrapped = wrap_text_line("│ ", line, effective_width);
+                        for w in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::styled("│ ", Style::default().fg(theme.border)),
+                                Span::styled(w, Style::default().fg(theme.status_bar_fg)),
+                            ]));
+                            is_user_logical_line.push(false);
+                        }
                     }
                     lines.push(Line::from(""));
+                    is_user_logical_line.push(false);
                 }
                 Role::System => {
                     // Notice banner format rather than plain conversational chat
@@ -221,13 +288,19 @@ pub fn render_transcript(
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
+                    is_user_logical_line.push(false);
                     for line in msg.content.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("  │ ", Style::default().fg(theme.system_msg)),
-                            Span::styled(line, Style::default().fg(theme.foreground)),
-                        ]));
+                        let wrapped = wrap_text_line("  │ ", line, effective_width);
+                        for w in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::styled("  │ ", Style::default().fg(theme.system_msg)),
+                                Span::styled(w, Style::default().fg(theme.foreground)),
+                            ]));
+                            is_user_logical_line.push(false);
+                        }
                     }
                     lines.push(Line::from(""));
+                    is_user_logical_line.push(false);
                 }
             }
         }
@@ -235,10 +308,14 @@ pub fn render_transcript(
         // Streaming text (in progress)
         if !streaming_text.is_empty() {
             for line in streaming_text.lines() {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(line, Style::default().fg(theme.foreground)),
-                ]));
+                let wrapped = wrap_text_line("  ", line, effective_width);
+                for w in wrapped {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(w, Style::default().fg(theme.foreground)),
+                    ]));
+                    is_user_logical_line.push(false);
+                }
             }
             // Streaming cursor indicator
             lines.push(Line::from(vec![
@@ -250,15 +327,47 @@ pub fn render_transcript(
                         .add_modifier(Modifier::RAPID_BLINK),
                 ),
             ]));
+            is_user_logical_line.push(false);
         }
     }
 
+    (lines, is_user_logical_line)
+}
+
+pub fn render_transcript(
+    f: &mut Frame,
+    area: Rect,
+    messages: &[ChatMessage],
+    streaming_text: &str,
+    scroll_offset: u16,
+    recent_sessions: &[RecentSessionSummary],
+    theme: &Theme,
+) {
+    let effective_width = area.width.max(1) as usize;
+    let (lines, is_user_logical_line) =
+        build_transcript_lines(messages, streaming_text, recent_sessions, effective_width, theme);
+
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset, 0));
 
     f.render_widget(paragraph, area);
+
+    // Apply user message background across all columns in visible user screen rows
+    // Since lines are pre-wrapped to effective_width, each line maps 1:1 to an absolute screen row
+    let scroll = scroll_offset as usize;
+    let buf = f.buffer_mut();
+    for row_offset in 0..area.height as usize {
+        let absolute_row = scroll + row_offset;
+        if is_user_logical_line.get(absolute_row).copied().unwrap_or(false) {
+            let y = area.y + row_offset as u16;
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(cell.style().bg(theme.user_msg_bg));
+                }
+            }
+        }
+    }
 }
 
 /// Calculate the total wrapped line count for the transcript given an inner area width.
@@ -268,72 +377,26 @@ pub fn calculate_transcript_height(
     streaming_text: &str,
     recent_sessions_count: usize,
 ) -> u16 {
+    let default_theme = Theme::default();
+    let dummy_sessions: Vec<RecentSessionSummary> = (0..recent_sessions_count)
+        .map(|i| RecentSessionSummary {
+            session_id: format!("{:08}", i),
+            preview: "preview".to_string(),
+            message_count: 0,
+            updated_at: 0,
+        })
+        .collect();
     let effective_width = width.max(1) as usize;
-    let mut total_lines: usize = 0;
-
-    if messages.is_empty() && streaming_text.is_empty() {
-        let base = 8;
-        let recent = if recent_sessions_count > 0 {
-            2 + recent_sessions_count.min(5) + 1
-        } else {
-            0
-        };
-        return (base + recent) as u16;
-    }
-
-    let prefix_indent = 2; // "  " or "│ "
-
-    for msg in messages {
-        match msg.role {
-            Role::User | Role::Assistant => {
-                // No extra header line
-                for line in msg.content.lines() {
-                    let line_len = prefix_indent + UnicodeWidthStr::width(line);
-                    let wrapped_count = (line_len + effective_width - 1) / effective_width;
-                    total_lines += wrapped_count.max(1);
-                }
-            }
-            Role::Tool => {
-                // 1 header line ("● tool execution")
-                total_lines += 1;
-                for line in msg.content.lines() {
-                    let line_len = prefix_indent + line.chars().count();
-                    let wrapped_count = (line_len + effective_width - 1) / effective_width;
-                    total_lines += wrapped_count.max(1);
-                }
-            }
-            Role::System => {
-                // 1 header line ("  [ NOTICE ]")
-                total_lines += 1;
-                for line in msg.content.lines() {
-                    let line_len = 4 + line.chars().count();
-                    let wrapped_count = (line_len + effective_width - 1) / effective_width;
-                    total_lines += wrapped_count.max(1);
-                }
-            }
-        }
-
-        if msg.content.is_empty() {
-            total_lines += 1;
-        }
-        // Blank line between message blocks
-        total_lines += 1;
-    }
-
-    if !streaming_text.is_empty() {
-        // Blinking cursor indicator line
-        total_lines += 1;
-        for line in streaming_text.lines() {
-            let line_len = prefix_indent + line.chars().count();
-            let wrapped_count = (line_len + effective_width - 1) / effective_width;
-            total_lines += wrapped_count.max(1);
-        }
-        // Blank line
-        total_lines += 1;
-    }
-
-    total_lines.min(u16::MAX as usize) as u16
+    let (lines, _) = build_transcript_lines(
+        messages,
+        streaming_text,
+        &dummy_sessions,
+        effective_width,
+        &default_theme,
+    );
+    lines.len().min(u16::MAX as usize) as u16
 }
+
 
 pub fn render_input_bar(
     f: &mut Frame,
@@ -364,16 +427,39 @@ pub fn render_input_bar(
         .border_style(Style::default().fg(border_color))
         .title(title);
 
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(input_buffer, Style::default().fg(theme.foreground)),
-    ]))
-    .block(block);
+    let (lines, cursor_y_offset) = if area.height >= 5 {
+        (
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(input_buffer, Style::default().fg(theme.foreground)),
+                ]),
+                Line::from(""),
+            ],
+            2,
+        )
+    } else {
+        (
+            vec![Line::from(vec![
+                Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(input_buffer, Style::default().fg(theme.foreground)),
+            ])],
+            1,
+        )
+    };
+
+    let paragraph = Paragraph::new(lines).block(block);
 
     f.render_widget(paragraph, area);
 
@@ -418,7 +504,7 @@ pub fn render_input_bar(
         .sum();
 
     let x = area.x + 3 + prefix_width as u16;
-    let y = area.y + 1;
+    let y = area.y + cursor_y_offset;
     if x < area.x + area.width - 1 && y < area.y + area.height {
         f.set_cursor_position((x, y));
     }

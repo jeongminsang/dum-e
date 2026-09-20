@@ -97,6 +97,24 @@ pub struct TokenUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<i64>,
+}
+
+impl TokenUsage {
+    pub fn accumulate(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+        if let Some(r) = other.cache_read_tokens {
+            *self.cache_read_tokens.get_or_insert(0) += r;
+        }
+        if let Some(w) = other.cache_write_tokens {
+            *self.cache_write_tokens.get_or_insert(0) += w;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

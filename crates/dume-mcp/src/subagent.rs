@@ -134,26 +134,24 @@ impl SubagentManager {
     }
 
     pub async fn await_subagent(&self, id: &str, timeout_ms: u64) -> Result<SubagentStatus> {
-        let start = tokio::time::Instant::now();
         let timeout = tokio::time::Duration::from_millis(timeout_ms);
+        let finished_token = {
+            let lock = self.subagents.lock().await;
+            let (_, _, finished) = lock
+                .get(id)
+                .with_context(|| format!("Subagent {} not found", id))?;
+            finished.clone()
+        };
 
-        loop {
-            if let Some(rec) = self.inspect_subagent(id).await {
-                match rec.status {
-                    SubagentStatus::Completed { .. }
-                    | SubagentStatus::Failed { .. }
-                    | SubagentStatus::Cancelled => return Ok(rec.status),
-                    SubagentStatus::Running => {}
-                }
-            } else {
-                anyhow::bail!("Subagent {} not found", id);
-            }
+        tokio::select! {
+            _ = finished_token.cancelled() => {}
+            _ = tokio::time::sleep(timeout) => {}
+        }
 
-            if start.elapsed() > timeout {
-                anyhow::bail!("Timeout awaiting subagent {}", id);
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        if let Some(rec) = self.inspect_subagent(id).await {
+            Ok(rec.status)
+        } else {
+            anyhow::bail!("Subagent {} not found", id);
         }
     }
 }
@@ -221,5 +219,19 @@ mod tests {
             mgr.inspect_subagent("child").await.unwrap().status,
             SubagentStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn test_subagent_await_timeout_returns_running() {
+        let mgr = SubagentManager::new();
+        mgr.start_subagent("sub_running", "slow task", |_token| async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            Ok("done".to_string())
+        })
+        .await
+        .unwrap();
+
+        let status = mgr.await_subagent("sub_running", 20).await.unwrap();
+        assert_eq!(status, SubagentStatus::Running);
     }
 }

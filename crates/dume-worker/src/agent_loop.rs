@@ -10,6 +10,57 @@ use std::path::Path;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AgentOutcome {
+    Completed {
+        answer: String,
+        usage: dume_provider::types::TokenUsage,
+    },
+    TurnLimitExhausted {
+        last_reply: Option<String>,
+        usage: dume_provider::types::TokenUsage,
+    },
+    Cancelled,
+}
+
+impl AgentOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self, AgentOutcome::Completed { .. })
+    }
+
+    pub fn answer(&self) -> Option<&str> {
+        match self {
+            AgentOutcome::Completed { answer, .. } => Some(answer.as_str()),
+            AgentOutcome::TurnLimitExhausted { last_reply, .. } => last_reply.as_deref(),
+            AgentOutcome::Cancelled => None,
+        }
+    }
+
+    pub fn usage(&self) -> Option<&dume_provider::types::TokenUsage> {
+        match self {
+            AgentOutcome::Completed { usage, .. } => Some(usage),
+            AgentOutcome::TurnLimitExhausted { usage, .. } => Some(usage),
+            AgentOutcome::Cancelled => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentOutcome::Completed { answer, .. } => write!(f, "{}", answer),
+            AgentOutcome::TurnLimitExhausted { last_reply, .. } => {
+                if let Some(reply) = last_reply {
+                    write!(f, "Turn limit exhausted. Last reply: {}", reply)
+                } else {
+                    write!(f, "Turn limit exhausted")
+                }
+            }
+            AgentOutcome::Cancelled => write!(f, "Agent execution cancelled"),
+        }
+    }
+}
+
 pub struct AgentLoop {
     worktree_path: std::path::PathBuf,
     model: String,
@@ -62,11 +113,13 @@ impl AgentLoop {
             },
             ToolDefinition {
                 name: "read_file".to_string(),
-                description: "Read file contents relative to the worktree".to_string(),
+                description: "Read file contents relative to the worktree with optional line range".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Relative file path" }
+                        "path": { "type": "string", "description": "Relative file path" },
+                        "start_line": { "type": "integer", "description": "Optional starting line number (1-based, inclusive)" },
+                        "end_line": { "type": "integer", "description": "Optional ending line number (1-based, inclusive)" }
                     },
                     "required": ["path"]
                 }),
@@ -98,13 +151,28 @@ impl AgentLoop {
             },
             ToolDefinition {
                 name: "grep_search".to_string(),
-                description: "Search for a regex or text pattern across files in worktree".to_string(),
+                description: "Search for a regex or text pattern across files in worktree with optional path filtering and match limits".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Search pattern" }
+                        "pattern": { "type": "string", "description": "Search pattern" },
+                        "path_filter": { "type": "string", "description": "Optional relative path or directory to filter search" },
+                        "max_matches": { "type": "integer", "description": "Optional maximum number of matches to return (default: 100)" }
                     },
                     "required": ["pattern"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_artifact".to_string(),
+                description: "Read bounded content from an artifact file with offset and length limits".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path to artifact file" },
+                        "offset": { "type": "integer", "description": "Optional byte offset to start reading from" },
+                        "length": { "type": "integer", "description": "Optional maximum bytes to read (default/max: 51200)" }
+                    },
+                    "required": ["path"]
                 }),
             },
             ToolDefinition {
@@ -182,6 +250,10 @@ impl AgentLoop {
             "read_file" => {
                 if parsed_args.get("path").and_then(|v| v.as_str()).is_none() {
                     Some("Missing required field 'path' (string)")
+                } else if parsed_args.get("start_line").is_some_and(|v| v.as_u64().is_none()) {
+                    Some("Field 'start_line' must be a positive integer")
+                } else if parsed_args.get("end_line").is_some_and(|v| v.as_u64().is_none()) {
+                    Some("Field 'end_line' must be a positive integer")
                 } else {
                     None
                 }
@@ -221,6 +293,19 @@ impl AgentLoop {
                     .is_none()
                 {
                     Some("Missing required field 'pattern' (string)")
+                } else if parsed_args.get("max_matches").is_some_and(|v| v.as_u64().is_none()) {
+                    Some("Field 'max_matches' must be a positive integer")
+                } else {
+                    None
+                }
+            }
+            "read_artifact" => {
+                if parsed_args.get("path").and_then(|v| v.as_str()).is_none() {
+                    Some("Missing required field 'path' (string)")
+                } else if parsed_args.get("offset").is_some_and(|v| v.as_u64().is_none()) {
+                    Some("Field 'offset' must be a non-negative integer")
+                } else if parsed_args.get("length").is_some_and(|v| v.as_u64().is_none()) {
+                    Some("Field 'length' must be a non-negative integer")
                 } else {
                     None
                 }
@@ -387,7 +472,7 @@ impl AgentLoop {
     pub fn run_task<'a>(
         &'a self,
         task_prompt: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentOutcome>> + Send + 'a>> {
         self.run_task_with_cancellation(task_prompt, CancellationToken::new())
     }
 
@@ -395,7 +480,7 @@ impl AgentLoop {
         &'a self,
         task_prompt: &'a str,
         cancellation: CancellationToken,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentOutcome>> + Send + 'a>> {
         let task_prompt = task_prompt.to_string();
         Box::pin(async move {
             let tools = Self::tool_definitions();
@@ -404,7 +489,7 @@ impl AgentLoop {
             let subagent_manager = std::sync::Arc::new(dume_mcp::subagent::SubagentManager::new());
             let mut child_paths: std::collections::HashMap<String, std::path::PathBuf> =
                 std::collections::HashMap::new();
-            let result: Result<String> = async {
+            let result: Result<AgentOutcome> = async {
 
         let system_msg = format!(
             "You are DUM-E coding agent. Work directly in the worktree.\nGoal: {}\nUse tools bash, read_file, write_file as needed.",
@@ -417,6 +502,10 @@ impl AgentLoop {
         ];
 
         let session_ctx = dume_provider::types::StreamRequestContext::new();
+        let mut final_outcome: Option<AgentOutcome> = None;
+        let mut last_assistant_reply: Option<String> = None;
+        let mut total_usage = dume_provider::types::TokenUsage::default();
+
         for _turn in 0..self.max_turns {
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(50);
@@ -489,7 +578,9 @@ impl AgentLoop {
                         }
                         ordered_calls[index].2.push_str(&arguments_delta);
                     }
-                    StreamEvent::Usage(_) => {}
+                    StreamEvent::Usage(usage) => {
+                        total_usage.accumulate(&usage);
+                    }
                     StreamEvent::Completed { finish_reason } => {
                         stream_completed_normally = true;
                         stream_finish_reason = finish_reason;
@@ -523,6 +614,8 @@ impl AgentLoop {
                 anyhow::bail!("Model output truncated due to length limits before completion");
             }
 
+            last_assistant_reply = Some(assistant_reply.clone());
+
             // Filter out empty slots if any
             let complete_tool_calls: Vec<dume_provider::types::ToolCall> = ordered_calls
                 .into_iter()
@@ -539,6 +632,10 @@ impl AgentLoop {
                 let mut message = ChatMessage::assistant(&assistant_reply);
                 message.codex_reasoning = codex_reasoning;
                 messages.push(message);
+                final_outcome = Some(AgentOutcome::Completed {
+                    answer: assistant_reply,
+                    usage: total_usage.clone(),
+                });
                 break;
             }
 
@@ -554,7 +651,10 @@ impl AgentLoop {
             }
         }
 
-            Ok("Agent completed task execution".to_string())
+            Ok(final_outcome.unwrap_or_else(|| AgentOutcome::TurnLimitExhausted {
+                last_reply: last_assistant_reply,
+                usage: total_usage,
+            }))
             }.await;
             subagent_manager.cancel_all().await;
             let mut retained = String::new();
@@ -565,7 +665,7 @@ impl AgentLoop {
                 anyhow::bail!("Agent execution cancelled{}", retained);
             }
             match result {
-                Ok(result) => Ok(format!("{}{}", result, retained)),
+                Ok(outcome) => Ok(outcome),
                 Err(error) => anyhow::bail!("{:#}{}", error, retained),
             }
         })
@@ -775,7 +875,7 @@ mod tests {
         .unwrap()
         .unwrap();
         server.await.unwrap();
-        assert!(!result.contains("opaque-secret"));
+        assert!(!result.to_string().contains("opaque-secret"));
         assert_eq!(
             tokio::fs::read_to_string(dir.path().join("result.txt"))
                 .await
@@ -1113,7 +1213,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(res.starts_with("Agent completed task execution"));
+        assert!(res.starts_with("E2E Task is finished."));
         assert!(res.contains(&format!("Worktree retained at {}", wt_path.display())));
         assert!(wt_path.join(".git").exists());
         assert!(!dir.path().join("e2e_out.txt").exists());
@@ -1344,5 +1444,60 @@ mod tests {
             serde_json::json!(["id", "prompt", "sub_dir"])
         );
         let _ = agent;
+    }
+
+    #[tokio::test]
+    async fn test_turn_limit_exhaustion_returns_turn_limit_exhausted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+
+                // Always ask to run bash "echo looping"
+                let sse = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {
+                                "content": "Keep looping...",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_loop",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": "{\"command\": \"echo looping\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    })
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let mut agent = AgentLoop::new(dir.path(), "mock-model")
+            .with_mock_base_url(format!("http://{}", addr));
+        agent.max_turns = 2;
+
+        let outcome = agent.run_task("infinite loop").await.unwrap();
+        match outcome {
+            AgentOutcome::TurnLimitExhausted { last_reply, .. } => {
+                assert!(last_reply.as_ref().unwrap().contains("Keep looping..."));
+            }
+            other => panic!("Expected TurnLimitExhausted, got {:?}", other),
+        }
     }
 }

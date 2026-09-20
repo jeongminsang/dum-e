@@ -1059,27 +1059,40 @@ impl HarnessStore {
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<SessionUsage, StoreError> {
+        self.record_session_usage_full(session_id, input_tokens, output_tokens, 0, 0)
+    }
+
+    pub fn record_session_usage_full(
+        &self,
+        session_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> Result<SessionUsage, StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
         let total = input_tokens + output_tokens;
 
         conn.execute(
             r#"
-            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(session_id) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
+                cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
                 updated_at = excluded.updated_at
             "#,
-            params![session_id, input_tokens, output_tokens, total, now],
+            params![session_id, input_tokens, output_tokens, total, cache_read_tokens, cache_write_tokens, now],
         )?;
 
-        let row: (i64, i64, i64, i64) = conn.query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+        let row: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at FROM session_usage WHERE session_id = ?1",
             params![session_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
 
         Ok(SessionUsage {
@@ -1087,26 +1100,114 @@ impl HarnessStore {
             input_tokens: row.0,
             output_tokens: row.1,
             total_tokens: row.2,
-            updated_at: row.3,
+            cache_read_tokens: row.3,
+            cache_write_tokens: row.4,
+            updated_at: row.5,
         })
+    }
+
+    pub fn record_request_usage(
+        &self,
+        usage: &dume_core::types::RequestUsage,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            r#"
+            INSERT OR IGNORE INTO request_usage (
+                request_id, session_id, model, input_tokens, output_tokens, total_tokens,
+                cache_read_tokens, cache_write_tokens, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                usage.request_id,
+                usage.session_id,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.created_at,
+            ],
+        )?;
+
+        // Also update aggregate session_usage if newly recorded
+        if inserted > 0 {
+            let total = usage.input_tokens + usage.output_tokens;
+            conn.execute(
+                r#"
+                INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    usage.session_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    total,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.created_at,
+                ],
+            )?;
+        }
+
+        Ok(inserted > 0)
+    }
+
+    pub fn get_session_request_usages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, created_at FROM request_usage WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(dume_core::types::RequestUsage {
+                request_id: r.get(0)?,
+                session_id: r.get(1)?,
+                model: r.get(2)?,
+                input_tokens: r.get(3)?,
+                output_tokens: r.get(4)?,
+                total_tokens: r.get(5)?,
+                cache_read_tokens: r.get(6)?,
+                cache_write_tokens: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
     }
 
     pub fn get_session_usage(&self, session_id: &str) -> Result<SessionUsage, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let existing: Option<(i64, i64, i64, i64)> = conn
+        let existing: Option<(i64, i64, i64, i64, i64, i64)> = conn
             .query_row(
-                "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+                "SELECT input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at FROM session_usage WHERE session_id = ?1",
                 params![session_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
 
         Ok(match existing {
-            Some((input, output, total, updated)) => SessionUsage {
+            Some((input, output, total, cache_read, cache_write, updated)) => SessionUsage {
                 session_id: session_id.to_string(),
                 input_tokens: input,
                 output_tokens: output,
                 total_tokens: total,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
                 updated_at: updated,
             },
             None => SessionUsage {
@@ -1114,6 +1215,8 @@ impl HarnessStore {
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 updated_at: now_millis(),
             },
         })
@@ -1415,5 +1518,56 @@ mod tests {
         assert!(active_msgs[0].4, "Must be flagged as summary");
         assert_eq!(active_msgs[1].1, "Done task 2");
         assert_eq!(active_msgs[2].1, "Now do task 3");
+    }
+
+    #[test]
+    fn test_request_and_session_usage_tracking() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "sess_usage_1";
+
+        let req1 = dume_core::types::RequestUsage {
+            request_id: "req_1".to_string(),
+            session_id: session_id.to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            cache_read_tokens: 30,
+            cache_write_tokens: 10,
+            created_at: 1000,
+        };
+
+        let inserted1 = store.record_request_usage(&req1).unwrap();
+        assert!(inserted1, "First insert must succeed");
+
+        // Idempotency: re-recording same request_id must be ignored and return false
+        let inserted_again = store.record_request_usage(&req1).unwrap();
+        assert!(!inserted_again, "Duplicate request_id must be ignored");
+
+        let req2 = dume_core::types::RequestUsage {
+            request_id: "req_2".to_string(),
+            session_id: session_id.to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            input_tokens: 200,
+            output_tokens: 80,
+            total_tokens: 280,
+            cache_read_tokens: 60,
+            cache_write_tokens: 20,
+            created_at: 2000,
+        };
+        store.record_request_usage(&req2).unwrap();
+
+        let list = store.get_session_request_usages(session_id).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].request_id, "req_1");
+        assert_eq!(list[1].request_id, "req_2");
+
+        let agg = store.get_session_usage(session_id).unwrap();
+        assert_eq!(agg.input_tokens, 300);
+        assert_eq!(agg.output_tokens, 130);
+        assert_eq!(agg.total_tokens, 430);
+        assert_eq!(agg.cache_read_tokens, 90);
+        assert_eq!(agg.cache_write_tokens, 30);
     }
 }

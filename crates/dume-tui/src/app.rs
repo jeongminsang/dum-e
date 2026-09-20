@@ -102,7 +102,7 @@ pub struct App {
     pub modal: ModalState,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
-    pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
+    pub session_usage: (i64, i64, i64, i64, i64), // (input, output, total, cache_read, cache_write)
     pub session_id: String,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -194,7 +194,7 @@ impl App {
             modal: ModalState::None,
             last_ctrl_c: None,
             available_update: None,
-            session_usage: (0, 0, 0),
+            session_usage: (0, 0, 0, 0, 0),
             session_id: dume_provider::types::StreamRequestContext::new().session_id,
             prompt_history: Vec::new(),
             history_index: None,
@@ -357,6 +357,12 @@ impl App {
                 self.session_usage.0 += usage.input_tokens;
                 self.session_usage.1 += usage.output_tokens;
                 self.session_usage.2 += usage.total_tokens;
+                if let Some(r) = usage.cache_read_tokens {
+                    self.session_usage.3 += r;
+                }
+                if let Some(w) = usage.cache_write_tokens {
+                    self.session_usage.4 += w;
+                }
             }
             ConversationEvent::Stream(_) => {}
             ConversationEvent::Finished { messages, error } => {
@@ -514,14 +520,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(5),    // Transcript
-                    Constraint::Length(3), // Input bar
+                    Constraint::Length(5), // Input bar
                     Constraint::Length(1), // Status bar
                 ])
                 .split(f.area());
 
             let transcript_area = chunks[0];
-            let inner_width = transcript_area.width.saturating_sub(2);
-            let inner_height = transcript_area.height.saturating_sub(2);
+            let inner_width = transcript_area.width;
+            let inner_height = transcript_area.height;
             let total_lines = calculate_transcript_height(
                 inner_width,
                 &app.messages,
@@ -1366,10 +1372,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             continue;
                                         } else if trimmed == "/usage" {
-                                            let (input, output, total) = app.session_usage;
+                                            let (input, output, total, cache_read, cache_write) = app.session_usage;
                                             app.messages.push(ChatMessage::system(format!(
-                                                "Session Token Usage:\n  Input Tokens:  {}\n  Output Tokens: {}\n  Total Tokens:  {}",
-                                                input, output, total
+                                                "Session Token Usage:\n  Input Tokens:       {}\n  Output Tokens:      {}\n  Total Tokens:       {}\n  Cache Read Tokens:  {}\n  Cache Write Tokens: {}",
+                                                input, output, total, cache_read, cache_write
                                             )));
                                             continue;
                                         } else if trimmed == "/btw" || trimmed.starts_with("/btw ") {

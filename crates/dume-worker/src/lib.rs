@@ -3,9 +3,10 @@ pub mod cancel;
 pub mod executor;
 pub mod host;
 pub mod ipc;
+pub mod output_limits;
 pub mod tools;
 
-pub use agent_loop::AgentLoop;
+pub use agent_loop::{AgentLoop, AgentOutcome};
 pub use cancel::terminate_process_group;
 pub use executor::WorkerExecutor;
 pub use host::WorkerHost;

@@ -417,7 +417,7 @@ async fn run_worker_child(
     print!("{}", serialize_message(&progress_msg)?);
 
     // 1. Run actual Agent Loop if task prompt is present
-    if let Some(prompt) = task_prompt {
+    let agent_outcome = if let Some(prompt) = task_prompt {
         let mut agent = dume_worker::AgentLoop::new(path, model);
         if let Some(base_url) = base_url {
             agent = agent.with_base_url(base_url);
@@ -427,8 +427,10 @@ async fn run_worker_child(
             message: format!("Agent loop executing prompt: {}", prompt),
         };
         print!("{}", serialize_message(&progress_exec)?);
-        let _ = agent.run_task(prompt).await?;
-    }
+        Some(agent.run_task(prompt).await?)
+    } else {
+        None
+    };
 
     // 2. Run test command if provided
     let mut test_results = Vec::new();
@@ -438,16 +440,33 @@ async fn run_worker_child(
     }
 
     // 3. Finalize manifest (detect modified files, commit changes)
+    let summary = match &agent_outcome {
+        Some(dume_worker::AgentOutcome::Completed { answer, .. }) => {
+            format!("Worker completed attempt: {}", answer)
+        }
+        Some(dume_worker::AgentOutcome::TurnLimitExhausted { last_reply, .. }) => {
+            format!(
+                "Worker turn limit exhausted. Last reply: {}",
+                last_reply.as_deref().unwrap_or("none")
+            )
+        }
+        Some(dume_worker::AgentOutcome::Cancelled) => "Worker cancelled".to_string(),
+        None => "Worker completed attempt".to_string(),
+    };
+
     let manifest = WorkerExecutor::finalize_manifest(
         attempt_id,
         path,
         test_results,
-        "Worker completed attempt",
+        &summary,
     )
     .await?;
 
     // Send completed message to host
-    let completed_msg = WorkerToHostMessage::Completed { manifest };
+    let completed_msg = WorkerToHostMessage::Completed {
+        manifest,
+        outcome: agent_outcome,
+    };
     print!("{}", serialize_message(&completed_msg)?);
 
     Ok(())

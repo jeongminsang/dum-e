@@ -376,11 +376,15 @@ impl AnthropicProvider {
                                          if let Some(usage) = msg.get("usage") {
                                              let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                                              let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                             if input > 0 || output > 0 {
+                                             let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64());
+                                             let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64());
+                                             if input > 0 || output > 0 || cache_read.is_some() || cache_write.is_some() {
                                                  let _ = tx.send(StreamEvent::Usage(TokenUsage {
                                                      input_tokens: input,
                                                      output_tokens: output,
                                                      total_tokens: input + output,
+                                                     cache_read_tokens: cache_read,
+                                                     cache_write_tokens: cache_write,
                                                  })).await;
                                              }
                                          }
@@ -389,11 +393,15 @@ impl AnthropicProvider {
                                 "message_delta" => {
                                     if let Some(usage) = parsed.get("usage") {
                                          let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                         if output > 0 {
+                                         let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64());
+                                         let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64());
+                                         if output > 0 || cache_read.is_some() || cache_write.is_some() {
                                              let _ = tx.send(StreamEvent::Usage(TokenUsage {
                                                  input_tokens: 0,
                                                  output_tokens: output,
                                                  total_tokens: output,
+                                                 cache_read_tokens: cache_read,
+                                                 cache_write_tokens: cache_write,
                                              })).await;
                                          }
                                     }

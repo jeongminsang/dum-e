@@ -30,6 +30,7 @@ pub enum WorkerToHostMessage {
     },
     Completed {
         manifest: ResultManifest,
+        outcome: Option<crate::agent_loop::AgentOutcome>,
     },
     Failed {
         error: String,
