@@ -43,6 +43,22 @@ async fn test_bench_streaming_usage_merge_cumulative() {
     assert_eq!(usage.output_tokens, 25);
     assert_eq!(usage.total_tokens, 125);
 
+    // Chunk 2b: Provider reports total_tokens exceeding input + output (e.g. thinking tokens)
+    let c2b = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 2,
+        total_tokens: 30, // 10 input + 2 output + 18 thinking = 30 total
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        is_complete: true,
+        raw_usage: None,
+    };
+    let mut thinking_usage = TokenUsage::default();
+    thinking_usage.merge_cumulative(&c2b);
+    assert_eq!(thinking_usage.input_tokens, 10);
+    assert_eq!(thinking_usage.output_tokens, 2);
+    assert_eq!(thinking_usage.total_tokens, 30, "Must preserve provider total when exceeding input + output");
+
     // Turn 2 adds 50 more input and 15 output via accumulate
     let mut turn2_usage = TokenUsage::default();
     let c3 = TokenUsage {
@@ -265,6 +281,7 @@ async fn test_bench_failed_cancelled_retains_usage() {
     let records = store.get_attempt_request_usages("att_cancelled").unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_tokens, 88);
+    assert!(!records[0].is_complete, "Stream disconnected prematurely must be marked is_complete = false");
 }
 
 // 6. Missing usage marks run incomplete
@@ -315,15 +332,58 @@ fn test_bench_acceptance_check_rejects_false_completion() {
     let check_before = (targeted_fix.check_fn)(dir.path());
     assert!(check_before.is_err() || check_before.unwrap() == false);
 
-    // Apply incorrect fix
+    // Apply incorrect fix: buggy subtraction
     std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
     let check_wrong = (targeted_fix.check_fn)(dir.path());
     assert!(check_wrong.is_err() || check_wrong.unwrap() == false);
+
+    // Apply adversarial cheat: constant return 5 (which passes add(2,3) and add(10,-5))
+    std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return 5\n").unwrap();
+    let check_cheat = (targeted_fix.check_fn)(dir.path());
+    assert!(check_cheat.is_err() || check_cheat.unwrap() == false, "Constant return 5 must be rejected by hardened oracle");
 
     // Apply correct fix
     std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
     let check_correct = (targeted_fix.check_fn)(dir.path()).unwrap();
     assert!(check_correct);
+
+    // Test adversarial case: repo_investigation marker-only output
+    let repo_fix = fixtures.iter().find(|f| f.id == "repo_investigation").unwrap();
+    let dir_repo = tempdir().unwrap();
+    (repo_fix.setup_fn)(dir_repo.path()).unwrap();
+    std::fs::write(dir_repo.path().join(".dume_finding.txt"), "CRITICAL_LEAK\n").unwrap();
+    let check_marker_only = (repo_fix.check_fn)(dir_repo.path());
+    assert!(check_marker_only.is_err() || check_marker_only.unwrap() == false, "Marker-only finding must be rejected");
+
+    std::fs::write(
+        dir_repo.path().join(".dume_finding.txt"),
+        "CRITICAL_LEAK: accidentally committed secret\n",
+    ).unwrap();
+    let check_full_finding = (repo_fix.check_fn)(dir_repo.path()).unwrap();
+    assert!(check_full_finding, "Full commit subject must be accepted");
+
+    // Test adversarial case: continuation_constraint modifying and committing config.json
+    let cont_fix = fixtures.iter().find(|f| f.id == "continuation_constraint").unwrap();
+    let dir_cont = tempdir().unwrap();
+    (cont_fix.setup_fn)(dir_cont.path()).unwrap();
+
+    // Modify protected config.json, update server.py to 9090, and commit both
+    std::fs::write(dir_cont.path().join("config.json"), "{\"port\": 9090, \"protected\": false}").unwrap();
+    std::fs::write(dir_cont.path().join("server.py"), "PORT = 9090\n").unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir_cont.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "Cheated and changed config"])
+        .current_dir(dir_cont.path())
+        .output();
+
+    let check_committed_config = (cont_fix.check_fn)(dir_cont.path());
+    assert!(
+        check_committed_config.is_err() || check_committed_config.unwrap() == false,
+        "Modifying and committing protected config.json must be rejected"
+    );
 }
 
 // 8. Both variants receive identical initial fixtures
@@ -434,15 +494,15 @@ fn test_bench_metrics_formulas_and_zero_division() {
     };
 
     let report_a = runner.build_report(
-        vec![BenchmarkRunner::calculate_case_summary("c1", vec![base_att], vec![cand_att])],
+        vec![BenchmarkRunner::calculate_case_summary("c1", vec![base_att.clone()], vec![cand_att])],
         vec!["baseline".to_string(), "candidate".to_string()],
     );
 
     assert_eq!(report_a.overall_baseline_tokens, 1000);
     assert_eq!(report_a.overall_candidate_tokens, 750);
-    assert!((report_a.overall_token_reduction - 0.25).abs() < 1e-6);
-    assert_eq!(report_a.overall_baseline_tokens_per_success, 1000.0);
-    assert_eq!(report_a.overall_candidate_tokens_per_success, 750.0);
+    assert!((report_a.overall_token_reduction.unwrap() - 0.25).abs() < 1e-6);
+    assert_eq!(report_a.overall_baseline_tokens_per_success, Some(1000.0));
+    assert_eq!(report_a.overall_candidate_tokens_per_success, Some(750.0));
 
     // Scenario B: Zero successful runs
     let base_failed = AttemptRecord {
@@ -494,10 +554,34 @@ fn test_bench_metrics_formulas_and_zero_division() {
 
     assert_eq!(report_b.overall_baseline_success_rate, 0.0);
     assert_eq!(report_b.overall_candidate_success_rate, 0.0);
-    assert_eq!(report_b.overall_baseline_tokens_per_success, 0.0);
-    assert_eq!(report_b.overall_candidate_tokens_per_success, 0.0);
-    assert!(!report_b.overall_baseline_tokens_per_success.is_nan());
-    assert!(!report_b.overall_candidate_tokens_per_success.is_nan());
+    assert_eq!(report_b.overall_baseline_tokens_per_success, None);
+    assert_eq!(report_b.overall_candidate_tokens_per_success, None);
+
+    // Scenario C: Incomplete candidate usage should yield None for reduction and tokens/success
+    let cand_incomplete = AttemptRecord {
+        run_id: "r3".to_string(),
+        case_id: "c3".to_string(),
+        variant: "candidate".to_string(),
+        repetition: 1,
+        attempt_id: "a5".to_string(),
+        session_id: "s5".to_string(),
+        success: true,
+        failure_reason: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        is_usage_complete: false,
+        duration_ms: 50,
+        request_count: 1,
+        parent_tokens: 0,
+        descendant_tokens: 0,
+    };
+
+    let summary_c = BenchmarkRunner::calculate_case_summary("c3", vec![base_att], vec![cand_incomplete]);
+    assert_eq!(summary_c.token_reduction, None);
+    assert_eq!(summary_c.candidate_tokens_per_success, None);
 }
 
 // 11. Saved results can be loaded and reported after process restart
@@ -520,9 +604,9 @@ fn test_bench_persistence_and_markdown_rendering() {
             candidate_success_rate: 1.0,
             baseline_total_tokens: 2000,
             candidate_total_tokens: 1500,
-            baseline_tokens_per_success: 2000.0,
-            candidate_tokens_per_success: 1500.0,
-            token_reduction: 0.25,
+            baseline_tokens_per_success: Some(2000.0),
+            candidate_tokens_per_success: Some(1500.0),
+            token_reduction: Some(0.25),
             baseline_attempts: vec![],
             candidate_attempts: vec![],
         }],
@@ -530,9 +614,9 @@ fn test_bench_persistence_and_markdown_rendering() {
         overall_candidate_tokens: 1500,
         overall_baseline_success_rate: 1.0,
         overall_candidate_success_rate: 1.0,
-        overall_token_reduction: 0.25,
-        overall_baseline_tokens_per_success: 2000.0,
-        overall_candidate_tokens_per_success: 1500.0,
+        overall_token_reduction: Some(0.25),
+        overall_baseline_tokens_per_success: Some(2000.0),
+        overall_candidate_tokens_per_success: Some(1500.0),
         incomplete_attempts_count: 0,
         execution_order: vec!["c1:rep1:baseline".to_string(), "c1:rep1:candidate".to_string()],
     };
@@ -543,7 +627,7 @@ fn test_bench_persistence_and_markdown_rendering() {
     // Reload JSON from disk simulating process restart
     let loaded: BenchmarkReport = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert_eq!(loaded.run_id, "bench_persist");
-    assert_eq!(loaded.overall_token_reduction, 0.25);
+    assert_eq!(loaded.overall_token_reduction, Some(0.25));
 
     // Render markdown
     let config = BenchmarkRunConfig {

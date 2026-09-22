@@ -163,7 +163,8 @@ impl TokenUsage {
         if other.output_tokens > 0 {
             self.output_tokens = self.output_tokens.max(other.output_tokens);
         }
-        self.total_tokens = self.input_tokens + self.output_tokens;
+        let sum_tokens = self.input_tokens + self.output_tokens;
+        self.total_tokens = self.total_tokens.max(other.total_tokens).max(sum_tokens);
         if other.cache_read_tokens.is_some() {
             self.cache_read_tokens = other.cache_read_tokens;
         }

@@ -613,9 +613,7 @@ impl AgentLoop {
                     _ = cancellation.cancelled() => {
                         stream_handle.abort();
                         let _ = stream_handle.await;
-                        if !had_usage_event {
-                            turn_usage.is_complete = false;
-                        }
+                        turn_usage.is_complete = false;
                         record_turn_usage(&turn_ctx, &turn_usage, &self.model);
                         total_usage.accumulate(&turn_usage);
                         anyhow::bail!("Agent execution cancelled");
@@ -658,9 +656,7 @@ impl AgentLoop {
                     StreamEvent::Error(err) => {
                         stream_handle.abort();
                         let _ = stream_handle.await;
-                        if !had_usage_event {
-                            turn_usage.is_complete = false;
-                        }
+                        turn_usage.is_complete = false;
                         record_turn_usage(&turn_ctx, &turn_usage, &self.model);
                         total_usage.accumulate(&turn_usage);
                         anyhow::bail!("Model streaming error: {}", err);
@@ -674,9 +670,7 @@ impl AgentLoop {
                 _ = cancellation.cancelled() => {
                     stream_handle.abort();
                     let _ = stream_handle.await;
-                    if !had_usage_event {
-                        turn_usage.is_complete = false;
-                    }
+                    turn_usage.is_complete = false;
                     record_turn_usage(&turn_ctx, &turn_usage, &self.model);
                     total_usage.accumulate(&turn_usage);
                     anyhow::bail!("Agent execution cancelled");
@@ -684,23 +678,19 @@ impl AgentLoop {
                 result = &mut stream_handle => result,
             };
             if let Err(e) = stream_task_res {
-                if !had_usage_event {
-                    turn_usage.is_complete = false;
-                }
+                turn_usage.is_complete = false;
                 record_turn_usage(&turn_ctx, &turn_usage, &self.model);
                 total_usage.accumulate(&turn_usage);
                 anyhow::bail!("Stream task aborted: {}", e);
             }
             if let Ok(Err(e)) = stream_task_res {
-                if !had_usage_event {
-                    turn_usage.is_complete = false;
-                }
+                turn_usage.is_complete = false;
                 record_turn_usage(&turn_ctx, &turn_usage, &self.model);
                 total_usage.accumulate(&turn_usage);
                 anyhow::bail!("Stream provider error: {}", e);
             }
 
-            if !had_usage_event {
+            if !had_usage_event || !stream_completed_normally {
                 turn_usage.is_complete = false;
             }
             record_turn_usage(&turn_ctx, &turn_usage, &self.model);

@@ -97,9 +97,10 @@ fn check_targeted_bug_fix(path: &Path) -> Result<bool, String> {
         return Err("calc.py does not exist".to_string());
     }
     let content = std::fs::read_to_string(&calc_file).map_err(|e| e.to_string())?;
-    // Acceptance check executes python3 check outside the agent editable files
+    // Acceptance check executes comprehensive python3 test suite outside the agent editable files
+    let test_script = "import calc\nassert calc.add(2, 3) == 5\nassert calc.add(10, -5) == 5\nassert calc.add(0, 0) == 0\nassert calc.add(-7, -8) == -15\nassert calc.add(100, 200) == 300\n";
     let out = Command::new("python3")
-        .args(["-B", "-c", "import calc; assert calc.add(2, 3) == 5 and calc.add(10, -5) == 5"])
+        .args(["-B", "-c", test_script])
         .current_dir(path)
         .output();
 
@@ -111,10 +112,10 @@ fn check_targeted_bug_fix(path: &Path) -> Result<bool, String> {
         }
         Err(_) => {
             // Fallback syntax inspection if python3 is unavailable
-            if content.contains("return a + b") {
+            if content.contains("return a + b") || content.contains("return b + a") {
                 Ok(true)
             } else {
-                Err("calc.py does not contain 'return a + b'".to_string())
+                Err("calc.py does not contain general 'return a + b'".to_string())
             }
         }
     }
@@ -140,12 +141,15 @@ fn check_repo_investigation(path: &Path) -> Result<bool, String> {
         return Err(".dume_finding.txt was not created".to_string());
     }
     let content = std::fs::read_to_string(&finding_file).map_err(|e| e.to_string())?;
-    if content.contains("CRITICAL_LEAK") {
+    let trimmed = content.trim();
+    if trimmed == "CRITICAL_LEAK: accidentally committed secret"
+        || trimmed.contains("CRITICAL_LEAK: accidentally committed secret")
+    {
         Ok(true)
     } else {
         Err(format!(
-            ".dume_finding.txt content '{:?}' does not contain expected finding",
-            content.trim()
+            ".dume_finding.txt content '{:?}' does not match expected full commit subject 'CRITICAL_LEAK: accidentally committed secret'",
+            trimmed
         ))
     }
 }
@@ -241,19 +245,45 @@ fn setup_continuation_constraint(path: &Path) -> Result<()> {
         "import json\n\nwith open('config.json') as f:\n    PORT = json.load(f)['port']\n",
     )?;
     git_commit_all(path, "Initial server with config")?;
+    // Create baseline tag to verify files are not modified across working directory or committed history
+    Command::new("git")
+        .args(["tag", "benchmark_initial"])
+        .current_dir(path)
+        .output()
+        .context("git tag failed")?;
     Ok(())
 }
 
 fn check_continuation_constraint(path: &Path) -> Result<bool, String> {
-    // 1. Verify config.json was NOT modified
-    let diff_out = Command::new("git")
-        .args(["diff", "--name-only", "HEAD", "--", "config.json"])
+    // 1. Verify config.json was NOT modified in worktree or committed on top of initial tag
+    let diff_working = Command::new("git")
+        .args(["diff", "--name-only", "--", "config.json"])
         .current_dir(path)
         .output()
         .map_err(|e| e.to_string())?;
-    let diff_files = String::from_utf8_lossy(&diff_out.stdout);
+    let diff_files = String::from_utf8_lossy(&diff_working.stdout);
     if !diff_files.trim().is_empty() {
-        return Err("Constraint violated: config.json was modified!".to_string());
+        return Err("Constraint violated: config.json was modified in working directory!".to_string());
+    }
+
+    let diff_initial = Command::new("git")
+        .args(["diff", "--name-only", "benchmark_initial", "HEAD", "--", "config.json"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let diff_committed = String::from_utf8_lossy(&diff_initial.stdout);
+    if !diff_committed.trim().is_empty() {
+        return Err("Constraint violated: config.json modification was committed!".to_string());
+    }
+
+    // Also verify content of config.json is still intact
+    let config_file = path.join("config.json");
+    if !config_file.exists() {
+        return Err("Constraint violated: config.json was removed!".to_string());
+    }
+    let config_content = std::fs::read_to_string(&config_file).map_err(|e| e.to_string())?;
+    if !config_content.contains("\"port\": 8080") || !config_content.contains("\"protected\": true") {
+        return Err("Constraint violated: config.json content altered!".to_string());
     }
 
     // 2. Verify server.py uses PORT = 9090

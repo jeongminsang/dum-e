@@ -54,9 +54,9 @@ pub struct CaseSummary {
     pub candidate_success_rate: f64,
     pub baseline_total_tokens: i64,
     pub candidate_total_tokens: i64,
-    pub baseline_tokens_per_success: f64,
-    pub candidate_tokens_per_success: f64,
-    pub token_reduction: f64,
+    pub baseline_tokens_per_success: Option<f64>,
+    pub candidate_tokens_per_success: Option<f64>,
+    pub token_reduction: Option<f64>,
     pub baseline_attempts: Vec<AttemptRecord>,
     pub candidate_attempts: Vec<AttemptRecord>,
 }
@@ -71,9 +71,9 @@ pub struct BenchmarkReport {
     pub overall_candidate_tokens: i64,
     pub overall_baseline_success_rate: f64,
     pub overall_candidate_success_rate: f64,
-    pub overall_token_reduction: f64,
-    pub overall_baseline_tokens_per_success: f64,
-    pub overall_candidate_tokens_per_success: f64,
+    pub overall_token_reduction: Option<f64>,
+    pub overall_baseline_tokens_per_success: Option<f64>,
+    pub overall_candidate_tokens_per_success: Option<f64>,
     pub incomplete_attempts_count: usize,
     pub execution_order: Vec<String>,
 }
@@ -175,6 +175,7 @@ impl BenchmarkRunner {
         let agent_error = if let Some(bin) = bin_path {
             self.run_via_binary(
                 &bin,
+                fixture.id,
                 &attempt_id,
                 worktree_path,
                 fixture.task_prompt,
@@ -184,6 +185,7 @@ impl BenchmarkRunner {
             .await
         } else {
             self.run_via_agent_loop(
+                fixture.id,
                 &attempt_id,
                 &session_id,
                 worktree_path,
@@ -263,6 +265,7 @@ impl BenchmarkRunner {
 
     async fn run_via_agent_loop(
         &self,
+        case_id: &str,
         attempt_id: &str,
         session_id: &str,
         worktree_path: &Path,
@@ -278,7 +281,7 @@ impl BenchmarkRunner {
             session_id: session_id.to_string(),
             request_id: format!("req_{}_0", attempt_id),
             benchmark_run_id: Some(self.config.run_id.clone()),
-            case_id: None,
+            case_id: Some(case_id.to_string()),
             variant: Some(variant.to_string()),
             attempt_id: Some(attempt_id.to_string()),
             agent_id: Some("main".to_string()),
@@ -295,6 +298,7 @@ impl BenchmarkRunner {
     async fn run_via_binary(
         &self,
         bin: &Path,
+        case_id: &str,
         attempt_id: &str,
         worktree_path: &Path,
         prompt: &str,
@@ -316,6 +320,8 @@ impl BenchmarkRunner {
             self.config.db_path.to_str().unwrap(),
             "--benchmark-run-id",
             &self.config.run_id,
+            "--case-id",
+            case_id,
             "--variant",
             variant,
         ]);
@@ -357,22 +363,25 @@ impl BenchmarkRunner {
         let baseline_total_tokens: i64 = baseline_attempts.iter().map(|a| a.total_tokens).sum();
         let candidate_total_tokens: i64 = candidate_attempts.iter().map(|a| a.total_tokens).sum();
 
-        let baseline_tokens_per_success = if baseline_success_count > 0 {
-            baseline_total_tokens as f64 / baseline_success_count as f64
+        let baseline_all_complete = !baseline_attempts.is_empty() && baseline_attempts.iter().all(|a| a.is_usage_complete);
+        let candidate_all_complete = !candidate_attempts.is_empty() && candidate_attempts.iter().all(|a| a.is_usage_complete);
+
+        let baseline_tokens_per_success = if baseline_all_complete && baseline_success_count > 0 {
+            Some(baseline_total_tokens as f64 / baseline_success_count as f64)
         } else {
-            0.0
+            None
         };
 
-        let candidate_tokens_per_success = if candidate_success_count > 0 {
-            candidate_total_tokens as f64 / candidate_success_count as f64
+        let candidate_tokens_per_success = if candidate_all_complete && candidate_success_count > 0 {
+            Some(candidate_total_tokens as f64 / candidate_success_count as f64)
         } else {
-            0.0
+            None
         };
 
-        let token_reduction = if baseline_total_tokens > 0 {
-            1.0 - (candidate_total_tokens as f64 / baseline_total_tokens as f64)
+        let token_reduction = if baseline_all_complete && candidate_all_complete && baseline_total_tokens > 0 {
+            Some(1.0 - (candidate_total_tokens as f64 / baseline_total_tokens as f64))
         } else {
-            0.0
+            None
         };
 
         CaseSummary {
@@ -406,6 +415,8 @@ impl BenchmarkRunner {
         let mut overall_candidate_successes = 0;
         let mut overall_candidate_attempts = 0;
         let mut incomplete_attempts_count = 0;
+        let mut all_baseline_complete = true;
+        let mut all_candidate_complete = true;
 
         for c in &cases {
             overall_baseline_tokens += c.baseline_total_tokens;
@@ -418,13 +429,22 @@ impl BenchmarkRunner {
             for a in &c.baseline_attempts {
                 if !a.is_usage_complete {
                     incomplete_attempts_count += 1;
+                    all_baseline_complete = false;
                 }
             }
             for a in &c.candidate_attempts {
                 if !a.is_usage_complete {
                     incomplete_attempts_count += 1;
+                    all_candidate_complete = false;
                 }
             }
+        }
+
+        if overall_baseline_attempts == 0 {
+            all_baseline_complete = false;
+        }
+        if overall_candidate_attempts == 0 {
+            all_candidate_complete = false;
         }
 
         let overall_baseline_success_rate = if overall_baseline_attempts > 0 {
@@ -439,22 +459,22 @@ impl BenchmarkRunner {
             0.0
         };
 
-        let overall_token_reduction = if overall_baseline_tokens > 0 {
-            1.0 - (overall_candidate_tokens as f64 / overall_baseline_tokens as f64)
+        let overall_token_reduction = if all_baseline_complete && all_candidate_complete && overall_baseline_tokens > 0 {
+            Some(1.0 - (overall_candidate_tokens as f64 / overall_baseline_tokens as f64))
         } else {
-            0.0
+            None
         };
 
-        let overall_baseline_tokens_per_success = if overall_baseline_successes > 0 {
-            overall_baseline_tokens as f64 / overall_baseline_successes as f64
+        let overall_baseline_tokens_per_success = if all_baseline_complete && overall_baseline_successes > 0 {
+            Some(overall_baseline_tokens as f64 / overall_baseline_successes as f64)
         } else {
-            0.0
+            None
         };
 
-        let overall_candidate_tokens_per_success = if overall_candidate_successes > 0 {
-            overall_candidate_tokens as f64 / overall_candidate_successes as f64
+        let overall_candidate_tokens_per_success = if all_candidate_complete && overall_candidate_successes > 0 {
+            Some(overall_candidate_tokens as f64 / overall_candidate_successes as f64)
         } else {
-            0.0
+            None
         };
 
         BenchmarkReport {
@@ -492,19 +512,27 @@ impl BenchmarkRunner {
         md.push_str(&format!("# DUM-E Benchmark Report: {}\n\n", report.run_id));
         md.push_str(&format!("- **Model**: `{}`\n", report.model));
         md.push_str(&format!("- **Incomplete Measurements**: {}\n", report.incomplete_attempts_count));
+        match report.overall_token_reduction {
+            Some(red) => md.push_str(&format!("- **Overall Token Reduction**: {:.2}%\n", red * 100.0)),
+            None => md.push_str("- **Overall Token Reduction**: N/A\n"),
+        }
+        let base_tps_str = match report.overall_baseline_tokens_per_success {
+            Some(v) => format!("{:.0}", v),
+            None => "N/A".to_string(),
+        };
         md.push_str(&format!(
-            "- **Overall Token Reduction**: {:.2}%\n",
-            report.overall_token_reduction * 100.0
-        ));
-        md.push_str(&format!(
-            "- **Baseline Success Rate**: {:.1}% (Tokens/Success: {:.0})\n",
+            "- **Baseline Success Rate**: {:.1}% (Tokens/Success: {})\n",
             report.overall_baseline_success_rate * 100.0,
-            report.overall_baseline_tokens_per_success
+            base_tps_str
         ));
+        let cand_tps_str = match report.overall_candidate_tokens_per_success {
+            Some(v) => format!("{:.0}", v),
+            None => "N/A".to_string(),
+        };
         md.push_str(&format!(
-            "- **Candidate Success Rate**: {:.1}% (Tokens/Success: {:.0})\n\n",
+            "- **Candidate Success Rate**: {:.1}% (Tokens/Success: {})\n\n",
             report.overall_candidate_success_rate * 100.0,
-            report.overall_candidate_tokens_per_success
+            cand_tps_str
         ));
 
         md.push_str("## Per-Case Results\n\n");
@@ -512,8 +540,20 @@ impl BenchmarkRunner {
         md.push_str("|---------|------------------|-------------------|-----------------|------------------|-----------|------------------|------------------|\n");
 
         for c in &report.cases {
+            let red_str = match c.token_reduction {
+                Some(r) => format!("{:.2}%", r * 100.0),
+                None => "N/A".to_string(),
+            };
+            let b_tps_str = match c.baseline_tokens_per_success {
+                Some(v) => format!("{:.0}", v),
+                None => "N/A".to_string(),
+            };
+            let c_tps_str = match c.candidate_tokens_per_success {
+                Some(v) => format!("{:.0}", v),
+                None => "N/A".to_string(),
+            };
             md.push_str(&format!(
-                "| `{}` | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {} | {} | {:.2}% | {:.0} | {:.0} |\n",
+                "| `{}` | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {} | {} | {} | {} | {} |\n",
                 c.case_id,
                 c.baseline_success_rate * 100.0,
                 c.baseline_success_count,
@@ -523,9 +563,9 @@ impl BenchmarkRunner {
                 c.candidate_total_count,
                 c.baseline_total_tokens,
                 c.candidate_total_tokens,
-                c.token_reduction * 100.0,
-                c.baseline_tokens_per_success,
-                c.candidate_tokens_per_success,
+                red_str,
+                b_tps_str,
+                c_tps_str,
             ));
         }
 

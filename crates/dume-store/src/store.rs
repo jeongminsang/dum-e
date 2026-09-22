@@ -1649,4 +1649,66 @@ mod tests {
         assert_eq!(agg.cache_read_tokens, 90);
         assert_eq!(agg.cache_write_tokens, 30);
     }
+
+    #[test]
+    fn test_legacy_schema_migration() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        // 1. Create a legacy database without benchmark columns in request_usage / session_usage
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE session_usage (
+                    session_id TEXT PRIMARY KEY,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE request_usage (
+                    request_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_request_usage_session ON request_usage(session_id);
+                "#,
+            ).unwrap();
+        }
+
+        // 2. Open via HarnessStore::open which runs initialize_schema and migrations
+        let store = HarnessStore::open(&db_path, dir.path().join("artifacts")).unwrap();
+
+        // 3. Verify store methods work on migrated DB
+        let req = dume_core::types::RequestUsage {
+            request_id: "req_migrated_1".to_string(),
+            session_id: "sess_migrated".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            benchmark_run_id: Some("bench_migrated".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("main".to_string()),
+            parent_agent_id: None,
+            raw_usage_json: None,
+            is_complete: true,
+            created_at: 100,
+        };
+        assert!(store.record_request_usage(&req).unwrap());
+        let list = store.get_benchmark_request_usages("bench_migrated").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].request_id, "req_migrated_1");
+    }
 }
+
