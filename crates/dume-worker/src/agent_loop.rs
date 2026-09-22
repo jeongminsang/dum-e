@@ -20,7 +20,9 @@ pub enum AgentOutcome {
         last_reply: Option<String>,
         usage: dume_provider::types::TokenUsage,
     },
-    Cancelled,
+    Cancelled {
+        usage: dume_provider::types::TokenUsage,
+    },
 }
 
 impl AgentOutcome {
@@ -32,7 +34,7 @@ impl AgentOutcome {
         match self {
             AgentOutcome::Completed { answer, .. } => Some(answer.as_str()),
             AgentOutcome::TurnLimitExhausted { last_reply, .. } => last_reply.as_deref(),
-            AgentOutcome::Cancelled => None,
+            AgentOutcome::Cancelled { .. } => None,
         }
     }
 
@@ -40,7 +42,7 @@ impl AgentOutcome {
         match self {
             AgentOutcome::Completed { usage, .. } => Some(usage),
             AgentOutcome::TurnLimitExhausted { usage, .. } => Some(usage),
-            AgentOutcome::Cancelled => None,
+            AgentOutcome::Cancelled { usage, .. } => Some(usage),
         }
     }
 }
@@ -56,20 +58,23 @@ impl std::fmt::Display for AgentOutcome {
                     write!(f, "Turn limit exhausted")
                 }
             }
-            AgentOutcome::Cancelled => write!(f, "Agent execution cancelled"),
+            AgentOutcome::Cancelled { .. } => write!(f, "Agent execution cancelled"),
         }
     }
 }
 
 pub struct AgentLoop {
-    worktree_path: std::path::PathBuf,
-    model: String,
-    max_turns: usize,
-    endpoint: Option<Endpoint>,
+    pub worktree_path: std::path::PathBuf,
+    pub model: String,
+    pub max_turns: usize,
+    pub endpoint: Option<Endpoint>,
+    pub store: Option<std::sync::Arc<dume_store::HarnessStore>>,
+    pub request_context: Option<dume_provider::types::StreamRequestContext>,
+    pub descendant_usage: std::sync::Arc<tokio::sync::Mutex<dume_provider::types::TokenUsage>>,
 }
 
 #[derive(Clone)]
-enum Endpoint {
+pub enum Endpoint {
     Authenticated(String),
     #[cfg(test)]
     Mock(String),
@@ -82,7 +87,20 @@ impl AgentLoop {
             model: model.into(),
             max_turns: 10,
             endpoint: None,
+            store: None,
+            request_context: None,
+            descendant_usage: std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
         }
+    }
+
+    pub fn with_store(mut self, store: std::sync::Arc<dume_store::HarnessStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn with_request_context(mut self, ctx: dume_provider::types::StreamRequestContext) -> Self {
+        self.request_context = Some(ctx);
+        self
     }
 
     /// Override the selected provider's API root using its normally resolved credentials.
@@ -93,7 +111,7 @@ impl AgentLoop {
     }
 
     #[cfg(test)]
-    fn with_mock_base_url(mut self, base_url: impl Into<String>) -> Self {
+    pub fn with_mock_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.endpoint = Some(Endpoint::Mock(base_url.into()));
         self
     }
@@ -383,6 +401,9 @@ impl AgentLoop {
                 let parent_repo = self.worktree_path.clone();
                 let child_prompt = prompt.clone();
                 let child_wt_clone = child_wt.clone();
+                let store_clone = self.store.clone();
+                let ctx_clone = self.request_context.as_ref().map(|c| c.child_agent(&sub_id));
+                let descendant_usage_clone = std::sync::Arc::clone(&self.descendant_usage);
 
                 let res = subagent_manager
                     .start_subagent(&sub_id, &prompt, move |token| async move {
@@ -393,6 +414,9 @@ impl AgentLoop {
                             endpoint,
                             &child_prompt,
                             token,
+                            store_clone,
+                            ctx_clone,
+                            descendant_usage_clone,
                         )
                         .await
                     })
@@ -501,10 +525,44 @@ impl AgentLoop {
             ChatMessage::user(task_prompt),
         ];
 
-        let session_ctx = dume_provider::types::StreamRequestContext::new();
+        let session_ctx = self
+            .request_context
+            .clone()
+            .unwrap_or_else(dume_provider::types::StreamRequestContext::new);
         let mut final_outcome: Option<AgentOutcome> = None;
         let mut last_assistant_reply: Option<String> = None;
         let mut total_usage = dume_provider::types::TokenUsage::default();
+
+        let record_turn_usage = |turn_ctx: &dume_provider::types::StreamRequestContext,
+                                 turn_usage: &dume_provider::types::TokenUsage,
+                                 model_name: &str| {
+            if let Some(store) = &self.store {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let req_usage = dume_core::types::RequestUsage {
+                    request_id: turn_ctx.request_id.clone(),
+                    session_id: turn_ctx.session_id.clone(),
+                    model: model_name.to_string(),
+                    input_tokens: turn_usage.input_tokens,
+                    output_tokens: turn_usage.output_tokens,
+                    total_tokens: turn_usage.total_tokens,
+                    cache_read_tokens: turn_usage.cache_read_tokens.unwrap_or(0),
+                    cache_write_tokens: turn_usage.cache_write_tokens.unwrap_or(0),
+                    benchmark_run_id: turn_ctx.benchmark_run_id.clone(),
+                    case_id: turn_ctx.case_id.clone(),
+                    variant: turn_ctx.variant.clone(),
+                    attempt_id: turn_ctx.attempt_id.clone(),
+                    agent_id: turn_ctx.agent_id.clone(),
+                    parent_agent_id: turn_ctx.parent_agent_id.clone(),
+                    raw_usage_json: turn_usage.raw_usage.as_ref().map(|v| v.to_string()),
+                    is_complete: turn_usage.is_complete,
+                    created_at: now,
+                };
+                let _ = store.record_request_usage(&req_usage);
+            }
+        };
 
         for _turn in 0..self.max_turns {
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
@@ -515,6 +573,11 @@ impl AgentLoop {
             let turn_ctx = session_ctx.next_request();
 
             let endpoint = self.endpoint.clone();
+            let mut turn_usage = dume_provider::types::TokenUsage::default();
+            let mut had_usage_event = false;
+
+            let turn_ctx_spawn = turn_ctx.clone();
+
             // Stream response
             let mut stream_handle = tokio::spawn(async move {
                 #[cfg(test)]
@@ -534,7 +597,7 @@ impl AgentLoop {
                 if let Some(Endpoint::Authenticated(base_url)) = endpoint {
                     provider = provider.with_base_url(&base_url)?;
                 }
-                provider.stream_with_context(&msgs, &tools_clone, Some(&turn_ctx), tx).await
+                provider.stream_with_context(&msgs, &tools_clone, Some(&turn_ctx_spawn), tx).await
             });
 
             let mut assistant_reply = String::new();
@@ -550,6 +613,11 @@ impl AgentLoop {
                     _ = cancellation.cancelled() => {
                         stream_handle.abort();
                         let _ = stream_handle.await;
+                        if !had_usage_event {
+                            turn_usage.is_complete = false;
+                        }
+                        record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+                        total_usage.accumulate(&turn_usage);
                         anyhow::bail!("Agent execution cancelled");
                     }
                     evt = rx.recv() => match evt {
@@ -579,7 +647,8 @@ impl AgentLoop {
                         ordered_calls[index].2.push_str(&arguments_delta);
                     }
                     StreamEvent::Usage(usage) => {
-                        total_usage.accumulate(&usage);
+                        had_usage_event = true;
+                        turn_usage.merge_cumulative(&usage);
                     }
                     StreamEvent::Completed { finish_reason } => {
                         stream_completed_normally = true;
@@ -589,6 +658,11 @@ impl AgentLoop {
                     StreamEvent::Error(err) => {
                         stream_handle.abort();
                         let _ = stream_handle.await;
+                        if !had_usage_event {
+                            turn_usage.is_complete = false;
+                        }
+                        record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+                        total_usage.accumulate(&turn_usage);
                         anyhow::bail!("Model streaming error: {}", err);
                     }
                 }
@@ -600,11 +674,37 @@ impl AgentLoop {
                 _ = cancellation.cancelled() => {
                     stream_handle.abort();
                     let _ = stream_handle.await;
+                    if !had_usage_event {
+                        turn_usage.is_complete = false;
+                    }
+                    record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+                    total_usage.accumulate(&turn_usage);
                     anyhow::bail!("Agent execution cancelled");
                 }
                 result = &mut stream_handle => result,
             };
-            stream_task_res.context("Stream task aborted")??;
+            if let Err(e) = stream_task_res {
+                if !had_usage_event {
+                    turn_usage.is_complete = false;
+                }
+                record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+                total_usage.accumulate(&turn_usage);
+                anyhow::bail!("Stream task aborted: {}", e);
+            }
+            if let Ok(Err(e)) = stream_task_res {
+                if !had_usage_event {
+                    turn_usage.is_complete = false;
+                }
+                record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+                total_usage.accumulate(&turn_usage);
+                anyhow::bail!("Stream provider error: {}", e);
+            }
+
+            if !had_usage_event {
+                turn_usage.is_complete = false;
+            }
+            record_turn_usage(&turn_ctx, &turn_usage, &self.model);
+            total_usage.accumulate(&turn_usage);
 
             if !stream_completed_normally {
                 anyhow::bail!("Stream disconnected prematurely without Completed event");
@@ -651,7 +751,22 @@ impl AgentLoop {
             }
         }
 
-            Ok(final_outcome.unwrap_or_else(|| AgentOutcome::TurnLimitExhausted {
+            let descendant = self.descendant_usage.lock().await.clone();
+            total_usage.accumulate(&descendant);
+
+            Ok(final_outcome.map(|outcome| match outcome {
+                AgentOutcome::Completed { answer, .. } => AgentOutcome::Completed {
+                    answer,
+                    usage: total_usage.clone(),
+                },
+                AgentOutcome::TurnLimitExhausted { last_reply, .. } => AgentOutcome::TurnLimitExhausted {
+                    last_reply,
+                    usage: total_usage.clone(),
+                },
+                AgentOutcome::Cancelled { .. } => AgentOutcome::Cancelled {
+                    usage: total_usage.clone(),
+                },
+            }).unwrap_or_else(|| AgentOutcome::TurnLimitExhausted {
                 last_reply: last_assistant_reply,
                 usage: total_usage,
             }))
@@ -730,6 +845,9 @@ async fn run_isolated_child(
     endpoint: Option<Endpoint>,
     prompt: &str,
     cancellation: CancellationToken,
+    store: Option<std::sync::Arc<dume_store::HarnessStore>>,
+    request_context: Option<dume_provider::types::StreamRequestContext>,
+    descendant_usage: std::sync::Arc<tokio::sync::Mutex<dume_provider::types::TokenUsage>>,
 ) -> Result<String> {
     anyhow::ensure!(
         !cancellation.is_cancelled(),
@@ -740,7 +858,16 @@ async fn run_isolated_child(
         .with_context(|| format!("Subagent isolation failed at {}", child.display()))?;
     let mut agent = AgentLoop::new(child, model);
     agent.endpoint = endpoint;
+    agent.store = store;
+    agent.request_context = request_context;
+    agent.descendant_usage = std::sync::Arc::clone(&descendant_usage);
     let result = agent.run_task_with_cancellation(prompt, cancellation).await;
+    if let Ok(ref outcome) = result {
+        if let Some(usage) = outcome.usage() {
+            let mut guard = descendant_usage.lock().await;
+            guard.accumulate(usage);
+        }
+    }
     // Retain even clean worktrees: detached commits are also child output.
     let retained = format!(
         "Worktree retained at {} for inspection/integration; output has not been integrated",
@@ -923,6 +1050,9 @@ mod tests {
             Some(Endpoint::Mock("http://127.0.0.1:1".into())),
             "write output",
             CancellationToken::new(),
+            None,
+            None,
+            std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
         )
         .await
         .unwrap_err();
@@ -981,6 +1111,9 @@ mod tests {
                 Some(Endpoint::Mock(url)),
                 "child task",
                 child_token,
+                None,
+                None,
+                std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
             )
             .await
         });
@@ -1210,6 +1343,9 @@ mod tests {
             Some(Endpoint::Mock(mock_url)),
             "Write e2e_out.txt with test content",
             CancellationToken::new(),
+            None,
+            None,
+            std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
         )
         .await
         .unwrap();

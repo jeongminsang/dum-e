@@ -172,7 +172,27 @@ pub struct RequestUsage {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_usage_json: Option<String>,
+    #[serde(default = "default_is_complete")]
+    pub is_complete: bool,
     pub created_at: i64,
+}
+
+fn default_is_complete() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

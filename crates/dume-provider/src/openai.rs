@@ -309,6 +309,8 @@ impl OpenAiProvider {
                                         total_tokens,
                                         cache_read_tokens,
                                         cache_write_tokens: None,
+                                        raw_usage: Some(usage.clone()),
+                                        is_complete: true,
                                     }))
                                     .await;
                             }
@@ -395,10 +397,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "test-session-123".to_string(),
-            request_id: "test-req-456".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("test-session-123", "test-req-456");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -432,10 +431,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "free-sess-default".to_string(),
-            request_id: "free-req-default".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("free-sess-default", "free-req-default");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -471,10 +467,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "free-sess-789".to_string(),
-            request_id: "free-req-012".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("free-sess-789", "free-req-012");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -512,10 +505,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "go-session-123".to_string(),
-            request_id: "go-req-456".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("go-session-123", "go-req-456");
 
         OpenAiProvider::new("go-key")
             .with_base_url(&url)

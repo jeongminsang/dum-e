@@ -374,17 +374,20 @@ impl AnthropicProvider {
                                 "message_start" => {
                                     if let Some(msg) = parsed.get("message") {
                                          if let Some(usage) = msg.get("usage") {
-                                             let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                             let raw_input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                                              let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                                              let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64());
                                              let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64());
-                                             if input > 0 || output > 0 || cache_read.is_some() || cache_write.is_some() {
+                                             let normalized_input = raw_input + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
+                                             if normalized_input > 0 || output > 0 || cache_read.is_some() || cache_write.is_some() {
                                                  let _ = tx.send(StreamEvent::Usage(TokenUsage {
-                                                     input_tokens: input,
+                                                     input_tokens: normalized_input,
                                                      output_tokens: output,
-                                                     total_tokens: input + output,
+                                                     total_tokens: normalized_input + output,
                                                      cache_read_tokens: cache_read,
                                                      cache_write_tokens: cache_write,
+                                                     raw_usage: Some(usage.clone()),
+                                                     is_complete: true,
                                                  })).await;
                                              }
                                          }
@@ -402,6 +405,8 @@ impl AnthropicProvider {
                                                  total_tokens: output,
                                                  cache_read_tokens: cache_read,
                                                  cache_write_tokens: cache_write,
+                                                 raw_usage: Some(usage.clone()),
+                                                 is_complete: true,
                                              })).await;
                                          }
                                     }

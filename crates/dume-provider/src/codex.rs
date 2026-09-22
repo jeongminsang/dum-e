@@ -1,5 +1,5 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, ToolDefinition};
+use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
 use anyhow::{Context, Result, bail};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -657,6 +657,23 @@ impl ResponseState {
                         }
                         let _: Value = serde_json::from_str(&call.arguments)
                             .context("Invalid final Codex tool arguments")?;
+                    }
+                }
+                if let Some(usage) = response.get("usage") {
+                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let total = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(input + output);
+                    let cache_read = usage.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|v| v.as_i64());
+                    if input > 0 || output > 0 || total > 0 {
+                        events.push(StreamEvent::Usage(TokenUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            total_tokens: total,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: None,
+                            raw_usage: Some(usage.clone()),
+                            is_complete: true,
+                        }));
                     }
                 }
                 if !self.reasoning.is_empty() {

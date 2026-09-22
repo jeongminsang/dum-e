@@ -46,6 +46,14 @@ enum Commands {
         /// Override the selected provider's API root (except Google); sends its resolved credentials to this URL
         #[arg(long, requires = "task_prompt")]
         base_url: Option<String>,
+        #[arg(long)]
+        db_path: Option<String>,
+        #[arg(long)]
+        benchmark_run_id: Option<String>,
+        #[arg(long)]
+        case_id: Option<String>,
+        #[arg(long)]
+        variant: Option<String>,
     },
 
     /// Show current harness status
@@ -126,6 +134,25 @@ enum Commands {
         #[arg(long, default_value = "default")]
         session_id: String,
     },
+    /// Run token-efficiency benchmarks
+    Bench {
+        #[arg(long, value_delimiter = ',')]
+        cases: Vec<String>,
+        #[arg(long)]
+        baseline_bin: Option<std::path::PathBuf>,
+        #[arg(long)]
+        candidate_bin: Option<std::path::PathBuf>,
+        #[arg(long, default_value = "1")]
+        repetitions: usize,
+        #[arg(long, default_value = "anthropic/claude-sonnet-4-5")]
+        model: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value = ".dume/rust/benchmarks")]
+        output_dir: std::path::PathBuf,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -148,6 +175,10 @@ async fn main() -> Result<()> {
             task_prompt,
             model,
             base_url,
+            db_path,
+            benchmark_run_id,
+            case_id,
+            variant,
         }) => {
             run_worker_child(
                 &attempt_id,
@@ -156,6 +187,10 @@ async fn main() -> Result<()> {
                 task_prompt.as_deref(),
                 &model,
                 base_url.as_deref(),
+                db_path.as_deref(),
+                benchmark_run_id.as_deref(),
+                case_id.as_deref(),
+                variant.as_deref(),
             )
             .await?;
         }
@@ -258,6 +293,38 @@ async fn main() -> Result<()> {
             println!("  Input Tokens:  {}", usage.input_tokens);
             println!("  Output Tokens: {}", usage.output_tokens);
             println!("  Total Tokens:  {}", usage.total_tokens);
+        }
+        Some(Commands::Bench {
+            cases,
+            baseline_bin,
+            candidate_bin,
+            repetitions,
+            model,
+            base_url,
+            output_dir,
+            db_path,
+        }) => {
+            let run_id = format!(
+                "bench_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+            let config = dume_cli::bench::BenchmarkRunConfig {
+                run_id,
+                case_ids: cases,
+                baseline_bin,
+                candidate_bin,
+                repetitions,
+                model,
+                base_url,
+                output_dir,
+                db_path,
+            };
+            let runner = dume_cli::bench::BenchmarkRunner::new(config)?;
+            let report = runner.run().await?;
+            println!("{}", runner.render_markdown_report(&report));
         }
         None => {
             // Default to interactive TUI
@@ -406,6 +473,10 @@ async fn run_worker_child(
     task_prompt: Option<&str>,
     model: &str,
     base_url: Option<&str>,
+    db_path: Option<&str>,
+    benchmark_run_id: Option<&str>,
+    case_id: Option<&str>,
+    variant: Option<&str>,
 ) -> Result<()> {
     let path = Path::new(worktree_path);
 
@@ -421,6 +492,25 @@ async fn run_worker_child(
         let mut agent = dume_worker::AgentLoop::new(path, model);
         if let Some(base_url) = base_url {
             agent = agent.with_base_url(base_url);
+        }
+        if let Some(db_p) = db_path {
+            let artifacts_dir = Path::new(db_p)
+                .parent()
+                .map(|p| p.join("artifacts"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".dume/rust/artifacts"));
+            if let Ok(store) = HarnessStore::open(db_p, &artifacts_dir) {
+                let ctx = dume_provider::types::StreamRequestContext {
+                    session_id: attempt_id.to_string(),
+                    request_id: format!("req_{}_0", attempt_id),
+                    benchmark_run_id: benchmark_run_id.map(ToString::to_string),
+                    case_id: case_id.map(ToString::to_string),
+                    variant: variant.map(ToString::to_string),
+                    attempt_id: Some(attempt_id.to_string()),
+                    agent_id: Some("main".to_string()),
+                    parent_agent_id: None,
+                };
+                agent = agent.with_store(Arc::new(store)).with_request_context(ctx);
+            }
         }
         let progress_exec = WorkerToHostMessage::Progress {
             attempt_id: attempt_id.to_string(),
@@ -450,7 +540,7 @@ async fn run_worker_child(
                 last_reply.as_deref().unwrap_or("none")
             )
         }
-        Some(dume_worker::AgentOutcome::Cancelled) => "Worker cancelled".to_string(),
+        Some(dume_worker::AgentOutcome::Cancelled { .. }) => "Worker cancelled".to_string(),
         None => "Worker completed attempt".to_string(),
     };
 

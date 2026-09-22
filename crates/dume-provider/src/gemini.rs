@@ -1,5 +1,5 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, ToolDefinition};
+use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -64,6 +64,23 @@ impl GeminiProvider {
                             let message = format!("Google API error: {err}");
                             let _ = tx.send(StreamEvent::Error(message.clone())).await;
                             anyhow::bail!(message);
+                        }
+                        if let Some(usage) = val.get("usageMetadata") {
+                            let input = usage.get("promptTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let output = usage.get("candidatesTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let total = usage.get("totalTokenCount").and_then(|v| v.as_i64()).unwrap_or(input + output);
+                            let cache_read = usage.get("cachedContentTokenCount").and_then(|v| v.as_i64());
+                            if input > 0 || output > 0 || total > 0 {
+                                let _ = tx.send(StreamEvent::Usage(TokenUsage {
+                                    input_tokens: input,
+                                    output_tokens: output,
+                                    total_tokens: total,
+                                    cache_read_tokens: cache_read,
+                                    cache_write_tokens: None,
+                                    raw_usage: Some(usage.clone()),
+                                    is_complete: true,
+                                })).await;
+                            }
                         }
                         if let Some(candidates) = val.get("candidates").and_then(|c| c.as_array()) {
                             if let Some(first) = candidates.first() {

@@ -1106,17 +1106,41 @@ impl HarnessStore {
         })
     }
 
+    fn map_request_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<dume_core::types::RequestUsage> {
+        Ok(dume_core::types::RequestUsage {
+            request_id: r.get(0)?,
+            session_id: r.get(1)?,
+            model: r.get(2)?,
+            input_tokens: r.get(3)?,
+            output_tokens: r.get(4)?,
+            total_tokens: r.get(5)?,
+            cache_read_tokens: r.get(6)?,
+            cache_write_tokens: r.get(7)?,
+            benchmark_run_id: r.get(8)?,
+            case_id: r.get(9)?,
+            variant: r.get(10)?,
+            attempt_id: r.get(11)?,
+            agent_id: r.get(12)?,
+            parent_agent_id: r.get(13)?,
+            raw_usage_json: r.get(14)?,
+            is_complete: r.get::<_, i64>(15)? != 0,
+            created_at: r.get(16)?,
+        })
+    }
+
     pub fn record_request_usage(
         &self,
         usage: &dume_core::types::RequestUsage,
     ) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let inserted = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
             r#"
             INSERT OR IGNORE INTO request_usage (
                 request_id, session_id, model, input_tokens, output_tokens, total_tokens,
-                cache_read_tokens, cache_write_tokens, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant,
+                attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 usage.request_id,
@@ -1127,6 +1151,14 @@ impl HarnessStore {
                 usage.total_tokens,
                 usage.cache_read_tokens,
                 usage.cache_write_tokens,
+                usage.benchmark_run_id,
+                usage.case_id,
+                usage.variant,
+                usage.attempt_id,
+                usage.agent_id,
+                usage.parent_agent_id,
+                usage.raw_usage_json,
+                if usage.is_complete { 1 } else { 0 },
                 usage.created_at,
             ],
         )?;
@@ -1134,7 +1166,7 @@ impl HarnessStore {
         // Also update aggregate session_usage if newly recorded
         if inserted > 0 {
             let total = usage.input_tokens + usage.output_tokens;
-            conn.execute(
+            tx.execute(
                 r#"
                 INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1158,6 +1190,7 @@ impl HarnessStore {
             )?;
         }
 
+        tx.commit()?;
         Ok(inserted > 0)
     }
 
@@ -1167,21 +1200,43 @@ impl HarnessStore {
     ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, created_at FROM request_usage WHERE session_id = ?1 ORDER BY created_at ASC",
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| {
-            Ok(dume_core::types::RequestUsage {
-                request_id: r.get(0)?,
-                session_id: r.get(1)?,
-                model: r.get(2)?,
-                input_tokens: r.get(3)?,
-                output_tokens: r.get(4)?,
-                total_tokens: r.get(5)?,
-                cache_read_tokens: r.get(6)?,
-                cache_write_tokens: r.get(7)?,
-                created_at: r.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![session_id], Self::map_request_usage_row)?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_benchmark_request_usages(
+        &self,
+        benchmark_run_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE benchmark_run_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![benchmark_run_id], Self::map_request_usage_row)?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_attempt_request_usages(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE attempt_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![attempt_id], Self::map_request_usage_row)?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -1535,6 +1590,14 @@ mod tests {
             total_tokens: 150,
             cache_read_tokens: 30,
             cache_write_tokens: 10,
+            benchmark_run_id: Some("bench_1".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("main".to_string()),
+            parent_agent_id: None,
+            raw_usage_json: Some("{\"prompt_tokens\":100}".to_string()),
+            is_complete: true,
             created_at: 1000,
         };
 
@@ -1554,6 +1617,14 @@ mod tests {
             total_tokens: 280,
             cache_read_tokens: 60,
             cache_write_tokens: 20,
+            benchmark_run_id: Some("bench_1".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("child_1".to_string()),
+            parent_agent_id: Some("main".to_string()),
+            raw_usage_json: None,
+            is_complete: true,
             created_at: 2000,
         };
         store.record_request_usage(&req2).unwrap();
@@ -1561,7 +1632,15 @@ mod tests {
         let list = store.get_session_request_usages(session_id).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].request_id, "req_1");
+        assert_eq!(list[0].benchmark_run_id.as_deref(), Some("bench_1"));
         assert_eq!(list[1].request_id, "req_2");
+        assert_eq!(list[1].parent_agent_id.as_deref(), Some("main"));
+
+        let bench_list = store.get_benchmark_request_usages("bench_1").unwrap();
+        assert_eq!(bench_list.len(), 2);
+
+        let att_list = store.get_attempt_request_usages("att_1").unwrap();
+        assert_eq!(att_list.len(), 2);
 
         let agg = store.get_session_usage(session_id).unwrap();
         assert_eq!(agg.input_tokens, 300);

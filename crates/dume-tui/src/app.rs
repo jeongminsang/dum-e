@@ -103,6 +103,7 @@ pub struct App {
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
     pub session_usage: (i64, i64, i64, i64, i64), // (input, output, total, cache_read, cache_write)
+    pub current_turn_usage: dume_provider::types::TokenUsage,
     pub session_id: String,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -195,6 +196,7 @@ impl App {
             last_ctrl_c: None,
             available_update: None,
             session_usage: (0, 0, 0, 0, 0),
+            current_turn_usage: dume_provider::types::TokenUsage::default(),
             session_id: dume_provider::types::StreamRequestContext::new().session_id,
             prompt_history: Vec::new(),
             history_index: None,
@@ -354,18 +356,34 @@ impl App {
                 self.streaming_text.push_str(&arguments_delta);
             }
             ConversationEvent::Stream(StreamEvent::Usage(usage)) => {
-                self.session_usage.0 += usage.input_tokens;
-                self.session_usage.1 += usage.output_tokens;
-                self.session_usage.2 += usage.total_tokens;
-                if let Some(r) = usage.cache_read_tokens {
+                self.current_turn_usage.merge_cumulative(&usage);
+            }
+            ConversationEvent::Stream(StreamEvent::Completed { .. }) => {
+                self.session_usage.0 += self.current_turn_usage.input_tokens;
+                self.session_usage.1 += self.current_turn_usage.output_tokens;
+                self.session_usage.2 += self.current_turn_usage.total_tokens;
+                if let Some(r) = self.current_turn_usage.cache_read_tokens {
                     self.session_usage.3 += r;
                 }
-                if let Some(w) = usage.cache_write_tokens {
+                if let Some(w) = self.current_turn_usage.cache_write_tokens {
                     self.session_usage.4 += w;
                 }
+                self.current_turn_usage = dume_provider::types::TokenUsage::default();
             }
             ConversationEvent::Stream(_) => {}
             ConversationEvent::Finished { messages, error } => {
+                if self.current_turn_usage.input_tokens > 0 || self.current_turn_usage.output_tokens > 0 {
+                    self.session_usage.0 += self.current_turn_usage.input_tokens;
+                    self.session_usage.1 += self.current_turn_usage.output_tokens;
+                    self.session_usage.2 += self.current_turn_usage.total_tokens;
+                    if let Some(r) = self.current_turn_usage.cache_read_tokens {
+                        self.session_usage.3 += r;
+                    }
+                    if let Some(w) = self.current_turn_usage.cache_write_tokens {
+                        self.session_usage.4 += w;
+                    }
+                    self.current_turn_usage = dume_provider::types::TokenUsage::default();
+                }
                 self.messages = messages;
                 if let Some(error) = error {
                     self.messages
