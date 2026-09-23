@@ -69,6 +69,7 @@ pub struct AgentLoop {
     pub max_turns: usize,
     pub endpoint: Option<Endpoint>,
     pub store: Option<std::sync::Arc<dume_store::HarnessStore>>,
+    artifact_store: Option<std::sync::Arc<dume_store::ArtifactStore>>,
     pub request_context: Option<dume_provider::types::StreamRequestContext>,
     pub descendant_usage: std::sync::Arc<tokio::sync::Mutex<dume_provider::types::TokenUsage>>,
 }
@@ -88,13 +89,20 @@ impl AgentLoop {
             max_turns: 10,
             endpoint: None,
             store: None,
+            artifact_store: None,
             request_context: None,
             descendant_usage: std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
         }
     }
 
     pub fn with_store(mut self, store: std::sync::Arc<dume_store::HarnessStore>) -> Self {
+        self.artifact_store = Some(std::sync::Arc::new(store.artifacts.clone()));
         self.store = Some(store);
+        self
+    }
+
+    pub fn with_artifact_store(mut self, store: std::sync::Arc<dume_store::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -116,7 +124,7 @@ impl AgentLoop {
         self
     }
 
-    pub fn tool_definitions() -> Vec<ToolDefinition> {
+    pub fn tool_definitions(worktree_path: &Path) -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {
                 name: "bash".to_string(),
@@ -181,12 +189,23 @@ impl AgentLoop {
                 }),
             },
             ToolDefinition {
-                name: "read_artifact".to_string(),
-                description: "Read bounded content from an artifact file with offset and length limits".to_string(),
+                name: "load_skill".to_string(),
+                description: dume_core::skills::SkillRegistry::load_default_for(worktree_path).format_catalog_description(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Relative path to artifact file" },
+                        "name": { "type": "string", "description": "Name of the skill to load" }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_artifact".to_string(),
+                description: "Read bounded content from an artifact file or SHA-256 artifact ID with offset and length limits".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path or SHA-256 artifact ID" },
                         "offset": { "type": "integer", "description": "Optional byte offset to start reading from" },
                         "length": { "type": "integer", "description": "Optional maximum bytes to read (default/max: 51200)" }
                     },
@@ -201,7 +220,9 @@ impl AgentLoop {
                     "properties": {
                         "id": { "type": "string", "description": "Unique identifier for the subagent" },
                         "prompt": { "type": "string", "description": "Task description for the subagent" },
-                        "sub_dir": { "type": "string", "description": "Relative directory in worktree for subagent execution" }
+                        "sub_dir": { "type": "string", "description": "Relative directory in worktree for subagent execution" },
+                        "constraints": { "type": "string", "description": "Optional specific constraints or boundaries for the child" },
+                        "artifact_ids": { "type": "array", "maxItems": 32, "items": { "type": "string" }, "description": "Optional SHA-256 artifact IDs relevant for child execution" }
                     },
                     "required": ["id", "prompt", "sub_dir"]
                 }),
@@ -239,6 +260,7 @@ impl AgentLoop {
         subagent_manager: &dume_mcp::subagent::SubagentManager,
         child_paths: &mut std::collections::HashMap<String, std::path::PathBuf>,
         cancellation: &CancellationToken,
+        messages: &[ChatMessage],
     ) -> Result<ChatMessage> {
         anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
         let parsed_args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
@@ -317,6 +339,13 @@ impl AgentLoop {
                     None
                 }
             }
+            "load_skill" => {
+                if parsed_args.get("name").and_then(|v| v.as_str()).is_none() {
+                    Some("Missing required field 'name' (string)")
+                } else {
+                    None
+                }
+            }
             "read_artifact" => {
                 if parsed_args.get("path").and_then(|v| v.as_str()).is_none() {
                     Some("Missing required field 'path' (string)")
@@ -339,6 +368,19 @@ impl AgentLoop {
                     .is_none()
                 {
                     Some("Missing required field 'sub_dir' (string)")
+                } else if parsed_args.get("constraints").is_some_and(|v| v.as_str().is_none()) {
+                    Some("Field 'constraints' must be a string")
+                } else if parsed_args
+                    .get("artifact_ids")
+                    .is_some_and(|value| value.as_array().is_none())
+                    || parsed_args.get("artifact_ids").and_then(|value| value.as_array())
+                        .is_some_and(|items| items.iter().any(|item| item.as_str().is_none()))
+                {
+                    Some("Field 'artifact_ids' must be an array of strings")
+                } else if parsed_args.get("artifact_ids").and_then(|value| value.as_array())
+                    .is_some_and(|items| items.len() > 32)
+                {
+                    Some("Field 'artifact_ids' must contain at most 32 entries")
                 } else {
                     None
                 }
@@ -373,10 +415,93 @@ impl AgentLoop {
         }
 
         let exec_result = match tc.name.as_str() {
+            "load_skill" => {
+                let skill_name = parsed_args["name"].as_str().unwrap();
+                let mut registry = dume_core::skills::SkillRegistry::load_default_for(&self.worktree_path);
+                if let Some(skill) = registry.get_or_reload(skill_name) {
+                    let is_active = dume_core::skills::SkillRegistry::is_content_in_messages(
+                        &skill.content,
+                        messages.iter().map(|m| m.content.as_str()),
+                    );
+                    if is_active {
+                        format!("Skill '{}' is already active in current context", skill.name)
+                    } else {
+                        format!("[Loaded Skill: '{}']\nDescription: {}\n\n---\n{}\n---", skill.name, skill.description, skill.content)
+                    }
+                } else {
+                    let available = registry.catalog();
+                    let names: Vec<String> = available.into_iter().map(|s| s.name).collect();
+                    format!("Skill '{}' not found. Available skills: {}", skill_name, names.join(", "))
+                }
+            }
             "spawn_subagent" => {
                 let sub_id = parsed_args["id"].as_str().unwrap().to_string();
                 let prompt = parsed_args["prompt"].as_str().unwrap().to_string();
                 let sub_dir = parsed_args["sub_dir"].as_str().unwrap();
+                let constraints = parsed_args.get("constraints").and_then(|v| v.as_str());
+                let artifact_ids: Vec<String> = parsed_args
+                    .get("artifact_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().map(|item| item.as_str().unwrap().to_string()).collect()
+                    })
+                    .unwrap_or_default();
+
+                if !artifact_ids.is_empty() {
+                    let Some(store) = &self.store else {
+                        return Ok(ChatMessage::tool(
+                            "Failed to start subagent: artifact references require an artifact store",
+                            tc.id,
+                        ));
+                    };
+                    if let Some(id) = artifact_ids.iter().find(|id| {
+                        id.len() != 64
+                            || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            || !store.artifacts.has_artifact(id)
+                    }) {
+                        return Ok(ChatMessage::tool(
+                            format!("Failed to start subagent: artifact '{}' is invalid or unavailable", id),
+                            tc.id,
+                        ));
+                    }
+                }
+
+                // Construct bounded handoff prompt
+                let mut bounded_prompt = format!("Task: {}", prompt);
+                if let Some(c) = constraints {
+                    bounded_prompt.push_str(&format!("\nConstraints: {}", c));
+                }
+                if !artifact_ids.is_empty() {
+                    bounded_prompt.push_str(&format!(
+                        "\nRelevant Artifacts (read via 'read_artifact'): {}",
+                        artifact_ids.join(", ")
+                    ));
+                }
+
+                // Enforce budget ceiling on child handoff prompt (max 64KB)
+                // If exceeded, admit into artifact store and reference in prompt
+                if bounded_prompt.len() > 65_536 {
+                    let Some(store) = &self.store else {
+                        return Ok(ChatMessage::tool(
+                            "Failed to start subagent: handoff exceeds 64 KiB and no artifact store is configured",
+                            tc.id,
+                        ));
+                    };
+                    let art_id = match store.artifacts.save_artifact(bounded_prompt.as_bytes()) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            return Ok(ChatMessage::tool(
+                                format!("Failed to preserve oversized subagent handoff: {}", error),
+                                tc.id,
+                            ));
+                        }
+                    };
+                    bounded_prompt = format!(
+                        "Task prompt exceeded size ceiling. Full instructions admitted to artifact ID: {}\nUse 'read_artifact' with path '{}' to view full task details and constraints.",
+                        art_id, art_id
+                    );
+                }
+
                 let child_wt = match child_worktree_path(&self.worktree_path, sub_dir) {
                     Ok(path) => path,
                     Err(error) => {
@@ -399,7 +524,7 @@ impl AgentLoop {
                 let endpoint = self.endpoint.clone();
 
                 let parent_repo = self.worktree_path.clone();
-                let child_prompt = prompt.clone();
+                let child_prompt = bounded_prompt.clone();
                 let child_wt_clone = child_wt.clone();
                 let store_clone = self.store.clone();
                 let ctx_clone = self.request_context.as_ref().map(|c| c.child_agent(&sub_id));
@@ -490,7 +615,12 @@ impl AgentLoop {
             },
         };
 
-        Ok(ChatMessage::tool(exec_result, tc.id))
+        let admitted = crate::output_limits::admit_tool_output(
+            &tc.name,
+            &exec_result,
+            self.artifact_store.as_deref(),
+        );
+        Ok(ChatMessage::tool(admitted, tc.id))
     }
 
     pub fn run_task<'a>(
@@ -507,25 +637,25 @@ impl AgentLoop {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentOutcome>> + Send + 'a>> {
         let task_prompt = task_prompt.to_string();
         Box::pin(async move {
-            let tools = Self::tool_definitions();
+            let tools = Self::tool_definitions(&self.worktree_path);
             let tool_executor =
-                LocalToolExecutor::new(&self.worktree_path).with_cancellation(cancellation.clone());
+                LocalToolExecutor::new(&self.worktree_path)
+                    .with_cancellation(cancellation.clone())
+                    .with_artifact_store(self.artifact_store.clone());
             let subagent_manager = std::sync::Arc::new(dume_mcp::subagent::SubagentManager::new());
             let mut child_paths: std::collections::HashMap<String, std::path::PathBuf> =
                 std::collections::HashMap::new();
             let result: Result<AgentOutcome> = async {
 
-        let system_msg = format!(
-            "You are DUM-E coding agent. Work directly in the worktree.\nGoal: {}\nUse tools bash, read_file, write_file as needed.",
-            task_prompt
-        );
+        let system_msg = dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT.to_string();
+        let user_msg = dume_core::types::PromptPrefix::build_task_user_message(&task_prompt);
 
         let mut messages = vec![
             ChatMessage::system(system_msg),
-            ChatMessage::user(task_prompt),
+            ChatMessage::user(user_msg),
         ];
 
-        let session_ctx = self
+        let mut session_ctx = self
             .request_context
             .clone()
             .unwrap_or_else(dume_provider::types::StreamRequestContext::new);
@@ -566,6 +696,17 @@ impl AgentLoop {
 
         for _turn in 0..self.max_turns {
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
+
+            if crate::context::prepare_request_context(crate::context::RequestContext {
+                model: &self.model,
+                session_id: &session_ctx.session_id,
+                messages: &mut messages,
+                tools: &tools,
+                store: self.store.as_deref(),
+            })? {
+                session_ctx = session_ctx.reset_session();
+            }
+
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(50);
             let model_name = self.model.clone();
             let msgs = messages.clone();
@@ -602,6 +743,8 @@ impl AgentLoop {
 
             let mut assistant_reply = String::new();
             let mut codex_reasoning = Vec::new();
+            let mut deepseek_reasoning = String::new();
+            let mut gemini_parts = Vec::new();
             // Preserve order: index -> (id, name, args_buf)
             let mut ordered_calls: Vec<(String, String, String)> = Vec::new();
             let mut stream_completed_normally = false;
@@ -625,6 +768,8 @@ impl AgentLoop {
                 };
                 match evt {
                     StreamEvent::CodexReasoning(items) => codex_reasoning.extend(items),
+                    StreamEvent::DeepSeekReasoning(delta) => deepseek_reasoning.push_str(&delta),
+                    StreamEvent::GeminiParts(parts) => gemini_parts.extend(parts),
                     StreamEvent::TextDelta(delta) => {
                         assistant_reply.push_str(&delta);
                     }
@@ -721,6 +866,8 @@ impl AgentLoop {
                 // Regular assistant message without tools
                 let mut message = ChatMessage::assistant(&assistant_reply);
                 message.codex_reasoning = codex_reasoning;
+                if !deepseek_reasoning.is_empty() { message.deepseek_reasoning = Some(deepseek_reasoning); }
+                message.gemini_parts = gemini_parts;
                 messages.push(message);
                 final_outcome = Some(AgentOutcome::Completed {
                     answer: assistant_reply,
@@ -732,12 +879,14 @@ impl AgentLoop {
             // CRITICAL: Assistant message MUST contain tool_calls metadata so provider accepts subsequent tool responses
             let mut message = ChatMessage::assistant_with_tool_calls(&assistant_reply, complete_tool_calls.clone());
             message.codex_reasoning = codex_reasoning;
+            message.deepseek_reasoning = Some(deepseek_reasoning);
+            message.gemini_parts = gemini_parts;
             messages.push(message);
 
             // Execute requested tools in exact order and feed back results
             for tc in complete_tool_calls {
                 anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
-                messages.push(self.execute_tool(tc, &tool_executor, &subagent_manager, &mut child_paths, &cancellation).await?);
+                messages.push(self.execute_tool(tc, &tool_executor, &subagent_manager, &mut child_paths, &cancellation, &messages).await?);
             }
         }
 
@@ -784,6 +933,7 @@ pub struct ToolDispatcher {
     executor: LocalToolExecutor,
     subagents: dume_mcp::subagent::SubagentManager,
     child_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    last_tool_definitions: Option<Vec<ToolDefinition>>,
     cancellation: CancellationToken,
 }
 
@@ -798,15 +948,53 @@ impl ToolDispatcher {
             executor: LocalToolExecutor::new(path.as_ref()).with_cancellation(cancellation.clone()),
             subagents: dume_mcp::subagent::SubagentManager::new(),
             child_paths: std::collections::HashMap::new(),
+            last_tool_definitions: None,
             cancellation,
         }
+    }
+
+    pub fn with_store(mut self, store: std::sync::Arc<dume_store::HarnessStore>) -> Self {
+        let art_store = std::sync::Arc::new(store.artifacts.clone());
+        self.agent = self.agent.with_store(store);
+        self.executor = self.executor.with_artifact_store(Some(art_store));
+        self
+    }
+
+    pub fn with_artifact_store(mut self, store: std::sync::Arc<dume_store::ArtifactStore>) -> Self {
+        self.executor = self.executor.with_artifact_store(Some(std::sync::Arc::clone(&store)));
+        self.agent = self.agent.with_artifact_store(store);
+        self
+    }
+
+    pub fn worktree_path(&self) -> &Path {
+        &self.agent.worktree_path
+    }
+
+    pub fn tool_definitions_for_session(
+        &mut self,
+        session_id: &mut String,
+    ) -> Vec<ToolDefinition> {
+        let tools = AgentLoop::tool_definitions(self.worktree_path());
+        if self
+            .last_tool_definitions
+            .as_ref()
+            .is_some_and(|previous| previous != &tools)
+        {
+            *session_id = dume_provider::types::StreamRequestContext::new().session_id;
+        }
+        self.last_tool_definitions = Some(tools.clone());
+        tools
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.agent.model = model.into();
     }
 
-    pub async fn execute(&mut self, call: dume_provider::ToolCall) -> Result<ChatMessage> {
+    pub fn store(&self) -> Option<&std::sync::Arc<dume_store::HarnessStore>> {
+        self.agent.store.as_ref()
+    }
+
+    pub async fn execute(&mut self, call: dume_provider::ToolCall, messages: &[ChatMessage]) -> Result<ChatMessage> {
         self.agent
             .execute_tool(
                 call,
@@ -814,6 +1002,7 @@ impl ToolDispatcher {
                 &self.subagents,
                 &mut self.child_paths,
                 &self.cancellation,
+                messages,
             )
             .await
     }
@@ -846,9 +1035,23 @@ async fn run_isolated_child(
     dume_git::create_git_worktree(parent, child, "HEAD")
         .await
         .with_context(|| format!("Subagent isolation failed at {}", child.display()))?;
+    let base_commit = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(child)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("Failed to identify subagent worktree base commit")?;
+    anyhow::ensure!(
+        base_commit.status.success(),
+        "Failed to identify subagent worktree base commit"
+    );
+    let base_commit = String::from_utf8_lossy(&base_commit.stdout).trim().to_string();
     let mut agent = AgentLoop::new(child, model);
     agent.endpoint = endpoint;
-    agent.store = store;
+    if let Some(store) = store.clone() {
+        agent = agent.with_store(store);
+    }
     agent.request_context = request_context;
     agent.descendant_usage = std::sync::Arc::clone(&descendant_usage);
     let result = agent.run_task_with_cancellation(prompt, cancellation).await;
@@ -858,14 +1061,58 @@ async fn run_isolated_child(
             guard.accumulate(usage);
         }
     }
-    // Retain even clean worktrees: detached commits are also child output.
-    let retained = format!(
-        "Worktree retained at {} for inspection/integration; output has not been integrated",
-        child.display()
-    );
     match result {
-        Ok(result) => Ok(format!("{}\n{}", result, retained)),
-        Err(error) => anyhow::bail!("{:#}\n{}", error, retained),
+        Ok(outcome) => {
+            let (status_str, answer_str) = match &outcome {
+                AgentOutcome::Completed { answer, .. } => ("Completed", answer.as_str()),
+                AgentOutcome::TurnLimitExhausted { last_reply, .. } => (
+                    "TurnLimitExhausted",
+                    last_reply.as_deref().unwrap_or("Turn limit reached"),
+                ),
+                AgentOutcome::Cancelled { .. } => ("Cancelled", "Subagent was cancelled"),
+            };
+            let changed_files = match tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(child)
+                .args(["status", "--short"])
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    let files = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if files.is_empty() { "(clean)".to_string() } else { files }
+                }
+                Ok(output) => format!("(unavailable: git status exited {})", output.status),
+                Err(error) => format!("(unavailable: {})", error),
+            };
+            let formatted = format!(
+                "Status: {}\nChanges/Findings: {}\nChanged Files:\n{}\nValidation: Not independently run by the harness\nUnresolved Issues: Not independently verified; review the child findings\nWorktree: {}\nBase Commit: {} (parent uncommitted changes are excluded)\nNote: Output has not been integrated into parent worktree.",
+                status_str,
+                answer_str,
+                changed_files,
+                child.display(),
+                base_commit
+            );
+            let bounded = crate::output_limits::admit_tool_output(
+                "subagent_outcome",
+                &formatted,
+                store.as_ref().map(|s| &s.artifacts),
+            );
+            Ok(bounded)
+        }
+        Err(error) => {
+            let formatted = format!(
+                "Status: Failed\nChanges/Findings: Execution error\nValidation: None\nUnresolved Issues: {:#}\nWorktree: {}\nNote: Worktree retained for recovery; output not integrated.",
+                error,
+                child.display()
+            );
+            let bounded = crate::output_limits::admit_tool_output(
+                "subagent_error",
+                &formatted,
+                store.as_ref().map(|s| &s.artifacts),
+            );
+            anyhow::bail!("{}", bounded)
+        }
     }
 }
 
@@ -1246,6 +1493,15 @@ mod tests {
                 .unwrap();
             assert!(output.status.success());
         }
+        let base_commit = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert!(base_commit.status.success());
+        let base_commit = String::from_utf8_lossy(&base_commit.stdout).trim().to_string();
         let wt_path = dir.path().join("child");
 
         // Spawn mock server for 2-turn agent loop:
@@ -1339,8 +1595,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(res.starts_with("E2E Task is finished."));
-        assert!(res.contains(&format!("Worktree retained at {}", wt_path.display())));
+        assert!(res.contains("Status: Completed"));
+        assert!(res.contains("Changes/Findings: E2E Task is finished."));
+        assert!(res.contains("Changed Files:"));
+        assert!(res.contains("e2e_out.txt"));
+        assert!(res.contains("Validation: Not independently run by the harness"));
+        assert!(res.contains(&format!("Base Commit: {}", base_commit)));
+        assert!(!res.contains("Worktree clean verification passed"));
+        assert!(res.contains(&format!("Worktree: {}", wt_path.display())));
         assert!(wt_path.join(".git").exists());
         assert!(!dir.path().join("e2e_out.txt").exists());
 
@@ -1359,6 +1621,103 @@ mod tests {
             2,
             "Agent loop must execute both turns via HTTP"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_compaction_is_visible_in_the_next_provider_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for turn in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 4096];
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&chunk[..size]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 4096];
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&chunk[..size]);
+                }
+                requests.push(
+                    serde_json::from_slice::<serde_json::Value>(
+                        &bytes[header_end..header_end + length],
+                    )
+                    .unwrap(),
+                );
+
+                let event = if turn == 0 {
+                    serde_json::json!({"choices":[{"delta":{
+                        "content":"trace ".repeat(80_000),
+                        "tool_calls":[{"index":0,"id":"call_after_large_context","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf ok\"}"}}]
+                    },"finish_reason":"tool_calls"}]})
+                } else {
+                    serde_json::json!({"choices":[{"delta":{"content":"Finished after compaction."},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let result = AgentLoop::new(dir.path(), "mock-compaction-model")
+            .with_mock_base_url(url)
+            .with_store(store)
+            .run_task("Inspect the result and preserve this constraint.")
+            .await
+            .unwrap();
+        assert!(result.to_string().contains("Finished after compaction"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_messages = requests[1]["messages"].as_array().unwrap();
+        assert!(second_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Conversation checkpoint"))
+        }));
+        assert!(second_messages.iter().any(|message| {
+            message["content"].as_str().is_some_and(|content| {
+                content.contains("Inspect the result and preserve this constraint.")
+            })
+        }));
+        assert!(second_messages.iter().all(|message| {
+            !message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("trace trace trace"))
+        }));
     }
 
     #[tokio::test]
@@ -1558,7 +1917,7 @@ mod tests {
         let wt_path = dir.path().to_path_buf();
         let agent = AgentLoop::new(&wt_path, "mock-model");
 
-        let tools = AgentLoop::tool_definitions();
+        let tools = AgentLoop::tool_definitions(&wt_path);
         assert!(tools.iter().any(|t| t.name == "spawn_subagent"));
         assert!(tools.iter().any(|t| t.name == "wait_subagent"));
         assert!(tools.iter().any(|t| t.name == "cancel_subagent"));
@@ -1625,5 +1984,325 @@ mod tests {
             }
             other => panic!("Expected TurnLimitExhausted, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_stable_prefix_construction() {
+        let p1 = dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT;
+        let p2 = dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT;
+        assert_eq!(p1, p2);
+
+        let u1 = dume_core::types::PromptPrefix::build_task_user_message("  fix bug in file.rs  ");
+        assert_eq!(u1, "fix bug in file.rs");
+
+        // Tools definition order and determinism
+        let dir = tempfile::tempdir().unwrap();
+        let tools1 = AgentLoop::tool_definitions(dir.path());
+        let tools2 = AgentLoop::tool_definitions(dir.path());
+        assert_eq!(tools1, tools2);
+        assert!(!tools1.is_empty());
+
+        // Session ID stability vs request ID rotation
+        let ctx = dume_provider::types::StreamRequestContext::new();
+        let req1 = ctx.next_request();
+        let req2 = ctx.next_request();
+        assert_eq!(req1.session_id, ctx.session_id);
+        assert_eq!(req2.session_id, ctx.session_id);
+        assert_ne!(req1.request_id, req2.request_id);
+
+        // Reset session generates distinct session ID
+        let reset = ctx.reset_session();
+        assert_ne!(reset.session_id, ctx.session_id);
+    }
+
+    #[test]
+    fn tool_catalog_change_rotates_tui_session_identity() {
+        let dir = tempdir().unwrap();
+        let mut dispatcher = ToolDispatcher::new(
+            dir.path(),
+            "mock-model",
+            CancellationToken::new(),
+        );
+        let mut session_id = dume_provider::types::StreamRequestContext::new().session_id;
+        let first_catalog = dispatcher.tool_definitions_for_session(&mut session_id);
+        let initial_session = session_id.clone();
+
+        let skills_dir = dir.path().join(".dume/skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("new-skill.md"),
+            "---\nname: new-skill\ndescription: newly available\n---\nSkill content",
+        )
+        .unwrap();
+        let updated_catalog = dispatcher.tool_definitions_for_session(&mut session_id);
+
+        assert_ne!(first_catalog, updated_catalog);
+        assert_ne!(session_id, initial_session);
+    }
+
+    #[tokio::test]
+    async fn test_load_skill_tool_execution() {
+        let dir = tempdir().unwrap();
+        let executor = LocalToolExecutor::new(dir.path());
+        let subagents = dume_mcp::subagent::SubagentManager::new();
+        let mut child_paths = std::collections::HashMap::new();
+        let cancellation = CancellationToken::new();
+
+        let agent = AgentLoop::new(dir.path(), "mock-model");
+
+        // 1. Loading unknown skill returns informative error with catalog
+        let unknown_call = dume_provider::types::ToolCall {
+            id: "call_sk1".to_string(),
+            name: "load_skill".to_string(),
+            arguments: "{\"name\": \"nonexistent_skill\"}".to_string(),
+        };
+        let res = agent.execute_tool(unknown_call, &executor, &subagents, &mut child_paths, &cancellation, &[]).await.unwrap();
+        assert!(res.content.contains("Skill 'nonexistent_skill' not found"));
+
+        // 2. Schema validation rejects missing name
+        let bad_call = dume_provider::types::ToolCall {
+            id: "call_sk2".to_string(),
+            name: "load_skill".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let bad_res = agent.execute_tool(bad_call, &executor, &subagents, &mut child_paths, &cancellation, &[]).await.unwrap();
+        assert!(bad_res.content.contains("Missing required field 'name'"));
+
+        // 3. Deduplication when skill is already in active messages
+        // Create a temporary skill file in dir/.dume/skills
+        let skills_dir = dir.path().join(".dume").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("test-sk.md"), "---\nname: test-sk\ndescription: test desc\n---\nTest skill content").unwrap();
+
+        let mut reg = dume_core::skills::SkillRegistry::new();
+        reg.load_from_dir(&skills_dir);
+        let sk = reg.get("test-sk").unwrap();
+
+        let messages = vec![ChatMessage::user(format!("Some text with {}", sk.content))];
+        let _dup_call = dume_provider::types::ToolCall {
+            id: "call_sk3".to_string(),
+            name: "load_skill".to_string(),
+            arguments: "{\"name\": \"test-sk\"}".to_string(),
+        };
+        // When registry is checked, test is_content_in_messages
+        assert!(dume_core::skills::SkillRegistry::is_content_in_messages(
+            &sk.content,
+            messages.iter().map(|m| m.content.as_str()),
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_subagent_handoff_validation() {
+        let dir = tempdir().unwrap();
+        let executor = LocalToolExecutor::new(dir.path());
+        let subagents = dume_mcp::subagent::SubagentManager::new();
+        let mut child_paths = std::collections::HashMap::new();
+        let cancellation = CancellationToken::new();
+
+        let agent = AgentLoop::new(dir.path(), "mock-model");
+
+        // Schema validation rejects invalid constraints or artifact_ids types
+        let bad_constraints = dume_provider::types::ToolCall {
+            id: "call_sub1".to_string(),
+            name: "spawn_subagent".to_string(),
+            arguments: "{\"id\":\"c1\",\"prompt\":\"task\",\"sub_dir\":\"child\",\"constraints\":123}".to_string(),
+        };
+        let res1 = agent.execute_tool(bad_constraints, &executor, &subagents, &mut child_paths, &cancellation, &[]).await.unwrap();
+        assert!(res1.content.contains("Field 'constraints' must be a string"));
+
+        let bad_artifacts = dume_provider::types::ToolCall {
+            id: "call_sub2".to_string(),
+            name: "spawn_subagent".to_string(),
+            arguments: "{\"id\":\"c1\",\"prompt\":\"task\",\"sub_dir\":\"child\",\"artifact_ids\":\"not_array\"}".to_string(),
+        };
+        let res2 = agent.execute_tool(bad_artifacts, &executor, &subagents, &mut child_paths, &cancellation, &[]).await.unwrap();
+        assert!(res2.content.contains("Field 'artifact_ids' must be an array of strings"));
+
+        let too_many_artifacts = dume_provider::types::ToolCall {
+            id: "call_sub3".to_string(),
+            name: "spawn_subagent".to_string(),
+            arguments: serde_json::json!({
+                "id": "c1",
+                "prompt": "task",
+                "sub_dir": "child",
+                "artifact_ids": vec!["a"; 33]
+            })
+            .to_string(),
+        };
+        let res3 = agent.execute_tool(too_many_artifacts, &executor, &subagents, &mut child_paths, &cancellation, &[]).await.unwrap();
+        assert!(res3.content.contains("at most 32 entries"));
+    }
+
+    #[tokio::test]
+    async fn test_context_budgeting_compaction_trigger() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+
+        // Pre-fill a session with messages exceeding budget
+        let session_id = "test_compact_session";
+        store
+            .append_session_message(session_id, "system", dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT, None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Initial user goal", None, None, false)
+            .unwrap();
+
+        // Create large content
+        let large_blob = "x".repeat(50_000);
+        store
+            .append_session_message(session_id, "assistant", &large_blob, None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Next command", None, None, false)
+            .unwrap();
+
+        let active_before = store.list_active_context_messages(session_id).unwrap();
+        assert_eq!(active_before.len(), 4);
+
+        // Perform compaction directly via store method
+        let retain_n = 2;
+        let summary_text = "Compacted context summary: earlier turns archived.";
+        store.compact_session(session_id, summary_text, retain_n).unwrap();
+
+        let active_after = store.list_active_context_messages(session_id).unwrap();
+        assert!(active_after.len() < active_before.len() + 1);
+        // Verify summary is at the start
+        assert_eq!(active_after[0].0, "system");
+        assert!(active_after[0].4, "First active message must be summary");
+        assert_eq!(active_after[0].1, summary_text);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preserves_and_reads_oversized_tool_output() {
+        let dir = tempdir().unwrap();
+        let artifacts = std::sync::Arc::new(
+            dume_store::ArtifactStore::new(dir.path().join("artifacts")).unwrap(),
+        );
+        let mut dispatcher = ToolDispatcher::new(
+            dir.path(),
+            "mock-model",
+            CancellationToken::new(),
+        )
+        .with_artifact_store(artifacts);
+        let call = dume_provider::types::ToolCall {
+            id: "large-output".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({
+                "command": "python3 -c 'print(\"x\"*71680,end=\"\")'"
+            })
+            .to_string(),
+        };
+
+        let result = dispatcher.execute(call, &[]).await.unwrap();
+        let artifact_id = result
+            .content
+            .split("Artifact ID:")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("oversized output should include a digest");
+        let read_call = dume_provider::types::ToolCall {
+            id: "read-large-output".into(),
+            name: "read_artifact".into(),
+            arguments: serde_json::json!({"path": artifact_id, "length": 128}).to_string(),
+        };
+
+        let retrieved = dispatcher.execute(read_call, &[]).await.unwrap();
+        assert!(
+            retrieved.content.contains(&"x".repeat(64)),
+            "{}",
+            retrieved.content.chars().take(512).collect::<String>()
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_child_reads_parent_artifact_by_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"],
+        ] {
+            assert!(tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success());
+        }
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let artifact_id = store.artifacts.save_artifact(b"important child evidence").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let expected_id = artifact_id.clone();
+        let server = tokio::spawn(async move {
+            for turn in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0u8; 1024];
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&chunk[..size]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                let length: usize = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                }).unwrap();
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 1024];
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&chunk[..size]);
+                }
+                let body: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let event = if turn == 0 {
+                    assert!(body.to_string().contains(&expected_id));
+                    json!({"choices":[{"delta":{"tool_calls":[{
+                        "index":0,"id":"read-child-artifact","function":{
+                            "name":"read_artifact",
+                            "arguments":json!({"path":expected_id,"length":128}).to_string()
+                        }
+                    }]},"finish_reason":"tool_calls"}]})
+                } else {
+                    assert!(body.to_string().contains("important child evidence"));
+                    json!({"choices":[{"delta":{"content":"Child read the artifact."},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(), sse
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let child = dir.path().join("child");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_isolated_child(
+                dir.path(),
+                &child,
+                "mock-model",
+                Some(Endpoint::Mock(url)),
+                &format!("Read artifact {artifact_id}"),
+                CancellationToken::new(),
+                Some(store),
+                None,
+                std::sync::Arc::new(tokio::sync::Mutex::new(dume_provider::types::TokenUsage::default())),
+            ),
+        ).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert!(outcome.contains("Child read the artifact."));
     }
 }

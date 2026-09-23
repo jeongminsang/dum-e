@@ -12,6 +12,7 @@ use crate::output_limits::{
 pub struct LocalToolExecutor {
     worktree_path: PathBuf,
     cancellation: CancellationToken,
+    artifact_store: Option<std::sync::Arc<dume_store::ArtifactStore>>,
 }
 
 #[cfg(test)]
@@ -156,17 +157,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_output_bounding() {
+    async fn test_read_artifact_by_hash_and_tamper_detection() {
         let dir = tempfile::tempdir().unwrap();
-        let executor = LocalToolExecutor::new(dir.path());
+        let art_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(dume_store::ArtifactStore::new(art_dir.path()).unwrap());
 
-        // Generate 600 lines
+        let raw_data = b"Arbitrary large binary or text payload to be tested via artifact store";
+        let hash = store.save_artifact(raw_data).unwrap();
+
+        let executor = LocalToolExecutor::new(dir.path())
+            .with_artifact_store(Some(store.clone()));
+
+        // 1. Read by valid artifact ID
+        let res = executor.execute("read_artifact", &serde_json::json!({
+            "path": hash,
+            "offset": 0,
+            "length": 20
+        })).await.unwrap();
+        assert!(res.contains(&format!("[Artifact: {} | Offset: 0 | Read: 20 bytes", hash)));
+        assert!(res.contains("Arbitrary large bina"));
+
+        // 2. Tampered content detection
+        let shard = &hash[..2];
+        let file_path = art_dir.path().join(shard).join(&hash);
+        std::fs::write(&file_path, b"Tampered data completely different").unwrap();
+
+        let err = executor.execute("read_artifact", &serde_json::json!({
+            "path": hash
+        })).await;
+        assert!(err.is_err());
+        let err_msg = format!("{:#}", err.unwrap_err());
+        assert!(err_msg.contains("Artifact corruption detected"));
+
+        // 3. Fallback to worktree file MUST NOT happen for 64-hex hash
+        let fake_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        // Create a file in worktree with the same name as fake_hash
+        std::fs::write(dir.path().join(fake_hash), b"malicious worktree content").unwrap();
+        let fake_err = executor.execute("read_artifact", &serde_json::json!({
+            "path": fake_hash
+        })).await;
+        // Must fail with NotFound from ArtifactStore, NOT return the worktree file!
+        assert!(fake_err.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_id_reader_rejects_external_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(dume_store::ArtifactStore::new(artifacts.path()).unwrap());
+        let hash = store.save_artifact(b"verified data").unwrap();
+        let artifact_path = artifacts.path().join(&hash[..2]).join(&hash);
+        std::fs::remove_file(&artifact_path).unwrap();
+        let outside_file = outside.path().join("target");
+        std::fs::write(&outside_file, b"verified data").unwrap();
+        symlink(&outside_file, &artifact_path).unwrap();
+        assert!(!store.has_artifact(&hash));
+
+        let executor = LocalToolExecutor::new(worktree.path())
+            .with_artifact_store(Some(store));
+        let error = executor
+            .execute("read_artifact", &serde_json::json!({"path": hash}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Artifact must be a regular file"));
+    }
+
+    #[tokio::test]
+    async fn test_symlink_containment_in_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let secret_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&secret_file, b"secret content").unwrap();
+
+        #[cfg(unix)]
+        {
+            let symlink_path = dir.path().join("link_to_secret");
+            std::os::unix::fs::symlink(&secret_file, &symlink_path).unwrap();
+
+            let executor = LocalToolExecutor::new(dir.path());
+            let err = executor.execute("read_artifact", &serde_json::json!({
+                "path": "link_to_secret"
+            })).await;
+            assert!(err.is_err());
+            assert!(err.unwrap_err().to_string().contains("Security violation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bash_preserves_large_output_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let art_dir = tempfile::tempdir().unwrap();
+        let store = dume_store::ArtifactStore::new(art_dir.path()).unwrap();
+
+        let executor = LocalToolExecutor::new(dir.path())
+            .with_artifact_store(Some(std::sync::Arc::new(store.clone())));
+
+        // Produce >70KB output from bash
         let res = executor.execute("bash", &serde_json::json!({
-            "command": "seq 1 600"
+            "command": "python3 -c 'print(\"A\" * 71680)' 2>/dev/null || printf '%*s' 71680 | tr ' ' 'A'"
         })).await.unwrap();
 
-        assert!(res.contains("Exit code: 0"));
-        assert!(res.contains("Truncated"));
+        // Raw output from executor must NOT be truncated before admission!
+        assert!(res.len() >= 71680);
+
+        // Admitting tool output with store
+        let admitted = crate::output_limits::admit_tool_output("bash", &res, Some(&store));
+        assert!(admitted.contains("Output Ceiling Exceeded for tool 'bash'"));
+        assert!(admitted.contains("Full raw output persisted to Artifact ID:"));
+
+        // Extract artifact ID and verify retrieval
+        let marker = "Artifact ID: ";
+        let id_start = admitted.find(marker).unwrap() + marker.len();
+        let artifact_id = &admitted[id_start..id_start + 64];
+
+        let retrieved = executor.execute("read_artifact", &serde_json::json!({
+            "path": artifact_id,
+            "offset": 0,
+            "length": 100
+        })).await.unwrap();
+
+        assert!(retrieved.contains(artifact_id));
+        assert!(retrieved.contains("AAAAA"));
     }
 }
 
@@ -175,11 +290,20 @@ impl LocalToolExecutor {
         Self {
             worktree_path: worktree_path.into(),
             cancellation: CancellationToken::new(),
+            artifact_store: None,
         }
     }
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_artifact_store(
+        mut self,
+        artifact_store: Option<std::sync::Arc<dume_store::ArtifactStore>>,
+    ) -> Self {
+        self.artifact_store = artifact_store;
         self
     }
 
@@ -266,22 +390,9 @@ impl LocalToolExecutor {
         let stderr_raw = String::from_utf8_lossy(&output.stderr);
         let status = output.status.code().unwrap_or(-1);
 
-        let (stdout, _) = truncate_output_head_tail(
-            &stdout_raw,
-            DEFAULT_MAX_OUTPUT_BYTES,
-            DEFAULT_HEAD_LINES,
-            DEFAULT_TAIL_LINES,
-        );
-        let (stderr, _) = truncate_output_head_tail(
-            &stderr_raw,
-            DEFAULT_MAX_OUTPUT_BYTES,
-            DEFAULT_HEAD_LINES,
-            DEFAULT_TAIL_LINES,
-        );
-
         Ok(format!(
             "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
-            status, stdout, stderr
+            status, stdout_raw, stderr_raw
         ))
     }
 
@@ -408,13 +519,7 @@ impl LocalToolExecutor {
             output.push_str(&format!("{}: {}\n", start + idx, line));
         }
 
-        let (bounded, _) = truncate_output_head_tail(
-            &output,
-            DEFAULT_MAX_OUTPUT_BYTES,
-            DEFAULT_HEAD_LINES,
-            DEFAULT_TAIL_LINES,
-        );
-        Ok(bounded)
+        Ok(output)
     }
 
     async fn write_file(&self, rel_path: &str, content: &str) -> Result<String> {
@@ -555,27 +660,64 @@ impl LocalToolExecutor {
         offset: Option<usize>,
         length: Option<usize>,
     ) -> Result<String> {
-        let full_path = self.resolve_path(rel_path)?;
-        let bytes = tokio::fs::read(&full_path)
-            .await
-            .with_context(|| format!("Failed to read artifact: {}", full_path.display()))?;
-
-        let total_bytes = bytes.len();
-        let off = offset.unwrap_or(0).min(total_bytes);
+        let trimmed = rel_path.trim();
+        let off = offset.unwrap_or(0);
         let max_len = length.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES).min(DEFAULT_MAX_OUTPUT_BYTES);
-        let end = (off + max_len).min(total_bytes);
 
-        let slice = &bytes[off..end];
-        let content_str = String::from_utf8_lossy(slice).to_string();
+        // Check if rel_path is a 64-character SHA-256 artifact ID
+        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            let store = self.artifact_store.as_ref().context(
+                "No ArtifactStore configured to read artifact by ID"
+            )?;
+            let store_clone = store.clone();
+            let hash = trimmed.to_string();
+            let (slice, total_bytes) = tokio::task::spawn_blocking(move || {
+                store_clone.get_artifact_range_with_total(&hash, off, max_len)
+            })
+            .await
+            .context("Task join error reading artifact")?
+            .with_context(|| format!("Failed to read artifact ID '{}'", trimmed))?;
 
+            let read_bytes = slice.len();
+            let content_str = String::from_utf8_lossy(&slice).to_string();
+            let header = format!(
+                "[Artifact: {} | Offset: {} | Read: {} bytes | Total: {} bytes]\n",
+                trimmed, off, read_bytes, total_bytes
+            );
+            return Ok(format!("{}{}", header, content_str));
+        }
+
+        // Otherwise, read as a normal worktree-relative file with path containment
+        let full_path = self.resolve_path(rel_path)?;
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(&full_path)
+            .await
+            .with_context(|| format!("Failed to open file: {}", full_path.display()))?;
+        let meta = file
+            .metadata()
+            .await
+            .with_context(|| format!("Failed to get metadata for file: {}", full_path.display()))?;
+        let total_bytes = meta.len() as usize;
+
+        if off >= total_bytes {
+            let header = format!(
+                "[Artifact: {} | Offset: {} | Read: 0 bytes | Total: {} bytes]\n",
+                rel_path, off, total_bytes
+            );
+            return Ok(header);
+        }
+
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(off as u64)).await?;
+        let to_read = max_len.min(total_bytes - off);
+        let mut slice = vec![0u8; to_read];
+        file.read_exact(&mut slice).await?;
+
+        let content_str = String::from_utf8_lossy(&slice).to_string();
         let header = format!(
             "[Artifact: {} | Offset: {} | Read: {} bytes | Total: {} bytes]\n",
-            rel_path,
-            off,
-            end - off,
-            total_bytes
+            rel_path, off, to_read, total_bytes
         );
-
         Ok(format!("{}{}", header, content_str))
     }
 
