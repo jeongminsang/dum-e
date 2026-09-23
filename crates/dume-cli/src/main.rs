@@ -98,7 +98,7 @@ enum Commands {
         #[arg(long, default_value = ".dume/rust/artifacts")]
         artifacts_dir: String,
     },
-    /// List available models across Anthropic, OpenAI, and Google
+    /// List available models across supported providers
     Models {
         #[arg(long)]
         provider: Option<String>,
@@ -384,7 +384,7 @@ async fn read_login_input() -> Result<String> {
 fn login_provider(provider: &str) -> Result<&str> {
     let provider = dume_provider::normalize_provider(provider);
     anyhow::ensure!(
-        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google"),
+        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"),
         "Unsupported login provider"
     );
     Ok(provider)
@@ -402,7 +402,7 @@ async fn run_login(provider: &str, api_key: bool, device: bool, manual: bool) ->
         "Codex requires OAuth login"
     );
     let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-    if api_key || matches!(provider, "openai" | "google") {
+    if api_key || matches!(provider, "openai" | "google" | "deepseek") {
         anyhow::ensure!(
             !manual,
             "Manual OAuth login is unavailable for API-key providers"
@@ -878,6 +878,7 @@ mod login_tests {
             clap::error::ErrorKind::DisplayVersion
         );
         assert_eq!(login_provider("gemini").unwrap(), "google");
+        assert_eq!(login_provider("deepseek").unwrap(), "deepseek");
         assert!(login_provider("unsupported").is_err());
         assert!(matches!(
             Cli::try_parse_from(["dume", "models"]).unwrap().command,

@@ -139,7 +139,7 @@ pub fn build_transcript_lines(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " to authenticate providers (OpenAI Codex, Claude, Gemini, ChatGPT)",
+                " to authenticate a provider, including DeepSeek",
                 Style::default().fg(theme.foreground),
             ),
         ]));
@@ -901,12 +901,12 @@ pub fn render_login_selector_modal(
     theme: &Theme,
 ) {
     let width = 72.min(area.width.saturating_sub(6));
-    let height = 14.min(area.height.saturating_sub(4));
+    let height = 12.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let modal_area = Rect::new(x, y, width, height);
 
-    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(ratatui::widgets::Clear, Rect::new(area.x, y, area.width, height));
 
     let block = Block::default()
         .borders(Borders::ALL)
