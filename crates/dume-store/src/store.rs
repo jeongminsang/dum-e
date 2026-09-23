@@ -33,6 +33,8 @@ pub enum StoreError {
     },
     #[error("Entity not found: {0}")]
     NotFound(String),
+    #[error("Invalid session state: {0}")]
+    InvalidSessionState(String),
 }
 
 fn now_millis() -> i64 {
@@ -990,56 +992,98 @@ impl HarnessStore {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        Self::compact_session_tx(&tx, session_id, summary_content, retain_last_n)?;
+        tx.commit()?;
+        Ok(())
+    }
 
+    pub fn persist_and_compact_session(
+        &self,
+        session_id: &str,
+        messages: &[(String, String, Option<String>, Option<String>, bool)],
+        summary_content: &str,
+        retain_last_n: usize,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if existing != 0 {
+            return Err(StoreError::InvalidSessionState(
+                "cannot seed compaction over an existing transcript".to_string(),
+            ));
+        }
+        for (index, (role, content, calls, call_id, is_checkpoint)) in messages.iter().enumerate() {
+            tx.execute(
+                r#"
+                INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)
+                "#,
+                params![session_id, index as i64, role, content, calls, call_id, i32::from(*is_checkpoint), now_millis()],
+            )?;
+        }
+        Self::compact_session_tx(&tx, session_id, summary_content, retain_last_n)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compact_session_tx(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        summary_content: &str,
+        retain_last_n: usize,
+    ) -> Result<(), StoreError> {
         let active_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0",
             params![session_id],
             |r| r.get(0),
         )?;
-
         if (active_count as usize) <= retain_last_n {
             return Ok(());
         }
-
         let mut cutoff_idx: i64 = tx.query_row(
             "SELECT message_index FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
             params![session_id, retain_last_n as i64],
             |r| r.get(0),
         )?;
-
-        // ATOMIC PAIR PRESERVATION:
-        // If cutoff_idx lands on an assistant message with tool_calls, do not split it from following tool results!
-        // Move cutoff forward to include the tool results in the archive window so the active context never starts with an orphaned tool result.
-        let is_tool_call_boundary: bool = tx.query_row(
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
-            params![session_id, cutoff_idx],
-            |r| r.get::<_, i64>(0).map(|c| c > 0),
-        ).unwrap_or(false);
-
-        if is_tool_call_boundary {
-            // Find max index of corresponding tool response
-            if let Ok(next_res_idx) = tx.query_row(
-                "SELECT message_index FROM session_messages WHERE session_id = ?1 AND message_index > ?2 AND role = 'tool' ORDER BY message_index ASC LIMIT 1",
+        loop {
+            let is_assistant_tool_call: bool = tx.query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
                 params![session_id, cutoff_idx],
-                |r| r.get::<_, i64>(0),
-            ) {
-                cutoff_idx = next_res_idx;
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            ).unwrap_or(false);
+            let is_tool_msg: bool = tx.query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND role = 'tool'",
+                params![session_id, cutoff_idx],
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            ).unwrap_or(false);
+            if is_assistant_tool_call || is_tool_msg {
+                let next_msg: Result<(i64, String), _> = tx.query_row(
+                    "SELECT message_index, role FROM session_messages WHERE session_id = ?1 AND message_index > ?2 ORDER BY message_index ASC LIMIT 1",
+                    params![session_id, cutoff_idx],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                );
+                if let Ok((next_idx, role)) = next_msg {
+                    if role == "tool" {
+                        cutoff_idx = next_idx;
+                        continue;
+                    }
+                }
             }
+            break;
         }
-
-        // ARCHIVE without deleting (Original raw audit history is completely preserved!)
         tx.execute(
-            "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND message_index <= ?2",
+            "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND (is_compacted_summary = 1 OR (message_index <= ?2 AND role != 'system'))",
             params![session_id, cutoff_idx],
         )?;
-
         let max_idx: i64 = tx.query_row(
             "SELECT COALESCE(MAX(message_index), -1) + 1 FROM session_messages WHERE session_id = ?1",
             params![session_id],
             |r| r.get(0),
         )?;
-
-        // Insert new compacted summary into active context with new unique index
         tx.execute(
             r#"
             INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
@@ -1047,9 +1091,6 @@ impl HarnessStore {
             "#,
             params![session_id, max_idx, summary_content, now_millis()],
         )?;
-
-        tx.commit()?;
-
         Ok(())
     }
 
@@ -1576,6 +1617,99 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_session_preserves_multi_tool_calls_atomically() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "test_sess_multi_tool_compact";
+
+        // Setup session history with a multi-tool call assistant message and multiple tool results
+        store
+            .append_session_message(session_id, "user", "Run three tasks", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(
+                session_id,
+                "assistant",
+                "Calling 3 tools",
+                Some(r#"[{"id":"t1","name":"tool1"},{"id":"t2","name":"tool2"},{"id":"t3","name":"tool3"}]"#),
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 1 output", None, Some("t1"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 2 output", None, Some("t2"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 3 output", None, Some("t3"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "assistant", "All three tools completed.", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Follow up prompt", None, None, false)
+            .unwrap();
+
+        // 7 messages total:
+        // 0: user
+        // 1: assistant (calls t1, t2, t3)
+        // 2: tool t1
+        // 3: tool t2
+        // 4: tool t3
+        // 5: assistant
+        // 6: user
+        //
+        // If we retain_last_n = 4:
+        // Normally offset 4 would cut off at message 2 (tool t1).
+        // Without atomic multi-tool protection, messages 0, 1, 2 would be archived,
+        // leaving orphaned tool messages 3 and 4 at the start of the active context!
+        // With atomic multi-tool protection, all contiguous tool results (2, 3, 4) are advanced into the archive window.
+        store.compact_session(session_id, "Compact summary: completed 3 tools", 4).unwrap();
+
+        let active_msgs = store.list_active_context_messages(session_id).unwrap();
+        // Active messages should be:
+        // 0: summary
+        // 1: assistant ("All three tools completed.")
+        // 2: user ("Follow up prompt")
+        assert_eq!(active_msgs.len(), 3);
+        assert_eq!(active_msgs[0].0, "system");
+        assert!(active_msgs[0].4, "First active message must be summary");
+        assert_eq!(active_msgs[1].0, "assistant");
+        assert_eq!(active_msgs[1].1, "All three tools completed.");
+        assert_eq!(active_msgs[2].0, "user");
+        assert_eq!(active_msgs[2].1, "Follow up prompt");
+
+        // Verify active context NEVER begins with an orphaned tool result
+        for (role, _, _, tool_call_id, is_sum) in &active_msgs {
+            if !is_sum && role == "tool" {
+                panic!("Active context must not have orphaned tool result! Found: {:?}", tool_call_id);
+            }
+        }
+    }
+
+    #[test]
+    fn persist_and_compact_session_rejects_existing_history_without_mutation() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "snapshot-conflict";
+        store
+            .append_session_message(session_id, "user", "existing", None, None, false)
+            .unwrap();
+        let incoming = vec![("user".to_string(), "new".to_string(), None, None, false)];
+
+        assert!(store
+            .persist_and_compact_session(session_id, &incoming, "checkpoint", 0)
+            .is_err());
+        assert_eq!(store.list_session_messages(session_id).unwrap().len(), 1);
+        assert_eq!(
+            store.list_active_context_messages(session_id).unwrap()[0].1,
+            "existing"
+        );
+    }
+
+    #[test]
     fn test_request_and_session_usage_tracking() {
         let dir = tempdir().unwrap();
         let store = HarnessStore::in_memory(dir.path()).unwrap();
@@ -1711,4 +1845,3 @@ mod tests {
         assert_eq!(list[0].request_id, "req_migrated_1");
     }
 }
-
