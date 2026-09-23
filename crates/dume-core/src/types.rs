@@ -228,3 +228,25 @@ pub struct WorkflowArtifact {
     pub created_at: i64,
 }
 
+
+/// Lightweight skill catalog metadata (names and descriptions only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+}
+
+/// Canonical stable system prompt and instructions for DUM-E execution.
+pub struct PromptPrefix;
+
+impl PromptPrefix {
+    /// Canonical stable system instructions shared across worker and interactive execution.
+    pub const BASE_SYSTEM_PROMPT: &'static str =
+        "You are DUM-E coding agent. Work directly in the worktree.
+Use tools bash, read_file, write_file as needed.";
+
+    /// Formats a user prompt cleanly with goal/task without embedding task text into the system prefix.
+    pub fn build_task_user_message(task_prompt: &str) -> String {
+        task_prompt.trim().to_string()
+    }
+}
