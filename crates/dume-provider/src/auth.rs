@@ -169,6 +169,7 @@ impl CredentialStore {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
             "google" => "GEMINI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
             "opencode" | "opencode-go" => "OPENCODE_API_KEY",
             _ => "",
         };
@@ -296,6 +297,7 @@ impl CredentialStore {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
             "google" => "GEMINI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
             "opencode" | "opencode-go" => "OPENCODE_API_KEY",
             _ => "",
         };

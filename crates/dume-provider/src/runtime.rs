@@ -40,7 +40,7 @@ impl ResolvedProvider {
             Transport::AnthropicOAuth(p) => Transport::AnthropicOAuth(p.with_base_url(base_url)),
             Transport::OpenAi(p) => Transport::OpenAi(p.with_base_url(base_url)),
             Transport::Codex(p) => Transport::Codex(p.with_base_url(base_url)),
-            Transport::Google(_) => anyhow::bail!("Base URL override is unsupported for google"),
+            Transport::Google(p) => Transport::Google(p.with_base_url(base_url)),
         };
         Ok(self)
     }
@@ -64,13 +64,15 @@ impl ResolvedProvider {
         let model = &self.model.id;
         match &self.transport {
             Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
-                p.stream(model, messages, tools, tx).await
+                p.stream_with_context(model, messages, tools, context, tx).await
             }
             Transport::OpenAi(p) => {
                 p.stream_with_context(model, messages, tools, context, tx)
                     .await
             }
-            Transport::Codex(p) => p.stream(model, messages, tools, tx).await,
+            Transport::Codex(p) => {
+                p.stream_with_context(model, messages, tools, context, tx).await
+            }
             Transport::Google(p) => p.stream(model, messages, tools, tx).await,
         }
     }
@@ -85,6 +87,7 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
             api == "openai-codex-responses" || api == "openai-responses" || api.is_empty()
         }
         "google" => api == "google-generative-ai" || api.is_empty(),
+        "deepseek" => api == "openai-completions" || api.is_empty(),
         "opencode" => {
             api == "openai-completions"
                 || api == "openai-responses"
@@ -110,7 +113,7 @@ pub fn is_model_supported(model: &ModelInfo) -> bool {
 fn supported(provider: &str) -> bool {
     matches!(
         provider,
-        "anthropic" | "openai" | "openai-codex" | "google" | "opencode" | "opencode-go"
+        "anthropic" | "openai" | "openai-codex" | "google" | "deepseek" | "opencode" | "opencode-go"
     )
 }
 
@@ -152,7 +155,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
             .filter(|m| {
                 matches!(
                     m.provider.as_str(),
-                    "anthropic" | "openai" | "openai-codex" | "google"
+                    "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"
                 )
             })
             .cloned()
@@ -218,6 +221,10 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             &required(credential.access_token.as_deref(), "access token")?,
         )),
         ("openai", "api_key") => Transport::OpenAi(OpenAiProvider::new(&required(
+            credential.key.as_deref(),
+            "API key",
+        )?)),
+        ("deepseek", "api_key") => Transport::OpenAi(OpenAiProvider::new_deepseek(&required(
             credential.key.as_deref(),
             "API key",
         )?)),
@@ -452,7 +459,7 @@ mod tests {
             credential("api_key"),
         )
         .unwrap();
-        assert!(google.with_base_url("http://127.0.0.1:1234").is_err());
+        assert!(google.with_base_url("http://127.0.0.1:1234").is_ok());
     }
 
     #[tokio::test]
@@ -599,5 +606,15 @@ mod tests {
             err.to_string()
                 .contains("only openai-completions is currently supported")
         );
+    }
+
+    #[test]
+    fn deepseek_catalog_and_api_key_route_to_direct_transport() {
+        let model = resolve_model("deepseek/deepseek-v4-flash").unwrap();
+        assert_eq!(model.api, "openai-completions");
+        let resolved = bind_credential(model, credential("api_key")).unwrap();
+        assert!(matches!(resolved.transport, Transport::OpenAi(_)));
+        assert!(!is_transport_supported("deepseek", "openai-responses"));
+        assert!(bind_credential(resolve_model("deepseek/deepseek-v4-flash").unwrap(), credential("oauth")).is_err());
     }
 }

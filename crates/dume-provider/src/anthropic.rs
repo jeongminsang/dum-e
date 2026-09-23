@@ -12,6 +12,7 @@ pub struct AnthropicProvider {
     api_key: String,
     oauth: bool,
     base_url: String,
+    prompt_caching: Option<bool>,
 }
 
 #[cfg(test)]
@@ -36,7 +37,8 @@ mod tests {
             } else {
                 AnthropicProvider::new("sk-ant-oat-key")
             }
-            .with_base_url(&url);
+            .with_base_url(&url)
+            .with_prompt_caching(!oauth);
             let messages = vec![
                 ChatMessage::system("Custom system"),
                 ChatMessage::user("Hi"),
@@ -77,7 +79,9 @@ mod tests {
                 assert!(headers.contains("x-api-key: sk-ant-oat-key"));
                 assert!(!headers.contains("authorization:"));
                 assert!(!headers.contains("anthropic-beta:"));
-                assert_eq!(body["system"], "Custom system");
+                assert_eq!(body["system"][0]["text"], "Custom system");
+                assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+                assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
             }
             assert_eq!(body["tools"][0]["name"], wire_name);
             assert_eq!(body["messages"][1]["content"][0]["name"], wire_name);
@@ -103,6 +107,65 @@ mod tests {
         }
     }
 
+
+    #[tokio::test]
+    async fn anthropic_multi_system_and_cache_control() {
+        let sse = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let (url, server) = crate::codex::tests::fixture(sse.to_string());
+        let provider = AnthropicProvider::new("sk-ant-test")
+            .with_base_url(&url)
+            .with_prompt_caching(true);
+        let messages = vec![
+            ChatMessage::system("Base instructions"),
+            ChatMessage::system("Compaction summary"),
+            ChatMessage::user("Hello"),
+        ];
+        let tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Execute shell".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        let (tx, _rx) = mpsc::channel(16);
+        provider.stream("claude-3-7", &messages, &tools, tx).await.unwrap();
+        let (_headers, body) = server.join().unwrap();
+        let system = body["system"].as_array().expect("system should be array");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"], "Base instructions");
+        assert_eq!(system[1]["text"], "Compaction summary");
+        assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        // Messages tail caching: last turn in messages should also have cache_control
+        let msgs = body["messages"].as_array().expect("messages should be array");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn anthropic_cache_disabled_and_unsupported_gateway() {
+        let sse = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let (url, server) = crate::codex::tests::fixture(sse.to_string());
+        // Explicitly disabled caching
+        let provider = AnthropicProvider::new("sk-ant-test")
+            .with_base_url(&url)
+            .with_prompt_caching(false);
+        let messages = vec![
+            ChatMessage::system("Base instructions"),
+            ChatMessage::user("Hello"),
+        ];
+        let tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Execute shell".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        let (tx, _rx) = mpsc::channel(16);
+        provider.stream("claude-3-7", &messages, &tools, tx).await.unwrap();
+        let (_headers, body) = server.join().unwrap();
+        // None of system, tools, or messages should have cache_control
+        assert!(body.get("system").and_then(|s| s[0].get("cache_control")).is_none());
+        assert!(body.get("tools").and_then(|t| t[0].get("cache_control")).is_none());
+        assert!(body.get("messages").and_then(|m| m[0]["content"][0].get("cache_control")).is_none());
+    }
+
     #[test]
     fn invalid_headers_are_errors_and_unknown_names_are_preserved() {
         assert!(AnthropicProvider::new("bad\nkey").headers().is_err());
@@ -121,6 +184,19 @@ mod tests {
         );
         assert_eq!(AnthropicProvider::new("key").tool_name("bash"), "bash");
     }
+
+    #[test]
+    fn caching_defaults_only_to_the_official_https_origin() {
+        assert!(AnthropicProvider::new("key").should_cache());
+        for url in [
+            "https://api.anthropic.com.evil.example/v1",
+            "https://gateway.example/v1",
+            "http://api.anthropic.com/v1",
+            "http://localhost:8080/v1",
+        ] {
+            assert!(!AnthropicProvider::new("key").with_base_url(url).should_cache());
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -130,6 +206,7 @@ impl AnthropicProvider {
             api_key: api_key.to_string(),
             oauth: false,
             base_url: "https://api.anthropic.com/v1".to_string(),
+            prompt_caching: None,
         }
     }
 
@@ -143,6 +220,20 @@ impl AnthropicProvider {
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
         self
+    }
+
+    pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching = Some(enabled);
+        self
+    }
+
+    fn should_cache(&self) -> bool {
+        if let Some(enabled) = self.prompt_caching {
+            return enabled;
+        }
+        reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+            url.scheme() == "https" && url.host_str() == Some("api.anthropic.com")
+        })
     }
 
     fn headers(&self) -> Result<HeaderMap> {
@@ -202,10 +293,22 @@ impl AnthropicProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
+        self.stream_with_context(model, messages, tools, None, tx).await
+    }
+
+    pub async fn stream_with_context(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        _context: Option<&crate::types::StreamRequestContext>,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<()> {
         let url = format!("{}/messages", self.base_url);
         let headers = self.headers()?;
+        let caching_enabled = self.should_cache();
 
-        let formatted_msgs: Vec<Value> = messages
+        let mut formatted_msgs: Vec<Value> = messages
             .iter()
             .filter(|m| m.role != Role::System)
             .map(|m| match m.role {
@@ -247,16 +350,33 @@ impl AnthropicProvider {
                 _ => {
                     json!({
                         "role": "user",
-                        "content": m.content
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": m.content
+                            }
+                        ]
                     })
                 }
             })
             .collect();
 
-        let system_prompt = messages
+        // If prompt caching is enabled and we have conversation turns, add a cache breakpoint
+        // to the last eligible turn in messages (growing conversation tail cache)
+        if caching_enabled && !formatted_msgs.is_empty() {
+            let last_idx = formatted_msgs.len() - 1;
+            if let Some(content_arr) = formatted_msgs[last_idx].get_mut("content").and_then(|c| c.as_array_mut()) {
+                if let Some(last_block) = content_arr.last_mut() {
+                    last_block["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+        }
+
+        let system_messages: Vec<String> = messages
             .iter()
-            .find(|m| m.role == Role::System)
-            .map(|m| m.content.clone());
+            .filter(|m| m.role == Role::System && !m.content.trim().is_empty())
+            .map(|m| m.content.clone())
+            .collect();
 
         let mut body = json!({
             "model": model,
@@ -265,20 +385,30 @@ impl AnthropicProvider {
             "stream": true,
         });
 
+        let mut system_blocks: Vec<Value> = Vec::new();
         if self.oauth {
-            let mut system = vec![
-                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
-            ];
-            if let Some(sys) = system_prompt {
-                system.push(json!({"type": "text", "text": sys}));
+            system_blocks.push(json!({
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }));
+        }
+        for sys in &system_messages {
+            system_blocks.push(json!({
+                "type": "text",
+                "text": sys
+            }));
+        }
+
+        if !system_blocks.is_empty() {
+            if caching_enabled {
+                let last_idx = system_blocks.len() - 1;
+                system_blocks[last_idx]["cache_control"] = json!({"type": "ephemeral"});
             }
-            body["system"] = json!(system);
-        } else if let Some(sys) = system_prompt {
-            body["system"] = json!(sys);
+            body["system"] = json!(system_blocks);
         }
 
         if !tools.is_empty() {
-            let tools_val: Vec<Value> = tools
+            let mut tools_val: Vec<Value> = tools
                 .iter()
                 .map(|t| {
                     json!({
@@ -288,6 +418,10 @@ impl AnthropicProvider {
                     })
                 })
                 .collect();
+            if caching_enabled {
+                let last_idx = tools_val.len() - 1;
+                tools_val[last_idx]["cache_control"] = json!({"type": "ephemeral"});
+            }
             body["tools"] = json!(tools_val);
         }
 

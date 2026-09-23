@@ -10,6 +10,15 @@ pub enum Role {
     Tool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePurpose {
+    #[default]
+    Conversation,
+    UiNotice,
+    Checkpoint,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
@@ -21,6 +30,8 @@ pub struct ToolCall {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "is_conversation_purpose")]
+    pub purpose: MessagePurpose,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,6 +39,14 @@ pub struct ChatMessage {
     /// Opaque Responses reasoning items, for stateless Codex replay only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_reasoning: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gemini_parts: Vec<Value>,
+}
+
+fn is_conversation_purpose(purpose: &MessagePurpose) -> bool {
+    *purpose == MessagePurpose::Conversation
 }
 
 impl ChatMessage {
@@ -35,9 +54,12 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            purpose: MessagePurpose::Conversation,
             tool_call_id: None,
             tool_calls: None,
             codex_reasoning: Vec::new(),
+            deepseek_reasoning: None,
+            gemini_parts: Vec::new(),
         }
     }
 
@@ -45,9 +67,12 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            purpose: MessagePurpose::Conversation,
             tool_call_id: None,
             tool_calls: None,
             codex_reasoning: Vec::new(),
+            deepseek_reasoning: None,
+            gemini_parts: Vec::new(),
         }
     }
 
@@ -58,9 +83,12 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            purpose: MessagePurpose::Conversation,
             tool_call_id: None,
             tool_calls: Some(tool_calls),
             codex_reasoning: Vec::new(),
+            deepseek_reasoning: None,
+            gemini_parts: Vec::new(),
         }
     }
 
@@ -68,20 +96,69 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            purpose: MessagePurpose::Conversation,
             tool_call_id: None,
             tool_calls: None,
             codex_reasoning: Vec::new(),
+            deepseek_reasoning: None,
+            gemini_parts: Vec::new(),
         }
+    }
+
+    pub fn ui_notice(content: impl Into<String>) -> Self {
+        let mut message = Self::system(content);
+        message.purpose = MessagePurpose::UiNotice;
+        message
+    }
+
+    pub fn checkpoint(content: impl Into<String>) -> Self {
+        let mut message = Self::system(content);
+        message.purpose = MessagePurpose::Checkpoint;
+        message
+    }
+
+    pub fn is_model_visible(&self) -> bool {
+        self.purpose != MessagePurpose::UiNotice
     }
 
     pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
+            purpose: MessagePurpose::Conversation,
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
             codex_reasoning: Vec::new(),
+            deepseek_reasoning: None,
+            gemini_parts: Vec::new(),
         }
+    }
+
+    /// Approximate token count for this message:
+    /// ~1 token per 4 characters + 4 tokens per message protocol overhead + tool call metadata.
+    pub fn approx_tokens(&self) -> usize {
+        let mut chars = self.content.len();
+        if let Some(tool_calls) = &self.tool_calls {
+            for tc in tool_calls {
+                chars += tc.name.len() + tc.arguments.len() + 10;
+            }
+        }
+        if let Some(tcid) = &self.tool_call_id {
+            chars += tcid.len();
+        }
+        if let Some(reasoning) = &self.deepseek_reasoning {
+            chars += reasoning.len();
+        }
+        if !self.gemini_parts.is_empty() {
+            chars =
+                chars.max(serde_json::to_string(&self.gemini_parts).map_or(0, |value| value.len()));
+        }
+        4 + (chars + 3) / 4
+    }
+
+    /// Approximate token count for a slice of messages.
+    pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+        messages.iter().map(|m| m.approx_tokens()).sum()
     }
 }
 
@@ -185,6 +262,8 @@ pub enum StreamEvent {
     TextDelta(String),
     /// Opaque replay metadata. Never render as transcript or streaming text.
     CodexReasoning(Vec<Value>),
+    DeepSeekReasoning(String),
+    GeminiParts(Vec<Value>),
     ToolCallDelta {
         index: usize,
         id: Option<String>,
@@ -287,6 +366,21 @@ impl StreamRequestContext {
             attempt_id: self.attempt_id.clone(),
             agent_id: Some(child_id.to_string()),
             parent_agent_id: self.agent_id.clone().or_else(|| Some("main".to_string())),
+        }
+    }
+
+    /// Reset the session identity (e.g. after clear, model/auth change, or compaction)
+    /// while preserving benchmark metadata.
+    pub fn reset_session(&self) -> Self {
+        Self {
+            session_id: Self::generate_opaque_id(),
+            request_id: Self::generate_opaque_id(),
+            benchmark_run_id: self.benchmark_run_id.clone(),
+            case_id: self.case_id.clone(),
+            variant: self.variant.clone(),
+            attempt_id: self.attempt_id.clone(),
+            agent_id: self.agent_id.clone(),
+            parent_agent_id: self.parent_agent_id.clone(),
         }
     }
 

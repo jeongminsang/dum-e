@@ -146,6 +146,47 @@ impl ModelCatalog {
 
         Ok(map)
     }
+
+    /// Find model info by exact ID or provider/model format (e.g. "anthropic/claude-sonnet-4-5" or "claude-sonnet-4-5").
+    pub fn find_model(model_name: &str) -> Option<ModelInfo> {
+        let (provider_hint, pure_id) = if let Some((p, m)) = model_name.split_once('/') {
+            (Some(p), m)
+        } else {
+            (None, model_name)
+        };
+
+        let all = Self::list_all_builtin_models().ok()?;
+        // Try exact match first
+        for info in &all {
+            if let Some(p) = provider_hint {
+                if (info.provider.eq_ignore_ascii_case(p) || info.api.eq_ignore_ascii_case(p))
+                    && info.id.eq_ignore_ascii_case(pure_id)
+                {
+                    return Some(info.clone());
+                }
+            } else if info.id.eq_ignore_ascii_case(pure_id) {
+                return Some(info.clone());
+            }
+        }
+
+        // Secondary fallback: match id ignoring case
+        all.into_iter().find(|info| info.id.eq_ignore_ascii_case(pure_id))
+    }
+
+    /// Resolve usable context budget for a model.
+    /// Deducts max_tokens or safety margin. Defaults to 100_000 if not found or unspecified.
+    pub fn context_budget(model_name: &str) -> usize {
+        const DEFAULT_BUDGET: usize = 100_000;
+        let Some(info) = Self::find_model(model_name) else {
+            return DEFAULT_BUDGET;
+        };
+
+        let context_window = info.context_window.unwrap_or(128_000) as usize;
+        let max_output = info.max_tokens.unwrap_or(8192) as usize;
+        let safety_margin = (context_window / 10).max(4096);
+
+        context_window.saturating_sub(max_output + safety_margin).max(1)
+    }
 }
 
 #[cfg(test)]
