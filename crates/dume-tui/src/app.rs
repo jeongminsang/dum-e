@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -70,6 +70,33 @@ enum ConversationEvent {
     },
     BtwStreamDelta(String),
     BtwFinished(Result<String, String>),
+    CatalogRefreshFinished(Result<Option<usize>, String>),
+}
+
+fn selectable_models() -> Vec<ModelInfo> {
+    let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    let authenticated: BTreeSet<_> = [
+        "anthropic", "openai", "google", "deepseek", "openai-codex", "opencode", "opencode-go",
+    ]
+    .into_iter()
+    .filter(|provider| store.has_credential(provider))
+    .collect();
+    dume_provider::ModelCatalog::list_all_models()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| {
+            dume_provider::is_model_supported(model) && authenticated.contains(model.provider.as_str())
+        })
+        .collect()
+}
+
+fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
+    tokio::spawn(async move {
+        let result = dume_provider::ModelCatalog::refresh_codex_cache_if_stale()
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+    });
 }
 
 pub enum ModalState {
@@ -506,6 +533,49 @@ impl App {
                     streaming_reply.clear();
                 }
             }
+            ConversationEvent::CatalogRefreshFinished(result) => match result {
+                Ok(Some(count)) => {
+                    self.messages.push(ChatMessage::ui_notice(format!(
+                        "Model catalog updated ({count} models)."
+                    )));
+                    if let ModalState::ModelSelector {
+                        models,
+                        filtered,
+                        selected_idx,
+                        filter,
+                        provider_tabs,
+                        active_tab_idx,
+                    } = &mut self.modal {
+                        let selected = filtered.get(*selected_idx).map(|m| (m.provider.clone(), m.id.clone()));
+                        let active_provider = provider_tabs.get(*active_tab_idx).cloned().unwrap_or_default();
+                        *models = selectable_models();
+                        *provider_tabs = std::iter::once("All".to_string())
+                            .chain(models.iter().map(|m| m.provider.clone()))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        if let Some(index) = provider_tabs.iter().position(|p| p == &active_provider) {
+                            *active_tab_idx = index;
+                        } else {
+                            *active_tab_idx = 0;
+                        }
+                        let tab = &provider_tabs[*active_tab_idx];
+                        let query = filter.to_lowercase();
+                        *filtered = models.iter().filter(|m| {
+                            (tab == "All" || &m.provider == tab)
+                                && (m.id.to_lowercase().contains(&query)
+                                    || m.provider.to_lowercase().contains(&query))
+                        }).cloned().collect();
+                        *selected_idx = selected
+                            .and_then(|(provider, id)| filtered.iter().position(|m| m.provider == provider && m.id == id))
+                            .unwrap_or(0);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.messages.push(ChatMessage::ui_notice(format!(
+                    "Model catalog refresh failed; using local models: {error}"
+                ))),
+            },
         }
     }
 }
@@ -562,6 +632,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                 .await;
         }
     });
+
+    // Spawn non-blocking background catalog refresh
+    let catalog_refresh = dume_provider::ModelCatalog::refresh_remote_catalog_background();
+    let catalog_tx = stream_tx.clone();
+    tokio::spawn(async move {
+        let result = catalog_refresh
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
+        let _ = catalog_tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+    });
+    spawn_codex_catalog_refresh(stream_tx.clone());
 
     let result: Result<()> = async {
       loop {
@@ -1322,36 +1404,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                         let trimmed = content.trim();
                                         if trimmed == "/model" || trimmed == "/model " {
-                                            // 1. Inspect authenticated providers
-                                            let cred_store = dume_provider::CredentialStore::new(
-                                                dume_provider::CredentialStore::default_path(),
-                                            );
-                                            let has_anthropic = cred_store.has_credential("anthropic");
-                                            let has_openai = cred_store.has_credential("openai");
-                                            let has_google = cred_store.has_credential("google");
-                                            let has_deepseek = cred_store.has_credential("deepseek");
-                                            let has_codex = cred_store.has_credential("openai-codex");
-                                            let has_opencode = cred_store.has_credential("opencode");
-                                            let has_opencode_go = cred_store.has_credential("opencode-go");
-
-                                            let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
-
-                                            // Filter only models whose provider is supported and authenticated
-                                            let models: Vec<_> = all_builtin.into_iter().filter(|m| {
-                                                if !dume_provider::is_model_supported(m) {
-                                                    return false;
-                                                }
-                                                match m.provider.as_str() {
-                                                    "anthropic" => has_anthropic,
-                                                    "openai" => has_openai,
-                                                    "google" => has_google,
-                                                    "deepseek" => has_deepseek,
-                                                    "openai-codex" => has_codex,
-                                                    "opencode" => has_opencode,
-                                                    "opencode-go" => has_opencode_go,
-                                                    _ => false,
-                                                }
-                                            }).collect();
+                                            let models = selectable_models();
 
                                             if models.is_empty() {
                                                 app.messages.push(ChatMessage::ui_notice(
@@ -1644,6 +1697,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
             Some(stream_event) = stream_rx.recv() => {
+                if let ConversationEvent::OAuthComplete { provider, result: Ok(()) } = &stream_event {
+                    if provider == "openai-codex" {
+                        spawn_codex_catalog_refresh(stream_tx.clone());
+                    }
+                }
                 app.receive(stream_event);
             }
             _ = ticker.tick() => {

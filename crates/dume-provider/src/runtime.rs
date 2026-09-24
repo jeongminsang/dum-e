@@ -119,6 +119,11 @@ fn supported(provider: &str) -> bool {
 
 /// Resolve only supported catalog entries, independently of available credentials.
 pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
+    resolve_model_with_root(selection, &ModelCatalog::models_dir())
+}
+
+/// Resolve only supported catalog entries with a custom models directory root.
+pub fn resolve_model_with_root(selection: &str, root: &std::path::Path) -> Result<ModelInfo> {
     let selection = selection.trim();
     let (provider, id) = match selection.split_once('/') {
         Some((provider, id)) => {
@@ -135,7 +140,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
         }
         None => (None, selection),
     };
-    let mut matches: Vec<_> = ModelCatalog::list_all_builtin_models()?
+    let mut matches: Vec<_> = ModelCatalog::list_all_models_with_root(root)?
         .into_iter()
         .filter(|model| {
             is_model_supported(model)
@@ -350,7 +355,7 @@ pub async fn resolve_role_provider(
     }
 
     // If role candidates failed, attempt fallback to any authenticated supported model
-    let all = ModelCatalog::list_all_builtin_models().unwrap_or_default();
+    let all = ModelCatalog::list_all_models().unwrap_or_default();
     for m in all {
         if is_model_supported(&m) && store.has_credential(&m.provider) {
             let qualified = format!("{}/{}", m.provider, m.id);
@@ -616,5 +621,33 @@ mod tests {
         assert!(matches!(resolved.transport, Transport::OpenAi(_)));
         assert!(!is_transport_supported("deepseek", "openai-responses"));
         assert!(bind_credential(resolve_model("deepseek/deepseek-v4-flash").unwrap(), credential("oauth")).is_err());
+    }
+
+    #[test]
+    fn resolve_dynamic_cached_model() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_dir = temp_dir.path().join(".dume/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // Write a dynamic model into models-cache.json
+        let cache_content = r#"[
+            {
+                "id": "gpt-6-luna",
+                "name": "GPT-6 Luna",
+                "provider": "openai",
+                "api": "openai-responses",
+                "contextWindow": 400000,
+                "maxTokens": 128000
+            }
+        ]"#;
+        std::fs::write(agent_dir.join("models-cache.json"), cache_content).unwrap();
+
+        let resolved = resolve_model_with_root("openai/gpt-6-luna", &agent_dir);
+
+        let m = resolved.expect("Failed to resolve dynamic cached model");
+        assert_eq!(m.id, "gpt-6-luna");
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.base_url.as_deref(), Some("https://api.openai.com/v1"));
+        assert!(is_model_supported(&m));
     }
 }

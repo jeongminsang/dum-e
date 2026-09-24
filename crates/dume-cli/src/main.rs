@@ -241,7 +241,23 @@ async fn main() -> Result<()> {
             println!("Created task '{}' under goal '{}'", task.id, task.goal_id);
         }
         Some(Commands::Models { provider }) => {
-            let all = dume_provider::ModelCatalog::list_all_builtin_models()?;
+            let codex_only = provider.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("openai-codex"));
+            if !codex_only {
+                if let Err(error) = dume_provider::ModelCatalog::refresh_remote_cache_if_stale().await {
+                    eprintln!("Model catalog refresh failed; showing local models: {error:#}");
+                }
+            }
+            if codex_only || provider.is_none() {
+                if codex_only && !dume_provider::CredentialStore::new(
+                    dume_provider::CredentialStore::default_path(),
+                ).has_credential("openai-codex") {
+                    eprintln!("Live Codex models require `dume login openai-codex`; showing local models.");
+                }
+                if let Err(error) = dume_provider::ModelCatalog::refresh_codex_cache_if_stale().await {
+                    eprintln!("Codex catalog refresh failed; showing local models: {error:#}");
+                }
+            }
+            let all = dume_provider::ModelCatalog::list_all_models()?;
             println!(
                 "{:<30} {:<12} {:<10} {:<12} {}",
                 "MODEL ID", "PROVIDER", "REASONING", "MAX TOKENS", "NAME"
