@@ -520,7 +520,24 @@ impl AgentLoop {
                         tc.id,
                     ));
                 }
-                let model_name = self.model.clone();
+                let settings = match crate::subagent_settings::SubagentSettings::load() {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        return Ok(ChatMessage::tool(
+                            format!("Failed to read subagent settings: {error:#}"),
+                            tc.id,
+                        ));
+                    }
+                };
+                let model_name = match settings.model_for(&self.model) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        return Ok(ChatMessage::tool(
+                            format!("Invalid subagent model setting: {error:#}"),
+                            tc.id,
+                        ));
+                    }
+                };
                 let endpoint = self.endpoint.clone();
 
                 let parent_repo = self.worktree_path.clone();

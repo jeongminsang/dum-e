@@ -19,6 +19,7 @@ use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
 use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
+use dume_worker::subagent_settings::SubagentSettings;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -88,6 +89,30 @@ fn selectable_models() -> Vec<ModelInfo> {
             dume_provider::is_model_supported(model) && authenticated.contains(model.provider.as_str())
         })
         .collect()
+}
+
+fn subagent_command(command: &str, parent_model: &str, path: &std::path::Path) -> Result<String> {
+    let mut settings = SubagentSettings::load_from(path)?;
+    if command == "/subagents" {
+        let model = settings.model.as_deref().unwrap_or(parent_model);
+        let source = if settings.model.is_some() { "configured" } else { "inherited" };
+        return Ok(format!(
+            "Subagent model: {model} ({source})\nUse /subagents model <provider/model> or /subagents model inherit."
+        ));
+    }
+    if command == "/subagents model inherit" {
+        settings.model = None;
+        settings.save_to(path)?;
+        return Ok("Subagents now inherit the parent model.".into());
+    }
+    if let Some(selection) = command.strip_prefix("/subagents model ") {
+        let model = dume_provider::resolve_model(selection.trim())?;
+        let qualified = format!("{}/{}", model.provider, model.id);
+        settings.model = Some(qualified.clone());
+        settings.save_to(path)?;
+        return Ok(format!("Subagent model set to {qualified}."));
+    }
+    anyhow::bail!("Usage: /subagents model <provider/model|inherit>")
 }
 
 fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
@@ -277,6 +302,7 @@ impl App {
                 "/model",
                 "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
             ),
+            ("/subagents", "Show or set the model used by subagents"),
             (
                 "/login",
                 "Save provider API key (e.g. /login anthropic <key>)",
@@ -1439,6 +1465,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             app.model = new_model;
                                             app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             continue;
+                                        } else if trimmed == "/subagents" || trimmed.starts_with("/subagents ") {
+                                            let result = SubagentSettings::path()
+                                                .and_then(|path| subagent_command(trimmed, &app.model, &path));
+                                            let message = match result {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Subagent settings error: {error:#}"),
+                                            };
+                                            app.messages.push(ChatMessage::ui_notice(message));
+                                            continue;
                                         } else if trimmed == "/login" {
                                             // Open interactive login provider selector modal
                                             app.modal = ModalState::LoginSelector { selected_idx: 0 };
@@ -1585,7 +1620,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else if trimmed == "/help" {
                                             app.skills.reload();
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /subagents                - Show subagent model setting\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {
@@ -2072,6 +2107,30 @@ mod tests {
         .is_ok());
         assert_ne!(session_id, logged_in_session);
         assert!(!store.has_credential("openai"));
+    }
+
+    #[test]
+    fn subagent_command_persists_model_and_rejects_invalid_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.json");
+        assert!(subagent_command("/subagents", "parent/model", &path)
+            .unwrap()
+            .contains("parent/model (inherited)"));
+
+        subagent_command("/subagents model openai/gpt-5.4", "parent/model", &path).unwrap();
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+        assert!(subagent_command("/subagents model no-such-model", "parent/model", &path)
+            .is_err());
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+
+        subagent_command("/subagents model inherit", "parent/model", &path).unwrap();
+        assert!(SubagentSettings::load_from(&path).unwrap().model.is_none());
     }
 
     #[test]

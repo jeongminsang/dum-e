@@ -5,6 +5,7 @@ pub mod executor;
 pub mod host;
 pub mod ipc;
 pub mod output_limits;
+pub mod subagent_settings;
 pub mod tools;
 
 pub use agent_loop::{AgentLoop, AgentOutcome};

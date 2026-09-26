@@ -107,6 +107,11 @@ dume models --provider openai-codex
 dume models --provider deepseek
 ```
 
+In the interactive TUI, `/subagents` shows the subagent model setting. Use
+`/subagents model <provider/model>` to select a model for newly spawned
+subagents, or `/subagents model inherit` to use the parent model. This setting
+is stored in `~/.dume/agent/subagents.json`.
+
 ---
 
 ## CLI Usage
