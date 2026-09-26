@@ -46,6 +46,14 @@ enum Commands {
         /// Override the selected provider's API root (except Google); sends its resolved credentials to this URL
         #[arg(long, requires = "task_prompt")]
         base_url: Option<String>,
+        #[arg(long)]
+        db_path: Option<String>,
+        #[arg(long)]
+        benchmark_run_id: Option<String>,
+        #[arg(long)]
+        case_id: Option<String>,
+        #[arg(long)]
+        variant: Option<String>,
     },
 
     /// Show current harness status
@@ -90,7 +98,7 @@ enum Commands {
         #[arg(long, default_value = ".dume/rust/artifacts")]
         artifacts_dir: String,
     },
-    /// List available models across Anthropic, OpenAI, and Google
+    /// List available models across supported providers
     Models {
         #[arg(long)]
         provider: Option<String>,
@@ -126,6 +134,25 @@ enum Commands {
         #[arg(long, default_value = "default")]
         session_id: String,
     },
+    /// Run token-efficiency benchmarks
+    Bench {
+        #[arg(long, value_delimiter = ',')]
+        cases: Vec<String>,
+        #[arg(long)]
+        baseline_bin: Option<std::path::PathBuf>,
+        #[arg(long)]
+        candidate_bin: Option<std::path::PathBuf>,
+        #[arg(long, default_value = "1")]
+        repetitions: usize,
+        #[arg(long, default_value = "anthropic/claude-sonnet-4-5")]
+        model: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value = ".dume/rust/benchmarks")]
+        output_dir: std::path::PathBuf,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -148,6 +175,10 @@ async fn main() -> Result<()> {
             task_prompt,
             model,
             base_url,
+            db_path,
+            benchmark_run_id,
+            case_id,
+            variant,
         }) => {
             run_worker_child(
                 &attempt_id,
@@ -156,6 +187,10 @@ async fn main() -> Result<()> {
                 task_prompt.as_deref(),
                 &model,
                 base_url.as_deref(),
+                db_path.as_deref(),
+                benchmark_run_id.as_deref(),
+                case_id.as_deref(),
+                variant.as_deref(),
             )
             .await?;
         }
@@ -206,7 +241,23 @@ async fn main() -> Result<()> {
             println!("Created task '{}' under goal '{}'", task.id, task.goal_id);
         }
         Some(Commands::Models { provider }) => {
-            let all = dume_provider::ModelCatalog::list_all_builtin_models()?;
+            let codex_only = provider.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("openai-codex"));
+            if !codex_only {
+                if let Err(error) = dume_provider::ModelCatalog::refresh_remote_cache_if_stale().await {
+                    eprintln!("Model catalog refresh failed; showing local models: {error:#}");
+                }
+            }
+            if codex_only || provider.is_none() {
+                if codex_only && !dume_provider::CredentialStore::new(
+                    dume_provider::CredentialStore::default_path(),
+                ).has_credential("openai-codex") {
+                    eprintln!("Live Codex models require `dume login openai-codex`; showing local models.");
+                }
+                if let Err(error) = dume_provider::ModelCatalog::refresh_codex_cache_if_stale().await {
+                    eprintln!("Codex catalog refresh failed; showing local models: {error:#}");
+                }
+            }
+            let all = dume_provider::ModelCatalog::list_all_models()?;
             println!(
                 "{:<30} {:<12} {:<10} {:<12} {}",
                 "MODEL ID", "PROVIDER", "REASONING", "MAX TOKENS", "NAME"
@@ -258,6 +309,38 @@ async fn main() -> Result<()> {
             println!("  Input Tokens:  {}", usage.input_tokens);
             println!("  Output Tokens: {}", usage.output_tokens);
             println!("  Total Tokens:  {}", usage.total_tokens);
+        }
+        Some(Commands::Bench {
+            cases,
+            baseline_bin,
+            candidate_bin,
+            repetitions,
+            model,
+            base_url,
+            output_dir,
+            db_path,
+        }) => {
+            let run_id = format!(
+                "bench_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+            let config = dume_cli::bench::BenchmarkRunConfig {
+                run_id,
+                case_ids: cases,
+                baseline_bin,
+                candidate_bin,
+                repetitions,
+                model,
+                base_url,
+                output_dir,
+                db_path,
+            };
+            let runner = dume_cli::bench::BenchmarkRunner::new(config)?;
+            let report = runner.run().await?;
+            println!("{}", runner.render_markdown_report(&report));
         }
         None => {
             // Default to interactive TUI
@@ -317,7 +400,7 @@ async fn read_login_input() -> Result<String> {
 fn login_provider(provider: &str) -> Result<&str> {
     let provider = dume_provider::normalize_provider(provider);
     anyhow::ensure!(
-        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google"),
+        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"),
         "Unsupported login provider"
     );
     Ok(provider)
@@ -335,7 +418,7 @@ async fn run_login(provider: &str, api_key: bool, device: bool, manual: bool) ->
         "Codex requires OAuth login"
     );
     let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-    if api_key || matches!(provider, "openai" | "google") {
+    if api_key || matches!(provider, "openai" | "google" | "deepseek") {
         anyhow::ensure!(
             !manual,
             "Manual OAuth login is unavailable for API-key providers"
@@ -406,6 +489,10 @@ async fn run_worker_child(
     task_prompt: Option<&str>,
     model: &str,
     base_url: Option<&str>,
+    db_path: Option<&str>,
+    benchmark_run_id: Option<&str>,
+    case_id: Option<&str>,
+    variant: Option<&str>,
 ) -> Result<()> {
     let path = Path::new(worktree_path);
 
@@ -417,18 +504,39 @@ async fn run_worker_child(
     print!("{}", serialize_message(&progress_msg)?);
 
     // 1. Run actual Agent Loop if task prompt is present
-    if let Some(prompt) = task_prompt {
+    let agent_outcome = if let Some(prompt) = task_prompt {
         let mut agent = dume_worker::AgentLoop::new(path, model);
         if let Some(base_url) = base_url {
             agent = agent.with_base_url(base_url);
+        }
+        if let Some(db_p) = db_path {
+            let artifacts_dir = Path::new(db_p)
+                .parent()
+                .map(|p| p.join("artifacts"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".dume/rust/artifacts"));
+            if let Ok(store) = HarnessStore::open(db_p, &artifacts_dir) {
+                let ctx = dume_provider::types::StreamRequestContext {
+                    session_id: attempt_id.to_string(),
+                    request_id: format!("req_{}_0", attempt_id),
+                    benchmark_run_id: benchmark_run_id.map(ToString::to_string),
+                    case_id: case_id.map(ToString::to_string),
+                    variant: variant.map(ToString::to_string),
+                    attempt_id: Some(attempt_id.to_string()),
+                    agent_id: Some("main".to_string()),
+                    parent_agent_id: None,
+                };
+                agent = agent.with_store(Arc::new(store)).with_request_context(ctx);
+            }
         }
         let progress_exec = WorkerToHostMessage::Progress {
             attempt_id: attempt_id.to_string(),
             message: format!("Agent loop executing prompt: {}", prompt),
         };
         print!("{}", serialize_message(&progress_exec)?);
-        let _ = agent.run_task(prompt).await?;
-    }
+        Some(agent.run_task(prompt).await?)
+    } else {
+        None
+    };
 
     // 2. Run test command if provided
     let mut test_results = Vec::new();
@@ -438,16 +546,33 @@ async fn run_worker_child(
     }
 
     // 3. Finalize manifest (detect modified files, commit changes)
+    let summary = match &agent_outcome {
+        Some(dume_worker::AgentOutcome::Completed { answer, .. }) => {
+            format!("Worker completed attempt: {}", answer)
+        }
+        Some(dume_worker::AgentOutcome::TurnLimitExhausted { last_reply, .. }) => {
+            format!(
+                "Worker turn limit exhausted. Last reply: {}",
+                last_reply.as_deref().unwrap_or("none")
+            )
+        }
+        Some(dume_worker::AgentOutcome::Cancelled { .. }) => "Worker cancelled".to_string(),
+        None => "Worker completed attempt".to_string(),
+    };
+
     let manifest = WorkerExecutor::finalize_manifest(
         attempt_id,
         path,
         test_results,
-        "Worker completed attempt",
+        &summary,
     )
     .await?;
 
     // Send completed message to host
-    let completed_msg = WorkerToHostMessage::Completed { manifest };
+    let completed_msg = WorkerToHostMessage::Completed {
+        manifest,
+        outcome: agent_outcome,
+    };
     print!("{}", serialize_message(&completed_msg)?);
 
     Ok(())
@@ -769,6 +894,7 @@ mod login_tests {
             clap::error::ErrorKind::DisplayVersion
         );
         assert_eq!(login_provider("gemini").unwrap(), "google");
+        assert_eq!(login_provider("deepseek").unwrap(), "deepseek");
         assert!(login_provider("unsupported").is_err());
         assert!(matches!(
             Cli::try_parse_from(["dume", "models"]).unwrap().command,

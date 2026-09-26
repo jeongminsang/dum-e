@@ -117,8 +117,52 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS request_usage (
+            request_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            benchmark_run_id TEXT,
+            case_id TEXT,
+            variant TEXT,
+            attempt_id TEXT,
+            agent_id TEXT,
+            parent_agent_id TEXT,
+            raw_usage_json TEXT,
+            is_complete INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+
+    // Safe backwards-compatible column migrations BEFORE creating indices
+    apply_column_migration(conn, "ALTER TABLE session_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    apply_column_migration(conn, "ALTER TABLE session_usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN benchmark_run_id TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN case_id TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN variant TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN attempt_id TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN agent_id TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN parent_agent_id TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN raw_usage_json TEXT;")?;
+    apply_column_migration(conn, "ALTER TABLE request_usage ADD COLUMN is_complete INTEGER NOT NULL DEFAULT 1;")?;
+
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_request_usage_session ON request_usage(session_id);
+        CREATE INDEX IF NOT EXISTS idx_request_usage_bench ON request_usage(benchmark_run_id, case_id, variant);
+        CREATE INDEX IF NOT EXISTS idx_request_usage_attempt ON request_usage(attempt_id);
 
         CREATE TABLE IF NOT EXISTS workflow_runs (
             run_id TEXT PRIMARY KEY,
@@ -141,5 +185,21 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+
     Ok(())
+}
+
+fn apply_column_migration(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            // SQLite returns "duplicate column name: ..." if column already exists
+            if msg.contains("duplicate column") {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }

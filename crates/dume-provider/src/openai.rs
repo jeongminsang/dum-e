@@ -21,6 +21,7 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     opencode_profile: Option<OpenCodeProfile>,
+    deepseek: bool,
 }
 
 impl OpenAiProvider {
@@ -30,7 +31,14 @@ impl OpenAiProvider {
             api_key: api_key.to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             opencode_profile: None,
+            deepseek: false,
         }
+    }
+
+    pub fn new_deepseek(api_key: &str) -> Self {
+        let mut provider = Self::new(api_key).with_base_url("https://api.deepseek.com");
+        provider.deepseek = true;
+        provider
     }
 
     pub fn with_base_url(mut self, base_url: &str) -> Self {
@@ -181,6 +189,13 @@ impl OpenAiProvider {
                     map.insert("tool_calls".to_string(), json!(tc_val));
                 }
 
+                if self.deepseek && m.role == Role::Assistant {
+                    map.insert(
+                        "reasoning_content".to_string(),
+                        json!(m.deepseek_reasoning.as_deref().unwrap_or("")),
+                    );
+                }
+
                 Value::Object(map)
             })
             .collect();
@@ -227,9 +242,41 @@ impl OpenAiProvider {
                             bail!("OpenAI response error");
                         }
                         anyhow::ensure!(parsed["choices"].is_array(), "Missing OpenAI choices");
+                        if self.deepseek {
+                            if let Some(usage) = parsed.get("usage") {
+                                let input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
+                                let output_tokens =
+                                    usage["completion_tokens"].as_i64().unwrap_or(0);
+                                let total_tokens = usage["total_tokens"]
+                                    .as_i64()
+                                    .unwrap_or(input_tokens + output_tokens);
+                                tx.send(StreamEvent::Usage(TokenUsage {
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    cache_read_tokens: usage["prompt_cache_hit_tokens"].as_i64(),
+                                    cache_write_tokens: None,
+                                    raw_usage: Some(usage.clone()),
+                                    is_complete: true,
+                                }))
+                                .await
+                                .context("Stream receiver closed")?;
+                            }
+                        }
                         if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
                             if let Some(choice) = choices.first() {
                                 if let Some(delta) = choice.get("delta") {
+                                    if self.deepseek {
+                                        if let Some(reasoning) =
+                                            delta.get("reasoning_content").and_then(Value::as_str)
+                                        {
+                                            tx.send(StreamEvent::DeepSeekReasoning(
+                                                reasoning.to_string(),
+                                            ))
+                                            .await
+                                            .context("Stream receiver closed")?;
+                                        }
+                                    }
                                     if let Some(content) =
                                         delta.get("content").and_then(|c| c.as_str())
                                     {
@@ -284,27 +331,37 @@ impl OpenAiProvider {
                                 }
                             }
                         }
-                        if let Some(usage) = parsed.get("usage") {
-                            let input_tokens = usage
-                                .get("prompt_tokens")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            let output_tokens = usage
-                                .get("completion_tokens")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            let total_tokens = usage
-                                .get("total_tokens")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(input_tokens + output_tokens);
-                            if input_tokens > 0 || output_tokens > 0 || total_tokens > 0 {
-                                let _ = tx
-                                    .send(StreamEvent::Usage(TokenUsage {
-                                        input_tokens,
-                                        output_tokens,
-                                        total_tokens,
-                                    }))
-                                    .await;
+                        if !self.deepseek {
+                            if let Some(usage) = parsed.get("usage") {
+                                let input_tokens = usage
+                                    .get("prompt_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let output_tokens = usage
+                                    .get("completion_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let total_tokens = usage
+                                    .get("total_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(input_tokens + output_tokens);
+                                let cache_read_tokens = usage
+                                    .get("prompt_tokens_details")
+                                    .and_then(|d| d.get("cached_tokens"))
+                                    .and_then(|v| v.as_i64());
+                                if input_tokens > 0 || output_tokens > 0 || total_tokens > 0 {
+                                    let _ = tx
+                                        .send(StreamEvent::Usage(TokenUsage {
+                                            input_tokens,
+                                            output_tokens,
+                                            total_tokens,
+                                            cache_read_tokens,
+                                            cache_write_tokens: None,
+                                            raw_usage: Some(usage.clone()),
+                                            is_complete: true,
+                                        }))
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -323,6 +380,59 @@ impl OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ToolCall;
+
+    #[tokio::test]
+    async fn deepseek_replays_reasoning_and_reports_cache_hits() {
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"next","function":{"name":"read","arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}})
+        );
+        let (url, server) = crate::codex::tests::fixture(sse);
+        let mut assistant = ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "old".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        assistant.deepseek_reasoning = Some("earlier thought".into());
+        let messages = [
+            ChatMessage::system("stable"),
+            ChatMessage::user("task"),
+            assistant,
+            ChatMessage::tool("result", "old"),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        OpenAiProvider::new_deepseek("secret")
+            .with_base_url(&url)
+            .stream("deepseek-v4-flash", &messages, &[], tx)
+            .await
+            .unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /chat/completions "));
+        assert_eq!(body["messages"][0]["content"], "stable");
+        assert_eq!(body["messages"][2]["reasoning_content"], "earlier thought");
+        assert_eq!(body["messages"][3]["tool_call_id"], "old");
+        assert_eq!(
+            rx.recv().await,
+            Some(StreamEvent::DeepSeekReasoning("think".into()))
+        );
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::ToolCallDelta { id: Some(id), .. }) if id == "next")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::Usage(usage)) if usage.cache_read_tokens == Some(80) && usage.input_tokens == 100)
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(StreamEvent::Completed {
+                finish_reason: "tool_calls".into()
+            })
+        );
+    }
 
     #[tokio::test]
     async fn api_key_keeps_chat_completions_contract() {
@@ -389,10 +499,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "test-session-123".to_string(),
-            request_id: "test-req-456".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("test-session-123", "test-req-456");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -426,10 +533,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "free-sess-default".to_string(),
-            request_id: "free-req-default".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("free-sess-default", "free-req-default");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -465,10 +569,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "free-sess-789".to_string(),
-            request_id: "free-req-012".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("free-sess-789", "free-req-012");
 
         OpenAiProvider::new("zen-key")
             .with_base_url(&url)
@@ -506,10 +607,7 @@ mod tests {
         let (url, server) = crate::codex::tests::fixture(sse);
         let (tx, mut rx) = mpsc::channel(8);
 
-        let ctx = StreamRequestContext {
-            session_id: "go-session-123".to_string(),
-            request_id: "go-req-456".to_string(),
-        };
+        let ctx = StreamRequestContext::from_ids("go-session-123", "go-req-456");
 
         OpenAiProvider::new("go-key")
             .with_base_url(&url)

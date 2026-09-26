@@ -33,6 +33,8 @@ pub enum StoreError {
     },
     #[error("Entity not found: {0}")]
     NotFound(String),
+    #[error("Invalid session state: {0}")]
+    InvalidSessionState(String),
 }
 
 fn now_millis() -> i64 {
@@ -990,56 +992,98 @@ impl HarnessStore {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        Self::compact_session_tx(&tx, session_id, summary_content, retain_last_n)?;
+        tx.commit()?;
+        Ok(())
+    }
 
+    pub fn persist_and_compact_session(
+        &self,
+        session_id: &str,
+        messages: &[(String, String, Option<String>, Option<String>, bool)],
+        summary_content: &str,
+        retain_last_n: usize,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if existing != 0 {
+            return Err(StoreError::InvalidSessionState(
+                "cannot seed compaction over an existing transcript".to_string(),
+            ));
+        }
+        for (index, (role, content, calls, call_id, is_checkpoint)) in messages.iter().enumerate() {
+            tx.execute(
+                r#"
+                INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)
+                "#,
+                params![session_id, index as i64, role, content, calls, call_id, i32::from(*is_checkpoint), now_millis()],
+            )?;
+        }
+        Self::compact_session_tx(&tx, session_id, summary_content, retain_last_n)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compact_session_tx(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        summary_content: &str,
+        retain_last_n: usize,
+    ) -> Result<(), StoreError> {
         let active_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0",
             params![session_id],
             |r| r.get(0),
         )?;
-
         if (active_count as usize) <= retain_last_n {
             return Ok(());
         }
-
         let mut cutoff_idx: i64 = tx.query_row(
             "SELECT message_index FROM session_messages WHERE session_id = ?1 AND is_archived = 0 AND is_compacted_summary = 0 ORDER BY message_index DESC LIMIT 1 OFFSET ?2",
             params![session_id, retain_last_n as i64],
             |r| r.get(0),
         )?;
-
-        // ATOMIC PAIR PRESERVATION:
-        // If cutoff_idx lands on an assistant message with tool_calls, do not split it from following tool results!
-        // Move cutoff forward to include the tool results in the archive window so the active context never starts with an orphaned tool result.
-        let is_tool_call_boundary: bool = tx.query_row(
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
-            params![session_id, cutoff_idx],
-            |r| r.get::<_, i64>(0).map(|c| c > 0),
-        ).unwrap_or(false);
-
-        if is_tool_call_boundary {
-            // Find max index of corresponding tool response
-            if let Ok(next_res_idx) = tx.query_row(
-                "SELECT message_index FROM session_messages WHERE session_id = ?1 AND message_index > ?2 AND role = 'tool' ORDER BY message_index ASC LIMIT 1",
+        loop {
+            let is_assistant_tool_call: bool = tx.query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND tool_calls_json IS NOT NULL",
                 params![session_id, cutoff_idx],
-                |r| r.get::<_, i64>(0),
-            ) {
-                cutoff_idx = next_res_idx;
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            ).unwrap_or(false);
+            let is_tool_msg: bool = tx.query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1 AND message_index = ?2 AND role = 'tool'",
+                params![session_id, cutoff_idx],
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            ).unwrap_or(false);
+            if is_assistant_tool_call || is_tool_msg {
+                let next_msg: Result<(i64, String), _> = tx.query_row(
+                    "SELECT message_index, role FROM session_messages WHERE session_id = ?1 AND message_index > ?2 ORDER BY message_index ASC LIMIT 1",
+                    params![session_id, cutoff_idx],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                );
+                if let Ok((next_idx, role)) = next_msg {
+                    if role == "tool" {
+                        cutoff_idx = next_idx;
+                        continue;
+                    }
+                }
             }
+            break;
         }
-
-        // ARCHIVE without deleting (Original raw audit history is completely preserved!)
         tx.execute(
-            "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND message_index <= ?2",
+            "UPDATE session_messages SET is_archived = 1 WHERE session_id = ?1 AND (is_compacted_summary = 1 OR (message_index <= ?2 AND role != 'system'))",
             params![session_id, cutoff_idx],
         )?;
-
         let max_idx: i64 = tx.query_row(
             "SELECT COALESCE(MAX(message_index), -1) + 1 FROM session_messages WHERE session_id = ?1",
             params![session_id],
             |r| r.get(0),
         )?;
-
-        // Insert new compacted summary into active context with new unique index
         tx.execute(
             r#"
             INSERT INTO session_messages (session_id, message_index, role, content, tool_calls_json, tool_call_id, is_compacted_summary, is_archived, created_at)
@@ -1047,9 +1091,6 @@ impl HarnessStore {
             "#,
             params![session_id, max_idx, summary_content, now_millis()],
         )?;
-
-        tx.commit()?;
-
         Ok(())
     }
 
@@ -1059,27 +1100,40 @@ impl HarnessStore {
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<SessionUsage, StoreError> {
+        self.record_session_usage_full(session_id, input_tokens, output_tokens, 0, 0)
+    }
+
+    pub fn record_session_usage_full(
+        &self,
+        session_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> Result<SessionUsage, StoreError> {
         let conn = self.conn.lock().unwrap();
         let now = now_millis();
         let total = input_tokens + output_tokens;
 
         conn.execute(
             r#"
-            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(session_id) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
+                cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
                 updated_at = excluded.updated_at
             "#,
-            params![session_id, input_tokens, output_tokens, total, now],
+            params![session_id, input_tokens, output_tokens, total, cache_read_tokens, cache_write_tokens, now],
         )?;
 
-        let row: (i64, i64, i64, i64) = conn.query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+        let row: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at FROM session_usage WHERE session_id = ?1",
             params![session_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
 
         Ok(SessionUsage {
@@ -1087,26 +1141,169 @@ impl HarnessStore {
             input_tokens: row.0,
             output_tokens: row.1,
             total_tokens: row.2,
-            updated_at: row.3,
+            cache_read_tokens: row.3,
+            cache_write_tokens: row.4,
+            updated_at: row.5,
         })
+    }
+
+    fn map_request_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<dume_core::types::RequestUsage> {
+        Ok(dume_core::types::RequestUsage {
+            request_id: r.get(0)?,
+            session_id: r.get(1)?,
+            model: r.get(2)?,
+            input_tokens: r.get(3)?,
+            output_tokens: r.get(4)?,
+            total_tokens: r.get(5)?,
+            cache_read_tokens: r.get(6)?,
+            cache_write_tokens: r.get(7)?,
+            benchmark_run_id: r.get(8)?,
+            case_id: r.get(9)?,
+            variant: r.get(10)?,
+            attempt_id: r.get(11)?,
+            agent_id: r.get(12)?,
+            parent_agent_id: r.get(13)?,
+            raw_usage_json: r.get(14)?,
+            is_complete: r.get::<_, i64>(15)? != 0,
+            created_at: r.get(16)?,
+        })
+    }
+
+    pub fn record_request_usage(
+        &self,
+        usage: &dume_core::types::RequestUsage,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            r#"
+            INSERT OR IGNORE INTO request_usage (
+                request_id, session_id, model, input_tokens, output_tokens, total_tokens,
+                cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant,
+                attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "#,
+            params![
+                usage.request_id,
+                usage.session_id,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.benchmark_run_id,
+                usage.case_id,
+                usage.variant,
+                usage.attempt_id,
+                usage.agent_id,
+                usage.parent_agent_id,
+                usage.raw_usage_json,
+                if usage.is_complete { 1 } else { 0 },
+                usage.created_at,
+            ],
+        )?;
+
+        // Also update aggregate session_usage if newly recorded
+        if inserted > 0 {
+            let total = usage.input_tokens + usage.output_tokens;
+            tx.execute(
+                r#"
+                INSERT INTO session_usage (session_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    usage.session_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    total,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.created_at,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(inserted > 0)
+    }
+
+    pub fn get_session_request_usages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], Self::map_request_usage_row)?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_benchmark_request_usages(
+        &self,
+        benchmark_run_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE benchmark_run_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![benchmark_run_id], Self::map_request_usage_row)?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_attempt_request_usages(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Vec<dume_core::types::RequestUsage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, session_id, model, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, benchmark_run_id, case_id, variant, attempt_id, agent_id, parent_agent_id, raw_usage_json, is_complete, created_at FROM request_usage WHERE attempt_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![attempt_id], Self::map_request_usage_row)?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
     }
 
     pub fn get_session_usage(&self, session_id: &str) -> Result<SessionUsage, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let existing: Option<(i64, i64, i64, i64)> = conn
+        let existing: Option<(i64, i64, i64, i64, i64, i64)> = conn
             .query_row(
-                "SELECT input_tokens, output_tokens, total_tokens, updated_at FROM session_usage WHERE session_id = ?1",
+                "SELECT input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, updated_at FROM session_usage WHERE session_id = ?1",
                 params![session_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
 
         Ok(match existing {
-            Some((input, output, total, updated)) => SessionUsage {
+            Some((input, output, total, cache_read, cache_write, updated)) => SessionUsage {
                 session_id: session_id.to_string(),
                 input_tokens: input,
                 output_tokens: output,
                 total_tokens: total,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
                 updated_at: updated,
             },
             None => SessionUsage {
@@ -1114,6 +1311,8 @@ impl HarnessStore {
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 updated_at: now_millis(),
             },
         })
@@ -1415,5 +1614,234 @@ mod tests {
         assert!(active_msgs[0].4, "Must be flagged as summary");
         assert_eq!(active_msgs[1].1, "Done task 2");
         assert_eq!(active_msgs[2].1, "Now do task 3");
+    }
+
+    #[test]
+    fn test_compact_session_preserves_multi_tool_calls_atomically() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "test_sess_multi_tool_compact";
+
+        // Setup session history with a multi-tool call assistant message and multiple tool results
+        store
+            .append_session_message(session_id, "user", "Run three tasks", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(
+                session_id,
+                "assistant",
+                "Calling 3 tools",
+                Some(r#"[{"id":"t1","name":"tool1"},{"id":"t2","name":"tool2"},{"id":"t3","name":"tool3"}]"#),
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 1 output", None, Some("t1"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 2 output", None, Some("t2"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "tool", "tool 3 output", None, Some("t3"), false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "assistant", "All three tools completed.", None, None, false)
+            .unwrap();
+        store
+            .append_session_message(session_id, "user", "Follow up prompt", None, None, false)
+            .unwrap();
+
+        // 7 messages total:
+        // 0: user
+        // 1: assistant (calls t1, t2, t3)
+        // 2: tool t1
+        // 3: tool t2
+        // 4: tool t3
+        // 5: assistant
+        // 6: user
+        //
+        // If we retain_last_n = 4:
+        // Normally offset 4 would cut off at message 2 (tool t1).
+        // Without atomic multi-tool protection, messages 0, 1, 2 would be archived,
+        // leaving orphaned tool messages 3 and 4 at the start of the active context!
+        // With atomic multi-tool protection, all contiguous tool results (2, 3, 4) are advanced into the archive window.
+        store.compact_session(session_id, "Compact summary: completed 3 tools", 4).unwrap();
+
+        let active_msgs = store.list_active_context_messages(session_id).unwrap();
+        // Active messages should be:
+        // 0: summary
+        // 1: assistant ("All three tools completed.")
+        // 2: user ("Follow up prompt")
+        assert_eq!(active_msgs.len(), 3);
+        assert_eq!(active_msgs[0].0, "system");
+        assert!(active_msgs[0].4, "First active message must be summary");
+        assert_eq!(active_msgs[1].0, "assistant");
+        assert_eq!(active_msgs[1].1, "All three tools completed.");
+        assert_eq!(active_msgs[2].0, "user");
+        assert_eq!(active_msgs[2].1, "Follow up prompt");
+
+        // Verify active context NEVER begins with an orphaned tool result
+        for (role, _, _, tool_call_id, is_sum) in &active_msgs {
+            if !is_sum && role == "tool" {
+                panic!("Active context must not have orphaned tool result! Found: {:?}", tool_call_id);
+            }
+        }
+    }
+
+    #[test]
+    fn persist_and_compact_session_rejects_existing_history_without_mutation() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "snapshot-conflict";
+        store
+            .append_session_message(session_id, "user", "existing", None, None, false)
+            .unwrap();
+        let incoming = vec![("user".to_string(), "new".to_string(), None, None, false)];
+
+        assert!(store
+            .persist_and_compact_session(session_id, &incoming, "checkpoint", 0)
+            .is_err());
+        assert_eq!(store.list_session_messages(session_id).unwrap().len(), 1);
+        assert_eq!(
+            store.list_active_context_messages(session_id).unwrap()[0].1,
+            "existing"
+        );
+    }
+
+    #[test]
+    fn test_request_and_session_usage_tracking() {
+        let dir = tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path()).unwrap();
+        let session_id = "sess_usage_1";
+
+        let req1 = dume_core::types::RequestUsage {
+            request_id: "req_1".to_string(),
+            session_id: session_id.to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            cache_read_tokens: 30,
+            cache_write_tokens: 10,
+            benchmark_run_id: Some("bench_1".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("main".to_string()),
+            parent_agent_id: None,
+            raw_usage_json: Some("{\"prompt_tokens\":100}".to_string()),
+            is_complete: true,
+            created_at: 1000,
+        };
+
+        let inserted1 = store.record_request_usage(&req1).unwrap();
+        assert!(inserted1, "First insert must succeed");
+
+        // Idempotency: re-recording same request_id must be ignored and return false
+        let inserted_again = store.record_request_usage(&req1).unwrap();
+        assert!(!inserted_again, "Duplicate request_id must be ignored");
+
+        let req2 = dume_core::types::RequestUsage {
+            request_id: "req_2".to_string(),
+            session_id: session_id.to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            input_tokens: 200,
+            output_tokens: 80,
+            total_tokens: 280,
+            cache_read_tokens: 60,
+            cache_write_tokens: 20,
+            benchmark_run_id: Some("bench_1".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("child_1".to_string()),
+            parent_agent_id: Some("main".to_string()),
+            raw_usage_json: None,
+            is_complete: true,
+            created_at: 2000,
+        };
+        store.record_request_usage(&req2).unwrap();
+
+        let list = store.get_session_request_usages(session_id).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].request_id, "req_1");
+        assert_eq!(list[0].benchmark_run_id.as_deref(), Some("bench_1"));
+        assert_eq!(list[1].request_id, "req_2");
+        assert_eq!(list[1].parent_agent_id.as_deref(), Some("main"));
+
+        let bench_list = store.get_benchmark_request_usages("bench_1").unwrap();
+        assert_eq!(bench_list.len(), 2);
+
+        let att_list = store.get_attempt_request_usages("att_1").unwrap();
+        assert_eq!(att_list.len(), 2);
+
+        let agg = store.get_session_usage(session_id).unwrap();
+        assert_eq!(agg.input_tokens, 300);
+        assert_eq!(agg.output_tokens, 130);
+        assert_eq!(agg.total_tokens, 430);
+        assert_eq!(agg.cache_read_tokens, 90);
+        assert_eq!(agg.cache_write_tokens, 30);
+    }
+
+    #[test]
+    fn test_legacy_schema_migration() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        // 1. Create a legacy database without benchmark columns in request_usage / session_usage
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE session_usage (
+                    session_id TEXT PRIMARY KEY,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE request_usage (
+                    request_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_request_usage_session ON request_usage(session_id);
+                "#,
+            ).unwrap();
+        }
+
+        // 2. Open via HarnessStore::open which runs initialize_schema and migrations
+        let store = HarnessStore::open(&db_path, dir.path().join("artifacts")).unwrap();
+
+        // 3. Verify store methods work on migrated DB
+        let req = dume_core::types::RequestUsage {
+            request_id: "req_migrated_1".to_string(),
+            session_id: "sess_migrated".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            benchmark_run_id: Some("bench_migrated".to_string()),
+            case_id: Some("case_1".to_string()),
+            variant: Some("baseline".to_string()),
+            attempt_id: Some("att_1".to_string()),
+            agent_id: Some("main".to_string()),
+            parent_agent_id: None,
+            raw_usage_json: None,
+            is_complete: true,
+            created_at: 100,
+        };
+        assert!(store.record_request_usage(&req).unwrap());
+        let list = store.get_benchmark_request_usages("bench_migrated").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].request_id, "req_migrated_1");
     }
 }

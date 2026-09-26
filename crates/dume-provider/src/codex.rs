@@ -1,5 +1,5 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, ToolDefinition};
+use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
 use anyhow::{Context, Result, bail};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -271,14 +271,26 @@ pub(crate) mod tests {
         );
         assert!(
             CodexProvider::new("bad\nvalue", "account")
-                .headers()
+                .headers(None)
                 .is_err()
         );
         assert!(
             CodexProvider::new("access", "bad\nvalue")
-                .headers()
+                .headers(None)
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn codex_propagates_session_id_prompt_cache_key() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        let (url, server) = fixture(sse.to_string());
+        let provider = CodexProvider::new("access-tok", "account-123").with_base_url(&url);
+        let ctx = crate::types::StreamRequestContext::for_session("session-cache-aff-99");
+        let (tx, _rx) = mpsc::channel(16);
+        provider.stream_with_context("gpt-5", &[ChatMessage::user("hi")], &[], Some(&ctx), tx).await.unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.contains("session-id: session-cache-aff-99"));
+        assert_eq!(body["prompt_cache_key"], "session-cache-aff-99");
     }
 }
 
@@ -307,12 +319,20 @@ impl CodexProvider {
         }
     }
 
-    fn headers(&self) -> Result<HeaderMap> {
+    fn headers(&self, context: Option<&crate::types::StreamRequestContext>) -> Result<HeaderMap> {
         let mut headers = LlmClient::build_auth_headers(&self.access_token, false)?;
         headers.insert(
             "chatgpt-account-id",
             HeaderValue::from_str(&self.account_id).context("Invalid account ID header")?,
         );
+        if let Some(ctx) = context {
+            if let Ok(val) = HeaderValue::from_str(&ctx.session_id) {
+                headers.insert("session-id", val);
+            }
+            if let Ok(val) = HeaderValue::from_str(&ctx.request_id) {
+                headers.insert("x-client-request-id", val);
+            }
+        }
         headers.insert("originator", HeaderValue::from_static("pi"));
         headers.insert(
             "user-agent",
@@ -326,7 +346,7 @@ impl CodexProvider {
         Ok(headers)
     }
 
-    fn body(model: &str, messages: &[ChatMessage], tools: &[ToolDefinition]) -> Result<Value> {
+    fn body(model: &str, messages: &[ChatMessage], tools: &[ToolDefinition], context: Option<&crate::types::StreamRequestContext>) -> Result<Value> {
         let mut input = Vec::new();
         for message in messages {
             match message.role {
@@ -359,6 +379,9 @@ impl CodexProvider {
             "input": input, "tool_choice": "auto", "parallel_tool_calls": true,
             "text": {"verbosity": "low"}, "include": ["reasoning.encrypted_content"]
         });
+        if let Some(ctx) = context {
+            body["prompt_cache_key"] = json!(ctx.session_id);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(
                 tools
@@ -380,7 +403,18 @@ impl CodexProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let result = self.stream_inner(model, messages, tools, &tx).await;
+        self.stream_with_context(model, messages, tools, None, tx).await
+    }
+
+    pub async fn stream_with_context(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<()> {
+        let result = self.stream_inner(model, messages, tools, context, &tx).await;
         if let Err(error) = &result {
             let _ = tx.send(StreamEvent::Error(error.to_string())).await;
         }
@@ -392,14 +426,15 @@ impl CodexProvider {
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
         tx: &mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
         let response = self
             .client
             .post_with_retry(
                 &self.url(),
-                self.headers()?,
-                &Self::body(model, messages, tools)?,
+                self.headers(context)?,
+                &Self::body(model, messages, tools, context)?,
                 0,
             )
             .await?;
@@ -657,6 +692,23 @@ impl ResponseState {
                         }
                         let _: Value = serde_json::from_str(&call.arguments)
                             .context("Invalid final Codex tool arguments")?;
+                    }
+                }
+                if let Some(usage) = response.get("usage") {
+                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let total = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(input + output);
+                    let cache_read = usage.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|v| v.as_i64());
+                    if input > 0 || output > 0 || total > 0 {
+                        events.push(StreamEvent::Usage(TokenUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            total_tokens: total,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: None,
+                            raw_usage: Some(usage.clone()),
+                            is_complete: true,
+                        }));
                     }
                 }
                 if !self.reasoning.is_empty() {

@@ -157,7 +157,42 @@ pub struct SessionUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUsage {
+    pub request_id: String,
+    pub session_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_usage_json: Option<String>,
+    #[serde(default = "default_is_complete")]
+    pub is_complete: bool,
+    pub created_at: i64,
+}
+
+fn default_is_complete() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,3 +228,25 @@ pub struct WorkflowArtifact {
     pub created_at: i64,
 }
 
+
+/// Lightweight skill catalog metadata (names and descriptions only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+}
+
+/// Canonical stable system prompt and instructions for DUM-E execution.
+pub struct PromptPrefix;
+
+impl PromptPrefix {
+    /// Canonical stable system instructions shared across worker and interactive execution.
+    pub const BASE_SYSTEM_PROMPT: &'static str =
+        "You are DUM-E coding agent. Work directly in the worktree.
+Use tools bash, read_file, write_file as needed.";
+
+    /// Formats a user prompt cleanly with goal/task without embedding task text into the system prefix.
+    pub fn build_task_user_message(task_prompt: &str) -> String {
+        task_prompt.trim().to_string()
+    }
+}

@@ -1,3 +1,5 @@
+pub mod bench;
+
 use anyhow::{Context, Result};
 use dume_core::types::*;
 use dume_core::verify::verify_allowed_paths;

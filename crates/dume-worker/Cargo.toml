@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 dume-core = { workspace = true }
+dume-store = { workspace = true }
 dume-git = { workspace = true }
 dume-provider = { workspace = true }
 dume-mcp = { workspace = true }

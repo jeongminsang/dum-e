@@ -40,7 +40,7 @@ impl ResolvedProvider {
             Transport::AnthropicOAuth(p) => Transport::AnthropicOAuth(p.with_base_url(base_url)),
             Transport::OpenAi(p) => Transport::OpenAi(p.with_base_url(base_url)),
             Transport::Codex(p) => Transport::Codex(p.with_base_url(base_url)),
-            Transport::Google(_) => anyhow::bail!("Base URL override is unsupported for google"),
+            Transport::Google(p) => Transport::Google(p.with_base_url(base_url)),
         };
         Ok(self)
     }
@@ -64,13 +64,15 @@ impl ResolvedProvider {
         let model = &self.model.id;
         match &self.transport {
             Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
-                p.stream(model, messages, tools, tx).await
+                p.stream_with_context(model, messages, tools, context, tx).await
             }
             Transport::OpenAi(p) => {
                 p.stream_with_context(model, messages, tools, context, tx)
                     .await
             }
-            Transport::Codex(p) => p.stream(model, messages, tools, tx).await,
+            Transport::Codex(p) => {
+                p.stream_with_context(model, messages, tools, context, tx).await
+            }
             Transport::Google(p) => p.stream(model, messages, tools, tx).await,
         }
     }
@@ -85,6 +87,7 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
             api == "openai-codex-responses" || api == "openai-responses" || api.is_empty()
         }
         "google" => api == "google-generative-ai" || api.is_empty(),
+        "deepseek" => api == "openai-completions" || api.is_empty(),
         "opencode" => {
             api == "openai-completions"
                 || api == "openai-responses"
@@ -110,12 +113,17 @@ pub fn is_model_supported(model: &ModelInfo) -> bool {
 fn supported(provider: &str) -> bool {
     matches!(
         provider,
-        "anthropic" | "openai" | "openai-codex" | "google" | "opencode" | "opencode-go"
+        "anthropic" | "openai" | "openai-codex" | "google" | "deepseek" | "opencode" | "opencode-go"
     )
 }
 
 /// Resolve only supported catalog entries, independently of available credentials.
 pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
+    resolve_model_with_root(selection, &ModelCatalog::models_dir())
+}
+
+/// Resolve only supported catalog entries with a custom models directory root.
+pub fn resolve_model_with_root(selection: &str, root: &std::path::Path) -> Result<ModelInfo> {
     let selection = selection.trim();
     let (provider, id) = match selection.split_once('/') {
         Some((provider, id)) => {
@@ -132,7 +140,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
         }
         None => (None, selection),
     };
-    let mut matches: Vec<_> = ModelCatalog::list_all_builtin_models()?
+    let mut matches: Vec<_> = ModelCatalog::list_all_models_with_root(root)?
         .into_iter()
         .filter(|model| {
             is_model_supported(model)
@@ -152,7 +160,7 @@ pub fn resolve_model(selection: &str) -> Result<ModelInfo> {
             .filter(|m| {
                 matches!(
                     m.provider.as_str(),
-                    "anthropic" | "openai" | "openai-codex" | "google"
+                    "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"
                 )
             })
             .cloned()
@@ -218,6 +226,10 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             &required(credential.access_token.as_deref(), "access token")?,
         )),
         ("openai", "api_key") => Transport::OpenAi(OpenAiProvider::new(&required(
+            credential.key.as_deref(),
+            "API key",
+        )?)),
+        ("deepseek", "api_key") => Transport::OpenAi(OpenAiProvider::new_deepseek(&required(
             credential.key.as_deref(),
             "API key",
         )?)),
@@ -343,7 +355,7 @@ pub async fn resolve_role_provider(
     }
 
     // If role candidates failed, attempt fallback to any authenticated supported model
-    let all = ModelCatalog::list_all_builtin_models().unwrap_or_default();
+    let all = ModelCatalog::list_all_models().unwrap_or_default();
     for m in all {
         if is_model_supported(&m) && store.has_credential(&m.provider) {
             let qualified = format!("{}/{}", m.provider, m.id);
@@ -452,7 +464,7 @@ mod tests {
             credential("api_key"),
         )
         .unwrap();
-        assert!(google.with_base_url("http://127.0.0.1:1234").is_err());
+        assert!(google.with_base_url("http://127.0.0.1:1234").is_ok());
     }
 
     #[tokio::test]
@@ -599,5 +611,43 @@ mod tests {
             err.to_string()
                 .contains("only openai-completions is currently supported")
         );
+    }
+
+    #[test]
+    fn deepseek_catalog_and_api_key_route_to_direct_transport() {
+        let model = resolve_model("deepseek/deepseek-v4-flash").unwrap();
+        assert_eq!(model.api, "openai-completions");
+        let resolved = bind_credential(model, credential("api_key")).unwrap();
+        assert!(matches!(resolved.transport, Transport::OpenAi(_)));
+        assert!(!is_transport_supported("deepseek", "openai-responses"));
+        assert!(bind_credential(resolve_model("deepseek/deepseek-v4-flash").unwrap(), credential("oauth")).is_err());
+    }
+
+    #[test]
+    fn resolve_dynamic_cached_model() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_dir = temp_dir.path().join(".dume/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // Write a dynamic model into models-cache.json
+        let cache_content = r#"[
+            {
+                "id": "gpt-6-luna",
+                "name": "GPT-6 Luna",
+                "provider": "openai",
+                "api": "openai-responses",
+                "contextWindow": 400000,
+                "maxTokens": 128000
+            }
+        ]"#;
+        std::fs::write(agent_dir.join("models-cache.json"), cache_content).unwrap();
+
+        let resolved = resolve_model_with_root("openai/gpt-6-luna", &agent_dir);
+
+        let m = resolved.expect("Failed to resolve dynamic cached model");
+        assert_eq!(m.id, "gpt-6-luna");
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.base_url.as_deref(), Some("https://api.openai.com/v1"));
+        assert!(is_model_supported(&m));
     }
 }

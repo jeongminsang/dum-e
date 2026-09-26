@@ -19,21 +19,44 @@ use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
 use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
+use dume_worker::subagent_settings::SubagentSettings;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
+
+fn save_credential_and_rotate_session(
+    store: &dume_provider::CredentialStore,
+    provider: &str,
+    key: &str,
+    session_id: &mut String,
+) -> Result<()> {
+    store.save_credential(provider, key)?;
+    *session_id = dume_provider::types::StreamRequestContext::new().session_id;
+    Ok(())
+}
+
+fn delete_credential_and_rotate_session(
+    store: &dume_provider::CredentialStore,
+    provider: &str,
+    session_id: &mut String,
+) -> Result<()> {
+    store.delete(provider)?;
+    *session_id = dume_provider::types::StreamRequestContext::new().session_id;
+    Ok(())
+}
 
 enum ConversationEvent {
     Stream(StreamEvent),
     Finished {
         messages: Vec<ChatMessage>,
         error: Option<String>,
+        session_id: Option<String>,
     },
     OAuthComplete {
         provider: String,
@@ -48,6 +71,57 @@ enum ConversationEvent {
     },
     BtwStreamDelta(String),
     BtwFinished(Result<String, String>),
+    CatalogRefreshFinished(Result<Option<usize>, String>),
+}
+
+fn selectable_models() -> Vec<ModelInfo> {
+    let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+    let authenticated: BTreeSet<_> = [
+        "anthropic", "openai", "google", "deepseek", "openai-codex", "opencode", "opencode-go",
+    ]
+    .into_iter()
+    .filter(|provider| store.has_credential(provider))
+    .collect();
+    dume_provider::ModelCatalog::list_all_models()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| {
+            dume_provider::is_model_supported(model) && authenticated.contains(model.provider.as_str())
+        })
+        .collect()
+}
+
+fn subagent_command(command: &str, parent_model: &str, path: &std::path::Path) -> Result<String> {
+    let mut settings = SubagentSettings::load_from(path)?;
+    if command == "/subagents" {
+        let model = settings.model.as_deref().unwrap_or(parent_model);
+        let source = if settings.model.is_some() { "configured" } else { "inherited" };
+        return Ok(format!(
+            "Subagent model: {model} ({source})\nUse /subagents model <provider/model> or /subagents model inherit."
+        ));
+    }
+    if command == "/subagents model inherit" {
+        settings.model = None;
+        settings.save_to(path)?;
+        return Ok("Subagents now inherit the parent model.".into());
+    }
+    if let Some(selection) = command.strip_prefix("/subagents model ") {
+        let model = dume_provider::resolve_model(selection.trim())?;
+        let qualified = format!("{}/{}", model.provider, model.id);
+        settings.model = Some(qualified.clone());
+        settings.save_to(path)?;
+        return Ok(format!("Subagent model set to {qualified}."));
+    }
+    anyhow::bail!("Usage: /subagents model <provider/model|inherit>")
+}
+
+fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
+    tokio::spawn(async move {
+        let result = dume_provider::ModelCatalog::refresh_codex_cache_if_stale()
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+    });
 }
 
 pub enum ModalState {
@@ -102,7 +176,8 @@ pub struct App {
     pub modal: ModalState,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
-    pub session_usage: (i64, i64, i64), // (input_tokens, output_tokens, total_tokens)
+    pub session_usage: (i64, i64, i64, i64, i64), // (input, output, total, cache_read, cache_write)
+    pub current_turn_usage: dume_provider::types::TokenUsage,
     pub session_id: String,
     pub prompt_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -194,7 +269,8 @@ impl App {
             modal: ModalState::None,
             last_ctrl_c: None,
             available_update: None,
-            session_usage: (0, 0, 0),
+            session_usage: (0, 0, 0, 0, 0),
+            current_turn_usage: dume_provider::types::TokenUsage::default(),
             session_id: dume_provider::types::StreamRequestContext::new().session_id,
             prompt_history: Vec::new(),
             history_index: None,
@@ -226,6 +302,7 @@ impl App {
                 "/model",
                 "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
             ),
+            ("/subagents", "Show or set the model used by subagents"),
             (
                 "/login",
                 "Save provider API key (e.g. /login anthropic <key>)",
@@ -354,16 +431,41 @@ impl App {
                 self.streaming_text.push_str(&arguments_delta);
             }
             ConversationEvent::Stream(StreamEvent::Usage(usage)) => {
-                self.session_usage.0 += usage.input_tokens;
-                self.session_usage.1 += usage.output_tokens;
-                self.session_usage.2 += usage.total_tokens;
+                self.current_turn_usage.merge_cumulative(&usage);
+            }
+            ConversationEvent::Stream(StreamEvent::Completed { .. }) => {
+                self.session_usage.0 += self.current_turn_usage.input_tokens;
+                self.session_usage.1 += self.current_turn_usage.output_tokens;
+                self.session_usage.2 += self.current_turn_usage.total_tokens;
+                if let Some(r) = self.current_turn_usage.cache_read_tokens {
+                    self.session_usage.3 += r;
+                }
+                if let Some(w) = self.current_turn_usage.cache_write_tokens {
+                    self.session_usage.4 += w;
+                }
+                self.current_turn_usage = dume_provider::types::TokenUsage::default();
             }
             ConversationEvent::Stream(_) => {}
-            ConversationEvent::Finished { messages, error } => {
+            ConversationEvent::Finished { messages, error, session_id } => {
+                if let Some(session_id) = session_id {
+                    self.session_id = session_id;
+                }
+                if self.current_turn_usage.input_tokens > 0 || self.current_turn_usage.output_tokens > 0 {
+                    self.session_usage.0 += self.current_turn_usage.input_tokens;
+                    self.session_usage.1 += self.current_turn_usage.output_tokens;
+                    self.session_usage.2 += self.current_turn_usage.total_tokens;
+                    if let Some(r) = self.current_turn_usage.cache_read_tokens {
+                        self.session_usage.3 += r;
+                    }
+                    if let Some(w) = self.current_turn_usage.cache_write_tokens {
+                        self.session_usage.4 += w;
+                    }
+                    self.current_turn_usage = dume_provider::types::TokenUsage::default();
+                }
                 self.messages = messages;
                 if let Some(error) = error {
                     self.messages
-                        .push(ChatMessage::system(format!("Error: {}", error)));
+                        .push(ChatMessage::ui_notice(format!("Error: {}", error)));
                 }
                 self.streaming_text.clear();
                 self.is_busy = false;
@@ -372,13 +474,14 @@ impl App {
             ConversationEvent::OAuthComplete { provider, result } => {
                 match result {
                     Ok(()) => {
-                        self.messages.push(ChatMessage::system(format!(
+                        self.session_id = dume_provider::types::StreamRequestContext::new().session_id;
+                        self.messages.push(ChatMessage::ui_notice(format!(
                             "Successfully authenticated {}! You can now use this provider.",
                             provider
                         )));
                     }
                     Err(e) => {
-                        self.messages.push(ChatMessage::system(format!(
+                        self.messages.push(ChatMessage::ui_notice(format!(
                             "Authentication failed for {}: {}",
                             provider, e
                         )));
@@ -388,7 +491,7 @@ impl App {
             }
             ConversationEvent::UpdateAvailable(info) => {
                 self.available_update = Some(info.clone());
-                self.messages.push(ChatMessage::system(format!(
+                self.messages.push(ChatMessage::ui_notice(format!(
                     "Update available: v{} (Current: v{}). Type /update to install in-place.",
                     info.latest_version, info.current_version
                 )));
@@ -407,12 +510,12 @@ impl App {
             ConversationEvent::UpdateFinished { result } => {
                 match result {
                     Ok(path) => {
-                        self.messages.push(ChatMessage::system(format!(
+                        self.messages.push(ChatMessage::ui_notice(format!(
                             "Successfully updated DUM-E in-place to the latest version! (Binary: {})",
                             path.display()
                         )));
                         if let Some(info) = &self.available_update {
-                            self.messages.push(ChatMessage::system(format!(
+                            self.messages.push(ChatMessage::ui_notice(format!(
                                 "DUM-E is now running on updated binary (v{}). Your session remains active.",
                                 info.latest_version
                             )));
@@ -420,7 +523,7 @@ impl App {
                         self.available_update = None;
                     }
                     Err(e) => {
-                        self.messages.push(ChatMessage::system(format!(
+                        self.messages.push(ChatMessage::ui_notice(format!(
                             "In-place update failed: {}",
                             e
                         )));
@@ -456,6 +559,49 @@ impl App {
                     streaming_reply.clear();
                 }
             }
+            ConversationEvent::CatalogRefreshFinished(result) => match result {
+                Ok(Some(count)) => {
+                    self.messages.push(ChatMessage::ui_notice(format!(
+                        "Model catalog updated ({count} models)."
+                    )));
+                    if let ModalState::ModelSelector {
+                        models,
+                        filtered,
+                        selected_idx,
+                        filter,
+                        provider_tabs,
+                        active_tab_idx,
+                    } = &mut self.modal {
+                        let selected = filtered.get(*selected_idx).map(|m| (m.provider.clone(), m.id.clone()));
+                        let active_provider = provider_tabs.get(*active_tab_idx).cloned().unwrap_or_default();
+                        *models = selectable_models();
+                        *provider_tabs = std::iter::once("All".to_string())
+                            .chain(models.iter().map(|m| m.provider.clone()))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        if let Some(index) = provider_tabs.iter().position(|p| p == &active_provider) {
+                            *active_tab_idx = index;
+                        } else {
+                            *active_tab_idx = 0;
+                        }
+                        let tab = &provider_tabs[*active_tab_idx];
+                        let query = filter.to_lowercase();
+                        *filtered = models.iter().filter(|m| {
+                            (tab == "All" || &m.provider == tab)
+                                && (m.id.to_lowercase().contains(&query)
+                                    || m.provider.to_lowercase().contains(&query))
+                        }).cloned().collect();
+                        *selected_idx = selected
+                            .and_then(|(provider, id)| filtered.iter().position(|m| m.provider == provider && m.id == id))
+                            .unwrap_or(0);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.messages.push(ChatMessage::ui_notice(format!(
+                    "Model catalog refresh failed; using local models: {error}"
+                ))),
+            },
         }
     }
 }
@@ -485,11 +631,17 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut reader = EventStream::new();
     let (stream_tx, mut stream_rx) = mpsc::channel::<ConversationEvent>(100);
     let cancellation = CancellationToken::new();
-    let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new(
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
+    let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
+    let harness_store = Arc::new(HarnessStore::open(&db_path, &artifacts_dir)?);
+    let mut raw_dispatcher = ToolDispatcher::new(
         std::env::current_dir()?,
         model,
         cancellation.clone(),
-    )));
+    );
+    raw_dispatcher = raw_dispatcher.with_store(harness_store);
+    let dispatcher = Arc::new(Mutex::new(raw_dispatcher));
     let mut task = None;
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
@@ -507,6 +659,18 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
     });
 
+    // Spawn non-blocking background catalog refresh
+    let catalog_refresh = dume_provider::ModelCatalog::refresh_remote_catalog_background();
+    let catalog_tx = stream_tx.clone();
+    tokio::spawn(async move {
+        let result = catalog_refresh
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
+        let _ = catalog_tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+    });
+    spawn_codex_catalog_refresh(stream_tx.clone());
+
     let result: Result<()> = async {
       loop {
         terminal.draw(|f| {
@@ -514,14 +678,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(5),    // Transcript
-                    Constraint::Length(3), // Input bar
+                    Constraint::Length(5), // Input bar
                     Constraint::Length(1), // Status bar
                 ])
                 .split(f.area());
 
             let transcript_area = chunks[0];
-            let inner_width = transcript_area.width.saturating_sub(2);
-            let inner_height = transcript_area.height.saturating_sub(2);
+            let inner_width = transcript_area.width;
+            let inner_height = transcript_area.height;
             let total_lines = calculate_transcript_height(
                 inner_width,
                 &app.messages,
@@ -615,6 +779,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     let has_anthropic = cred_store.has_credential("anthropic");
                     let has_openai = cred_store.has_credential("openai");
                     let has_google = cred_store.has_credential("google");
+                    let has_deepseek = cred_store.has_credential("deepseek");
                     let has_codex = cred_store.has_credential("openai-codex");
                     let has_opencode = cred_store.has_credential("opencode");
                     let has_opencode_go = cred_store.has_credential("opencode-go");
@@ -637,6 +802,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                             name: "Google Gemini",
                             auth_type: "API Key",
                             is_authenticated: has_google,
+                        },
+                        LoginProviderChoice {
+                            id: "deepseek",
+                            name: "DeepSeek",
+                            auth_type: "API Key",
+                            is_authenticated: has_deepseek,
                         },
                         LoginProviderChoice {
                             id: "openai-codex",
@@ -807,8 +978,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             if let Some(selected) = filtered.get(*selected_idx) {
                                                 let new_model = format!("{}/{}", selected.provider, selected.id);
                                                 persist_last_used_model(&new_model);
-                                                app.messages.push(ChatMessage::system(format!("Switched model to '{}'", new_model)));
+                                                app.messages.push(ChatMessage::ui_notice(format!("Switched model to '{}'", new_model)));
                                                 app.model = new_model;
+                                                app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             }
                                             app.modal = ModalState::None;
                                         }
@@ -851,6 +1023,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         "anthropic",
                                         "openai",
                                         "google",
+                                        "deepseek",
                                         "openai-codex",
                                         "opencode",
                                         "opencode-go",
@@ -859,6 +1032,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         "Anthropic Claude",
                                         "OpenAI ChatGPT",
                                         "Google Gemini",
+                                        "DeepSeek",
                                         "OpenAI Codex",
                                         "OpenCode Zen",
                                         "OpenCode Go",
@@ -938,19 +1112,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                                         };
                                                                     }
                                                                     Err(e) => {
-                                                                        app.messages.push(ChatMessage::system(format!("Failed to build OAuth URL: {}", e)));
+                                                                        app.messages.push(ChatMessage::ui_notice(format!("Failed to build OAuth URL: {}", e)));
                                                                         app.modal = ModalState::None;
                                                                     }
                                                                 }
                                                             }
                                                             Err(e) => {
-                                                                app.messages.push(ChatMessage::system(format!("PKCE generation failed: {}", e)));
+                                                                app.messages.push(ChatMessage::ui_notice(format!("PKCE generation failed: {}", e)));
                                                                 app.modal = ModalState::None;
                                                             }
                                                         }
                                                     }
                                                     None => {
-                                                        app.messages.push(ChatMessage::system("OAuth config for openai-codex not found."));
+                                                        app.messages.push(ChatMessage::ui_notice("OAuth config for openai-codex not found."));
                                                         app.modal = ModalState::None;
                                                     }
                                                 }
@@ -980,15 +1154,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 let cred_store = dume_provider::CredentialStore::new(
                                                     dume_provider::CredentialStore::default_path(),
                                                 );
-                                                match cred_store.save_credential(provider_id, key) {
+                                                match save_credential_and_rotate_session(
+                                                    &cred_store,
+                                                    provider_id,
+                                                    key,
+                                                    &mut app.session_id,
+                                                ) {
                                                     Ok(()) => {
-                                                        app.messages.push(ChatMessage::system(format!(
+                                                        app.messages.push(ChatMessage::ui_notice(format!(
                                                             "Successfully authenticated {} with API key.",
                                                             provider_name
                                                         )));
                                                     }
                                                     Err(e) => {
-                                                        app.messages.push(ChatMessage::system(format!(
+                                                        app.messages.push(ChatMessage::ui_notice(format!(
                                                             "Failed to save credential for {}: {}",
                                                             provider_name, e
                                                         )));
@@ -1008,7 +1187,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     if key.code == crossterm::event::KeyCode::Esc {
                                         cancel_token.cancel();
                                         app.modal = ModalState::None;
-                                        app.messages.push(ChatMessage::system("Cancelled OpenAI Codex login."));
+                                        app.messages.push(ChatMessage::ui_notice("Cancelled OpenAI Codex login."));
                                     }
                                     continue;
                                 }
@@ -1127,7 +1306,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         if let Some(cancel) = current_stream_cancel.take() {
                                             cancel.cancel();
                                         }
-                                        app.messages.push(ChatMessage::system("Streaming interrupted by user."));
+                                        app.messages.push(ChatMessage::ui_notice("Streaming interrupted by user."));
                                         app.is_busy = false;
                                         app.streaming_text.clear();
                                         app.last_ctrl_c = None;
@@ -1162,7 +1341,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         if let Some(cancel) = current_stream_cancel.take() {
                                             cancel.cancel();
                                         }
-                                        app.messages.push(ChatMessage::system("Streaming interrupted by user."));
+                                        app.messages.push(ChatMessage::ui_notice("Streaming interrupted by user."));
                                         app.is_busy = false;
                                         app.streaming_text.clear();
                                     }
@@ -1251,38 +1430,11 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                         let trimmed = content.trim();
                                         if trimmed == "/model" || trimmed == "/model " {
-                                            // 1. Inspect authenticated providers
-                                            let cred_store = dume_provider::CredentialStore::new(
-                                                dume_provider::CredentialStore::default_path(),
-                                            );
-                                            let has_anthropic = cred_store.has_credential("anthropic");
-                                            let has_openai = cred_store.has_credential("openai");
-                                            let has_google = cred_store.has_credential("google");
-                                            let has_codex = cred_store.has_credential("openai-codex");
-                                            let has_opencode = cred_store.has_credential("opencode");
-                                            let has_opencode_go = cred_store.has_credential("opencode-go");
-
-                                            let all_builtin = dume_provider::ModelCatalog::list_all_builtin_models().unwrap_or_default();
-
-                                            // Filter only models whose provider is supported and authenticated
-                                            let models: Vec<_> = all_builtin.into_iter().filter(|m| {
-                                                if !dume_provider::is_model_supported(m) {
-                                                    return false;
-                                                }
-                                                match m.provider.as_str() {
-                                                    "anthropic" => has_anthropic,
-                                                    "openai" => has_openai,
-                                                    "google" => has_google,
-                                                    "openai-codex" => has_codex,
-                                                    "opencode" => has_opencode,
-                                                    "opencode-go" => has_opencode_go,
-                                                    _ => false,
-                                                }
-                                            }).collect();
+                                            let models = selectable_models();
 
                                             if models.is_empty() {
-                                                app.messages.push(ChatMessage::system(
-                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, OpenAI Codex, OpenCode Zen, OpenCode Go)."
+                                                app.messages.push(ChatMessage::ui_notice(
+                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, DeepSeek, OpenAI Codex, OpenCode Zen, OpenCode Go)."
                                                 ));
                                                 continue;
                                             }
@@ -1309,8 +1461,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else if trimmed.starts_with("/model ") {
                                             let new_model = trimmed[7..].trim().to_string();
                                             persist_last_used_model(&new_model);
-                                            app.messages.push(ChatMessage::system(format!("Switched model to '{}'", new_model)));
+                                            app.messages.push(ChatMessage::ui_notice(format!("Switched model to '{}'", new_model)));
                                             app.model = new_model;
+                                            app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
+                                            continue;
+                                        } else if trimmed == "/subagents" || trimmed.starts_with("/subagents ") {
+                                            let result = SubagentSettings::path()
+                                                .and_then(|path| subagent_command(trimmed, &app.model, &path));
+                                            let message = match result {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Subagent settings error: {error:#}"),
+                                            };
+                                            app.messages.push(ChatMessage::ui_notice(message));
                                             continue;
                                         } else if trimmed == "/login" {
                                             // Open interactive login provider selector modal
@@ -1320,22 +1482,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let rest = trimmed[7..].trim();
                                             let parts: Vec<&str> = rest.split_whitespace().collect();
                                             if parts.len() < 2 {
-                                                app.messages.push(ChatMessage::system(
+                                                app.messages.push(ChatMessage::ui_notice(
                                                     "Usage: /login <provider> <api-key>\nExample: /login anthropic sk-ant-..."
                                                 ));
                                             } else {
                                                 let provider = parts[0];
                                                 let key = parts[1..].join(" ");
                                                 let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-                                                match cred_store.save_credential(provider, &key) {
+                                                match save_credential_and_rotate_session(
+                                                    &cred_store,
+                                                    provider,
+                                                    &key,
+                                                    &mut app.session_id,
+                                                ) {
                                                     Ok(()) => {
-                                                        app.messages.push(ChatMessage::system(format!(
+                                                        app.messages.push(ChatMessage::ui_notice(format!(
                                                             "Successfully saved API key for provider '{}'",
                                                             provider
                                                         )));
                                                     }
                                                     Err(e) => {
-                                                        app.messages.push(ChatMessage::system(format!(
+                                                        app.messages.push(ChatMessage::ui_notice(format!(
                                                             "Failed to save credential for '{}': {}",
                                                             provider, e
                                                         )));
@@ -1350,15 +1517,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 trimmed[8..].trim()
                                             };
                                             let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-                                            match cred_store.delete(provider) {
+                                            match delete_credential_and_rotate_session(
+                                                &cred_store,
+                                                provider,
+                                                &mut app.session_id,
+                                            ) {
                                                 Ok(()) => {
-                                                    app.messages.push(ChatMessage::system(format!(
+                                                    app.messages.push(ChatMessage::ui_notice(format!(
                                                         "Logged out from provider '{}'",
                                                         provider
                                                     )));
                                                 }
                                                 Err(e) => {
-                                                    app.messages.push(ChatMessage::system(format!(
+                                                    app.messages.push(ChatMessage::ui_notice(format!(
                                                         "Failed to logout from '{}': {}",
                                                         provider, e
                                                     )));
@@ -1366,10 +1537,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             continue;
                                         } else if trimmed == "/usage" {
-                                            let (input, output, total) = app.session_usage;
-                                            app.messages.push(ChatMessage::system(format!(
-                                                "Session Token Usage:\n  Input Tokens:  {}\n  Output Tokens: {}\n  Total Tokens:  {}",
-                                                input, output, total
+                                            let (input, output, total, cache_read, cache_write) = app.session_usage;
+                                            app.messages.push(ChatMessage::ui_notice(format!(
+                                                "Session Token Usage:\n  Input Tokens:       {}\n  Output Tokens:      {}\n  Total Tokens:       {}\n  Cache Read Tokens:  {}\n  Cache Write Tokens: {}",
+                                                input, output, total, cache_read, cache_write
                                             )));
                                             continue;
                                         } else if trimmed == "/btw" || trimmed.starts_with("/btw ") {
@@ -1386,12 +1557,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             };
                                             continue;
                                         } else if trimmed == "/clear" {
+                                            app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             app.messages.clear();
                                             app.streaming_text.clear();
                                             app.auto_scroll = true;
                                             app.scroll_offset = 0;
                                             continue;
                                         } else if trimmed == "/skills" {
+                                            app.skills.reload();
                                             let skills = app.skills.list();
                                             let mut text = String::from("Available Skills:\n");
                                             if skills.is_empty() {
@@ -1401,7 +1574,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     text.push_str(&format!("  /{:<18} - {}\n", skill.name, skill.description));
                                                 }
                                             }
-                                            app.messages.push(ChatMessage::system(text.trim_end().to_string()));
+                                            app.messages.push(ChatMessage::ui_notice(text.trim_end().to_string()));
                                             continue;
                                         } else if trimmed == "/update" {
                                             if let Some(info) = app.available_update.clone() {
@@ -1411,7 +1584,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     in_progress: false,
                                                 };
                                             } else {
-                                                app.messages.push(ChatMessage::system("Checking for updates..."));
+                                                app.messages.push(ChatMessage::ui_notice("Checking for updates..."));
                                                 let update_tx = stream_tx.clone();
                                                 tokio::spawn(async move {
                                                     let current_version = env!("CARGO_PKG_VERSION");
@@ -1422,20 +1595,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         }
                                                         Ok(None) => {
                                                             let _ = update_tx.send(ConversationEvent::Finished {
-                                                                messages: vec![ChatMessage::system(format!(
+                                                                messages: vec![ChatMessage::ui_notice(format!(
                                                                     "DUM-E is already up to date (v{}).",
                                                                     current_version
                                                                 ))],
                                                                 error: None,
+                                                                session_id: None,
                                                             }).await;
                                                         }
                                                         Err(e) => {
                                                             let _ = update_tx.send(ConversationEvent::Finished {
-                                                                messages: vec![ChatMessage::system(format!(
+                                                                messages: vec![ChatMessage::ui_notice(format!(
                                                                     "Update check failed: {}",
                                                                     e
                                                                 ))],
                                                                 error: None,
+                                                                session_id: None,
                                                             }).await;
                                                         }
                                                     }
@@ -1443,8 +1618,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             continue;
                                         } else if trimmed == "/help" {
+                                            app.skills.reload();
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /subagents                - Show subagent model setting\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {
@@ -1453,25 +1629,40 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     help.push_str(&format!("  /{:<22} - {}\n", skill.name, skill.description));
                                                 }
                                             }
-                                            app.messages.push(ChatMessage::system(help.trim_end().to_string()));
+                                            app.messages.push(ChatMessage::ui_notice(help.trim_end().to_string()));
                                             continue;
                                         } else if let Some(cmd) = trimmed.strip_prefix('/') {
+                                            app.skills.reload();
                                             let (skill_name, rest_args) = match cmd.split_once(char::is_whitespace) {
                                                 Some((name, rest)) => (name, rest.trim()),
                                                 None => (cmd, ""),
                                             };
 
-                                            if let Some(skill) = app.skills.get(skill_name).cloned() {
-                                                let prompt_content = if rest_args.is_empty() {
-                                                    format!("Execute skill '{}':\n\n{}", skill.name, skill.content)
+                                            if let Some(skill) = app.skills.get_or_reload(skill_name).cloned() {
+                                                let is_already_in_context = dume_core::skills::SkillRegistry::is_content_in_messages(
+                                                    &skill.content,
+                                                    app.messages.iter().map(|m| m.content.as_str()),
+                                                );
+                                                let prompt_content = if is_already_in_context {
+                                                    if rest_args.is_empty() {
+                                                        format!("Execute skill '{}' (already loaded in context)", skill.name)
+                                                    } else {
+                                                        format!("Execute skill '{}' with instructions: {}", skill.name, rest_args)
+                                                    }
+                                                } else if rest_args.is_empty() {
+                                                    format!("Execute skill '{}':
+
+{}", skill.name, skill.content)
                                                 } else {
-                                                    format!("Execute skill '{}' with instructions: {}\n\n{}", skill.name, rest_args, skill.content)
+                                                    format!("Execute skill '{}' with instructions: {}
+
+{}", skill.name, rest_args, skill.content)
                                                 };
                                                 app.prompt_history.push(format!("/{}", cmd));
                                                 app.history_index = None;
                                                 app.temp_input.clear();
                                                 app.messages.push(ChatMessage::user(format!("/{}", cmd)));
-                                                app.messages.push(ChatMessage::system(format!("Loaded skill '{}': {}", skill.name, skill.description)));
+                                                app.messages.push(ChatMessage::ui_notice(format!("Loaded skill '{}': {}", skill.name, skill.description)));
                                                 app.is_busy = true;
                                                 app.busy_started_at = Some(std::time::Instant::now());
 
@@ -1491,7 +1682,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }));
                                                 continue;
                                             } else {
-                                                app.messages.push(ChatMessage::system(format!(
+                                                app.messages.push(ChatMessage::ui_notice(format!(
                                                     "Unknown command '/{}'. Type /help or /skills to see available commands.",
                                                     skill_name
                                                 )));
@@ -1541,6 +1732,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
             Some(stream_event) = stream_rx.recv() => {
+                if let ConversationEvent::OAuthComplete { provider, result: Ok(()) } = &stream_event {
+                    if provider == "openai-codex" {
+                        spawn_codex_catalog_refresh(stream_tx.clone());
+                    }
+                }
                 app.receive(stream_event);
             }
             _ = ticker.tick() => {
@@ -1565,7 +1761,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
 async fn dispatch_stream(
     model: &str,
-    session_id: String,
+    mut session_id: String,
     mut messages: Vec<ChatMessage>,
     tx: mpsc::Sender<ConversationEvent>,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
@@ -1575,7 +1771,7 @@ async fn dispatch_stream(
     dispatcher.set_model(model);
     let result = dispatch_authenticated(
         model,
-        session_id,
+        &mut session_id,
         &mut messages,
         &tx,
         &mut dispatcher,
@@ -1586,48 +1782,127 @@ async fn dispatch_stream(
     let _ = tx
         .send(ConversationEvent::Finished {
             messages,
-            error: result.err().map(|error| format!("{error:#}")),
+            error: result.as_ref().err().map(|error| format!("{error:#}")),
+            session_id: Some(session_id),
         })
         .await;
 }
 
+struct PendingCompaction {
+    before: Vec<ChatMessage>,
+    after: Vec<ChatMessage>,
+}
+
+struct DispatchState {
+    session_id: String,
+    pending: Option<PendingCompaction>,
+}
+
+fn model_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut payload = vec![ChatMessage::system(
+        dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT,
+    )];
+    payload.extend(messages.iter().filter(|message| {
+        message.is_model_visible()
+            && !(message.role == dume_provider::Role::System
+                && message.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT)
+    }).cloned());
+    payload
+}
+
 async fn dispatch_authenticated(
     model: &str,
-    session_id: String,
+    session_id: &mut String,
     messages: &mut Vec<ChatMessage>,
     tx: &mpsc::Sender<ConversationEvent>,
     dispatcher: &mut ToolDispatcher,
     cancellation: &CancellationToken,
-) -> Result<()> {
+) -> Result<String> {
+    if !messages.iter().any(|m| m.role == dume_provider::Role::System && m.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT) {
+        messages.insert(0, ChatMessage::system(dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT));
+    }
     let cred_store =
         dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
     let model = model.to_string();
-    run_conversation(
+    let tools = dispatcher.tool_definitions_for_session(session_id);
+    let store = dispatcher.store().cloned();
+    let session_state = Arc::new(std::sync::Mutex::new(DispatchState {
+        session_id: session_id.clone(),
+        pending: None,
+    }));
+
+    let result = run_conversation(
         messages,
         tx,
         dispatcher,
         cancellation,
         10,
-        move |messages, tx| {
+        |raw_messages, tx| {
             let cred_store = cred_store.clone();
             let model = model.clone();
-            let turn_ctx = dume_provider::types::StreamRequestContext::for_session(&session_id);
+            let tools = tools.clone();
+            let store = store.clone();
+            let session_state = Arc::clone(&session_state);
             async move {
-                let tools = dume_worker::AgentLoop::tool_definitions();
+                let mut raw_messages = raw_messages;
+                let before = raw_messages.clone();
+                let mut session_id = session_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?
+                    .session_id
+                    .clone();
+                let compacted = dume_worker::context::prepare_request_context(
+                    dume_worker::context::RequestContext {
+                        model: &model,
+                        session_id: &session_id,
+                        messages: &mut raw_messages,
+                        tools: &tools,
+                        store: store.as_deref(),
+                    },
+                )?;
+                if compacted {
+                    session_id = dume_provider::types::StreamRequestContext::new().session_id;
+                    let mut state = session_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?;
+                    state.session_id = session_id.clone();
+                    state.pending = Some(PendingCompaction {
+                        before,
+                        after: raw_messages.clone(),
+                    });
+                }
+                let turn_ctx = dume_provider::types::StreamRequestContext::for_session(&session_id);
+                let provider_msgs = model_messages(&raw_messages);
                 let provider = resolve_provider(&model, &cred_store).await?;
                 provider
-                    .stream_with_context(&messages, &tools, Some(&turn_ctx), tx)
-                    .await
+                    .stream_with_context(&provider_msgs, &tools, Some(&turn_ctx), tx)
+                    .await?;
+                Ok(raw_messages)
             }
         },
     )
-    .await
+    .await;
+    let mut state = session_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?;
+    if result.is_err() {
+        if let Some(pending) = state.pending.take() {
+            if *messages == pending.before {
+                *messages = pending.after;
+            }
+        }
+    }
+    *session_id = state.session_id.clone();
+    result?;
+    Ok(session_id.clone())
 }
 
 #[derive(Default)]
 struct StreamTurn {
     text: String,
     reasoning: Vec<serde_json::Value>,
+    deepseek_reasoning: String,
+    gemini_parts: Vec<serde_json::Value>,
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
@@ -1644,6 +1919,8 @@ impl StreamTurn {
         match event {
             StreamEvent::TextDelta(delta) => self.text.push_str(delta),
             StreamEvent::CodexReasoning(items) => self.reasoning.extend(items.iter().cloned()),
+            StreamEvent::DeepSeekReasoning(delta) => self.deepseek_reasoning.push_str(delta),
+            StreamEvent::GeminiParts(parts) => self.gemini_parts.extend(parts.iter().cloned()),
             StreamEvent::ToolCallDelta {
                 index,
                 id,
@@ -1708,6 +1985,10 @@ impl StreamTurn {
             ChatMessage::assistant_with_tool_calls(self.text, calls.clone())
         };
         message.codex_reasoning = self.reasoning;
+        if !self.deepseek_reasoning.is_empty() || !calls.is_empty() {
+            message.deepseek_reasoning = Some(self.deepseek_reasoning);
+        }
+        message.gemini_parts = self.gemini_parts;
         Ok((message, calls))
     }
 }
@@ -1722,7 +2003,7 @@ async fn run_conversation<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut(Vec<ChatMessage>, mpsc::Sender<StreamEvent>) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<Vec<ChatMessage>>>,
 {
     for _ in 0..max_turns {
         let (sub_tx, mut sub_rx) = mpsc::channel(100);
@@ -1742,11 +2023,12 @@ where
             turn.finish()
         };
         // Both futures are scoped: errors drop the other side, never detach a producer.
-        let (_, (assistant, tool_calls)) = tokio::select! {
+        let (prepared_messages, (assistant, tool_calls)) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
             result = async { tokio::try_join!(stream(messages.clone(), sub_tx), collect) } => result?,
         };
+        *messages = prepared_messages;
         messages.push(assistant);
         if tool_calls.is_empty() {
             return Ok(());
@@ -1758,7 +2040,8 @@ where
                 name
             ))))
             .await?;
-            messages.push(dispatcher.execute(call).await?);
+            let tool_res = dispatcher.execute(call, &messages).await?;
+            messages.push(tool_res);
             tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
                 "[Finished {}]\n",
                 name
@@ -1788,6 +2071,66 @@ mod tests {
         StreamEvent::Completed {
             finish_reason: reason.to_string(),
         }
+    }
+
+    #[test]
+    fn credential_changes_rotate_session_identity_only_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("credentials.json"));
+        let mut session_id = "before-login".to_string();
+
+        assert!(save_credential_and_rotate_session(
+            &store,
+            "openai",
+            "test-key",
+            &mut session_id,
+        )
+        .is_ok());
+        assert_ne!(session_id, "before-login");
+        assert!(store.has_credential("openai"));
+
+        let logged_in_session = session_id.clone();
+        assert!(save_credential_and_rotate_session(
+            &store,
+            "openai-codex",
+            "invalid-api-key",
+            &mut session_id,
+        )
+        .is_err());
+        assert_eq!(session_id, logged_in_session);
+
+        assert!(delete_credential_and_rotate_session(
+            &store,
+            "openai",
+            &mut session_id,
+        )
+        .is_ok());
+        assert_ne!(session_id, logged_in_session);
+        assert!(!store.has_credential("openai"));
+    }
+
+    #[test]
+    fn subagent_command_persists_model_and_rejects_invalid_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.json");
+        assert!(subagent_command("/subagents", "parent/model", &path)
+            .unwrap()
+            .contains("parent/model (inherited)"));
+
+        subagent_command("/subagents model openai/gpt-5.4", "parent/model", &path).unwrap();
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+        assert!(subagent_command("/subagents model no-such-model", "parent/model", &path)
+            .is_err());
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+
+        subagent_command("/subagents model inherit", "parent/model", &path).unwrap();
+        assert!(SubagentSettings::load_from(&path).unwrap().model.is_none());
     }
 
     #[test]
@@ -1822,7 +2165,7 @@ mod tests {
             &CancellationToken::new(),
             max_turns,
             |history, tx| {
-                requests.push(history);
+                requests.push(history.clone());
                 let (events, fail) = scripts.pop_front().expect("unexpected model request");
                 async move {
                     for event in events {
@@ -1831,7 +2174,7 @@ mod tests {
                         }
                     }
                     anyhow::ensure!(!fail, "provider request failed");
-                    Ok(())
+                    Ok(history)
                 }
             },
         )
@@ -1909,6 +2252,7 @@ mod tests {
         app.receive(ConversationEvent::Finished {
             messages: messages.clone(),
             error: None,
+            session_id: None,
         });
         assert!(!app.is_busy);
         assert!(app.streaming_text.is_empty());
@@ -2043,6 +2387,7 @@ mod tests {
         app.receive(ConversationEvent::Finished {
             messages,
             error: Some(error),
+            session_id: None,
         });
         assert!(!app.is_busy);
         assert_eq!(app.messages[20].tool_call_id.as_deref(), Some("call_9"));
@@ -2155,7 +2500,7 @@ mod tests {
                     .await
                     .unwrap();
                     token.cancel();
-                    std::future::pending::<Result<()>>().await
+                    std::future::pending::<Result<Vec<ChatMessage>>>().await
                 }
             },
         )
@@ -2164,5 +2509,75 @@ mod tests {
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(messages.len(), 1);
         assert!(!dir.path().join("bad.txt").exists());
+    }
+
+    #[test]
+    fn ui_notices_do_not_change_model_history() {
+        let history = vec![
+            ChatMessage::system(dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT),
+            ChatMessage::user("First request"),
+            ChatMessage::ui_notice("Available Skills: /test"),
+            ChatMessage::ui_notice("Session Token Usage: 100"),
+            ChatMessage::user("Second request"),
+        ];
+        let payload = model_messages(&history);
+        assert_eq!(payload.len(), 3);
+        assert_eq!(payload[0].content, dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT);
+        assert_eq!(payload[1].content, "First request");
+        assert_eq!(payload[2].content, "Second request");
+        assert_eq!(model_messages(&history[..2]), payload[..2]);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_after_compaction_keeps_new_session_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(HarnessStore::in_memory(dir.path().join("artifacts")).unwrap());
+        let dispatcher = Arc::new(Mutex::new(
+            ToolDispatcher::new(dir.path(), "unknown-model", CancellationToken::new())
+                .with_store(store.clone()),
+        ));
+        let original_session = "before-compaction".to_string();
+        let history = vec![
+            ChatMessage::user("Preserve the public API."),
+            ChatMessage::assistant("x".repeat(500_000)),
+            ChatMessage::user("Continue."),
+        ];
+        let (tx, mut rx) = mpsc::channel(8);
+        dispatch_stream(
+            "unknown-model",
+            original_session.clone(),
+            history,
+            tx,
+            dispatcher,
+            CancellationToken::new(),
+        )
+        .await;
+        let Some(ConversationEvent::Finished {
+            mut messages,
+            error: Some(error),
+            session_id: Some(session_id),
+        }) = rx.recv().await else {
+            panic!("expected a failed conversation with a recoverable session");
+        };
+        assert!(error.contains("Unknown") || error.contains("unknown"), "{error}");
+        assert_ne!(session_id, original_session);
+        assert!(messages.iter().any(|message| {
+            message.content.contains("Conversation checkpoint")
+                && message.content.contains("Preserve the public API")
+        }));
+        assert!(messages.iter().all(|message| !message.content.contains(&"x".repeat(100))));
+
+        messages.push(ChatMessage::assistant("y".repeat(500_000)));
+        messages.push(ChatMessage::user("Try again."));
+        assert!(dume_worker::context::prepare_request_context(
+            dume_worker::context::RequestContext {
+                model: "unknown-model",
+                session_id: &session_id,
+                messages: &mut messages,
+                tools: &[],
+                store: Some(&store),
+            },
+        )
+        .is_ok());
     }
 }

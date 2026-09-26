@@ -82,7 +82,7 @@ impl WorkerHost {
                 while let Ok(Some(line)) = reader.next_line().await {
                     if let Ok(msg) = deserialize_message::<WorkerToHostMessage>(&line) {
                         match msg {
-                            WorkerToHostMessage::Completed { manifest } => {
+                            WorkerToHostMessage::Completed { manifest, outcome: _ } => {
                                 final_manifest = Some(manifest);
                                 break;
                             }
