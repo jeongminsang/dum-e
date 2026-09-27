@@ -33,7 +33,7 @@ impl ArtifactStore {
         if shard_meta.file_type().is_symlink() || !shard_meta.is_dir() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard must be a real directory"));
         }
-        if !fs::canonicalize(&shard)?.starts_with(root) {
+        if !fs::canonicalize(&shard)?.starts_with(&root) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard escapes the configured store"));
         }
 
