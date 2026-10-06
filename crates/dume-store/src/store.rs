@@ -44,6 +44,16 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+pub fn resolve_project_root(start_dir: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+    for ancestor in canonical.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    canonical
+}
+
 pub struct HarnessStore {
     conn: Mutex<Connection>,
     pub artifacts: ArtifactStore,
@@ -903,6 +913,27 @@ impl HarnessStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConversationRecord {
+    pub id: String,
+    pub cwd: String,
+    pub model: String,
+    pub provider_session_id: String,
+    pub status: String,
+    pub generation: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConversationMessageRecord {
+    pub conversation_id: String,
+    pub generation: i64,
+    pub idx: i64,
+    pub message_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecentSessionSummary {
     pub session_id: String,
     pub preview: String,
@@ -939,6 +970,92 @@ impl HarnessStore {
             let preview: String = r.get(1)?;
             let message_count: i64 = r.get(2)?;
             let updated_at: i64 = r.get(3)?;
+            Ok(RecentSessionSummary {
+                session_id,
+                preview,
+                message_count: message_count.max(0) as usize,
+                updated_at,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_conversations(
+        &self,
+        cwd: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RecentSessionSummary>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match cwd {
+            Some(c) => (
+                r#"
+                SELECT 
+                    c.id,
+                    COALESCE(
+                        (SELECT message_json FROM conversation_messages 
+                         WHERE conversation_id = c.id AND generation = c.generation 
+                           AND message_json LIKE '%"role":"user"%' 
+                         ORDER BY idx ASC LIMIT 1),
+                        (SELECT message_json FROM conversation_messages 
+                         WHERE conversation_id = c.id AND generation = c.generation 
+                         ORDER BY idx ASC LIMIT 1),
+                        ''
+                    ) as preview_json,
+                    (SELECT COUNT(*) FROM conversation_messages WHERE conversation_id = c.id AND generation = c.generation) as msg_count,
+                    c.updated_at
+                FROM conversations c
+                WHERE c.cwd = ?1
+                ORDER BY c.updated_at DESC
+                LIMIT ?2
+                "#.to_string(),
+                vec![Box::new(c.to_string()), Box::new(limit as i64)],
+            ),
+            None => (
+                r#"
+                SELECT 
+                    c.id,
+                    COALESCE(
+                        (SELECT message_json FROM conversation_messages 
+                         WHERE conversation_id = c.id AND generation = c.generation 
+                           AND message_json LIKE '%"role":"user"%' 
+                         ORDER BY idx ASC LIMIT 1),
+                        (SELECT message_json FROM conversation_messages 
+                         WHERE conversation_id = c.id AND generation = c.generation 
+                         ORDER BY idx ASC LIMIT 1),
+                        ''
+                    ) as preview_json,
+                    (SELECT COUNT(*) FROM conversation_messages WHERE conversation_id = c.id AND generation = c.generation) as msg_count,
+                    c.updated_at
+                FROM conversations c
+                ORDER BY c.updated_at DESC
+                LIMIT ?1
+                "#.to_string(),
+                vec![Box::new(limit as i64)],
+            ),
+        };
+
+        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_slice.as_slice(), |r| {
+            let session_id: String = r.get(0)?;
+            let raw_json: String = r.get(1)?;
+            let message_count: i64 = r.get(2)?;
+            let updated_at: i64 = r.get(3)?;
+
+            let preview = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+                val.get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                raw_json
+            };
+
             Ok(RecentSessionSummary {
                 session_id,
                 preview,
@@ -1092,6 +1209,363 @@ impl HarnessStore {
             params![session_id, max_idx, summary_content, now_millis()],
         )?;
         Ok(())
+    }
+
+    // --- Conversation & Recovery Storage ---
+
+    pub fn create_conversation(
+        &self,
+        id: &str,
+        cwd: &str,
+        model: &str,
+        provider_session_id: &str,
+    ) -> Result<ConversationRecord, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        conn.execute(
+            r#"
+            INSERT INTO conversations (id, cwd, model, provider_session_id, status, generation, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, 'active', 0, ?5, ?5)
+            "#,
+            params![id, cwd, model, provider_session_id, now],
+        )?;
+
+        Ok(ConversationRecord {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            model: model.to_string(),
+            provider_session_id: provider_session_id.to_string(),
+            status: "active".to_string(),
+            generation: 0,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn append_conversation_message(
+        &self,
+        conversation_id: &str,
+        message_json: &str,
+    ) -> Result<i64, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                StoreError::NotFound(format!("conversation {conversation_id}"))
+            }
+            other => StoreError::Db(other),
+        })?;
+
+        let next_idx: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(idx), -1) + 1 FROM conversation_messages WHERE conversation_id = ?1 AND generation = ?2",
+            params![conversation_id, generation],
+            |r| r.get(0),
+        )?;
+
+        let now = now_millis();
+        tx.execute(
+            r#"
+            INSERT INTO conversation_messages (conversation_id, generation, idx, message_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![conversation_id, generation, next_idx, message_json, now],
+        )?;
+
+        tx.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now, conversation_id],
+        )?;
+
+        tx.commit()?;
+        Ok(next_idx)
+    }
+
+    pub fn replace_conversation_messages(
+        &self,
+        conversation_id: &str,
+        messages: &[String],
+    ) -> Result<i64, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current_gen: i64 = tx.query_row(
+            "SELECT generation FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                StoreError::NotFound(format!("conversation {conversation_id}"))
+            }
+            other => StoreError::Db(other),
+        })?;
+
+        let new_gen = current_gen + 1;
+        let now = now_millis();
+
+        for (idx, msg_json) in messages.iter().enumerate() {
+            tx.execute(
+                r#"
+                INSERT INTO conversation_messages (conversation_id, generation, idx, message_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![conversation_id, new_gen, idx as i64, msg_json, now],
+            )?;
+        }
+
+        // Delete previous generations to keep DB compact
+        tx.execute(
+            "DELETE FROM conversation_messages WHERE conversation_id = ?1 AND generation < ?2",
+            params![conversation_id, new_gen],
+        )?;
+
+        tx.execute(
+            "UPDATE conversations SET generation = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_gen, now, conversation_id],
+        )?;
+
+        tx.commit()?;
+        Ok(new_gen)
+    }
+
+    pub fn update_conversation_meta(
+        &self,
+        conversation_id: &str,
+        model: Option<&str>,
+        provider_session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        let mut updates = vec!["updated_at = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+
+        if let Some(m) = model {
+            params_vec.push(Box::new(m.to_string()));
+            updates.push(format!("model = ?{}", params_vec.len()));
+        }
+        if let Some(p) = provider_session_id {
+            params_vec.push(Box::new(p.to_string()));
+            updates.push(format!("provider_session_id = ?{}", params_vec.len()));
+        }
+
+        params_vec.push(Box::new(conversation_id.to_string()));
+        let id_param_idx = params_vec.len();
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE id = ?{}",
+            updates.join(", "),
+            id_param_idx
+        );
+
+        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let affected = conn.execute(&sql, params_slice.as_slice())?;
+        if affected == 0 {
+            return Err(StoreError::NotFound(format!("conversation {conversation_id}")));
+        }
+        Ok(())
+    }
+
+    pub fn set_conversation_status(
+        &self,
+        conversation_id: &str,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_millis();
+        let affected = conn.execute(
+            "UPDATE conversations SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, conversation_id],
+        )?;
+        if affected == 0 {
+            return Err(StoreError::NotFound(format!("conversation {conversation_id}")));
+        }
+        Ok(())
+    }
+
+    pub fn load_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(ConversationRecord, Vec<ConversationMessageRecord>), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let record = conn.query_row(
+            r#"
+            SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
+            FROM conversations
+            WHERE id = ?1
+            "#,
+            params![conversation_id],
+            |r| {
+                Ok(ConversationRecord {
+                    id: r.get(0)?,
+                    cwd: r.get(1)?,
+                    model: r.get(2)?,
+                    provider_session_id: r.get(3)?,
+                    status: r.get(4)?,
+                    generation: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            },
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                StoreError::NotFound(format!("conversation {conversation_id}"))
+            }
+            other => StoreError::Db(other),
+        })?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT conversation_id, generation, idx, message_json, created_at
+            FROM conversation_messages
+            WHERE conversation_id = ?1 AND generation = ?2
+            ORDER BY idx ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![conversation_id, record.generation], |r| {
+            Ok(ConversationMessageRecord {
+                conversation_id: r.get(0)?,
+                generation: r.get(1)?,
+                idx: r.get(2)?,
+                message_json: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+
+        Ok((record, messages))
+    }
+
+    pub fn latest_conversation_for_cwd(
+        &self,
+        cwd: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
+            FROM conversations
+            WHERE cwd = ?1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map(params![cwd], |r| {
+            Ok(ConversationRecord {
+                id: r.get(0)?,
+                cwd: r.get(1)?,
+                model: r.get(2)?,
+                provider_session_id: r.get(3)?,
+                status: r.get(4)?,
+                generation: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(res) => Ok(Some(res?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn latest_interrupted_conversation_for_cwd(
+        &self,
+        cwd: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
+            FROM conversations
+            WHERE cwd = ?1
+              AND (?2 IS NULL OR id != ?2)
+              AND status != 'closed'
+              AND EXISTS (
+                  SELECT 1 FROM conversation_messages
+                  WHERE conversation_id = conversations.id
+              )
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map(params![cwd, exclude_id], |r| {
+            Ok(ConversationRecord {
+                id: r.get(0)?,
+                cwd: r.get(1)?,
+                model: r.get(2)?,
+                provider_session_id: r.get(3)?,
+                status: r.get(4)?,
+                generation: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(res) => Ok(Some(res?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_conversations(
+        &self,
+        cwd: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match cwd {
+            Some(c) => (
+                r#"
+                SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
+                FROM conversations
+                WHERE cwd = ?1
+                ORDER BY updated_at DESC
+                LIMIT ?2
+                "#
+                .to_string(),
+                vec![Box::new(c.to_string()), Box::new(limit as i64)],
+            ),
+            None => (
+                r#"
+                SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
+                FROM conversations
+                ORDER BY updated_at DESC
+                LIMIT ?1
+                "#
+                .to_string(),
+                vec![Box::new(limit as i64)],
+            ),
+        };
+
+        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_slice.as_slice(), |r| {
+            Ok(ConversationRecord {
+                id: r.get(0)?,
+                cwd: r.get(1)?,
+                model: r.get(2)?,
+                provider_session_id: r.get(3)?,
+                status: r.get(4)?,
+                generation: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
     }
 
     pub fn record_session_usage(
@@ -1843,5 +2317,127 @@ mod tests {
         let list = store.get_benchmark_request_usages("bench_migrated").unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].request_id, "req_migrated_1");
+    }
+
+    #[test]
+    fn test_conversation_lifecycle_and_compaction_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HarnessStore::in_memory(dir.path().join("artifacts")).unwrap();
+
+        // 1. Create conversation
+        let conv = store
+            .create_conversation("conv_1", "/workspace/repo", "test-model", "sess_1")
+            .unwrap();
+        assert_eq!(conv.id, "conv_1");
+        assert_eq!(conv.status, "active");
+        assert_eq!(conv.generation, 0);
+
+        // 2. Append messages
+        let idx0 = store
+            .append_conversation_message("conv_1", r#"{"role":"user","content":"hello"}"#)
+            .unwrap();
+        assert_eq!(idx0, 0);
+        let idx1 = store
+            .append_conversation_message("conv_1", r#"{"role":"assistant","content":"world"}"#)
+            .unwrap();
+        assert_eq!(idx1, 1);
+
+        // 3. Load conversation
+        let (loaded_conv, msgs) = store.load_conversation("conv_1").unwrap();
+        assert_eq!(loaded_conv.id, "conv_1");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].idx, 0);
+        assert_eq!(msgs[1].idx, 1);
+
+        // 4. Update metadata and status
+        store
+            .update_conversation_meta("conv_1", Some("new-model"), Some("sess_2"))
+            .unwrap();
+        store.set_conversation_status("conv_1", "closed").unwrap();
+        let (updated_conv, _) = store.load_conversation("conv_1").unwrap();
+        assert_eq!(updated_conv.model, "new-model");
+        assert_eq!(updated_conv.provider_session_id, "sess_2");
+        assert_eq!(updated_conv.status, "closed");
+
+        // 5. Replace messages on compaction
+        let compacted = vec![
+            r#"{"role":"system","content":"checkpoint"}"#.to_string(),
+            r#"{"role":"user","content":"follow up"}"#.to_string(),
+        ];
+        let new_gen = store
+            .replace_conversation_messages("conv_1", &compacted)
+            .unwrap();
+        assert_eq!(new_gen, 1);
+
+        let (comp_conv, comp_msgs) = store.load_conversation("conv_1").unwrap();
+        assert_eq!(comp_conv.generation, 1);
+        assert_eq!(comp_msgs.len(), 2);
+        assert_eq!(comp_msgs[0].message_json, r#"{"role":"system","content":"checkpoint"}"#);
+
+        // 6. Query latest and list
+        let latest = store.latest_conversation_for_cwd("/workspace/repo").unwrap();
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().id, "conv_1");
+
+        let list_all = store.list_conversations(None, 10).unwrap();
+        assert_eq!(list_all.len(), 1);
+
+        let list_other = store.list_conversations(Some("/other/path"), 10).unwrap();
+        assert!(list_other.is_empty());
+
+        let recents = store.list_recent_conversations(Some("/workspace/repo"), 10).unwrap();
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].session_id, "conv_1");
+        assert_eq!(recents[0].message_count, 2);
+        assert_eq!(recents[0].preview, "follow up");
+
+        // 7. Test interrupted conversation queries
+        // conv_1 is currently 'closed', so latest_interrupted should return None
+        let interrupted = store
+            .latest_interrupted_conversation_for_cwd("/workspace/repo", None)
+            .unwrap();
+        assert!(interrupted.is_none());
+
+        // Set conv_1 back to 'interrupted'
+        store.set_conversation_status("conv_1", "interrupted").unwrap();
+        let interrupted = store
+            .latest_interrupted_conversation_for_cwd("/workspace/repo", None)
+            .unwrap();
+        assert!(interrupted.is_some());
+        assert_eq!(interrupted.unwrap().id, "conv_1");
+
+        // Excluding conv_1 returns None
+        let excluded = store
+            .latest_interrupted_conversation_for_cwd("/workspace/repo", Some("conv_1"))
+            .unwrap();
+        assert!(excluded.is_none());
+
+        // Create an empty session conv_empty with status 'active'
+        store
+            .create_conversation("conv_empty", "/workspace/repo", "model", "sess")
+            .unwrap();
+        // Since it has no messages, latest_interrupted should still return conv_1, not conv_empty
+        let interrupted = store
+            .latest_interrupted_conversation_for_cwd("/workspace/repo", Some("conv_1"))
+            .unwrap();
+        assert!(interrupted.is_none());
+    }
+
+    #[test]
+    fn test_resolve_project_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = temp_dir.path();
+        let git_dir = base.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let sub_dir = base.join("sub").join("nested");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let resolved = resolve_project_root(&sub_dir);
+        let canonical_base = std::fs::canonicalize(base).unwrap();
+        assert_eq!(resolved, canonical_base);
+
+        let non_git_temp = tempfile::tempdir().unwrap();
+        let canonical_non_git = std::fs::canonicalize(non_git_temp.path()).unwrap();
+        assert_eq!(resolve_project_root(non_git_temp.path()), canonical_non_git);
     }
 }

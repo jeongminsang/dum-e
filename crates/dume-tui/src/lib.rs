@@ -3,7 +3,7 @@ pub mod component;
 pub mod keybinding;
 pub mod theme;
 
-pub use app::{App, run_tui};
+pub use app::{App, ResumeTarget, run_tui, run_tui_with_target};
 pub use keybinding::Action;
 pub use theme::Theme;
 

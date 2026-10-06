@@ -2,7 +2,7 @@ use crate::component::{
     AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
     render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
     render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
-    render_status_bar, render_transcript, render_update_modal,
+    render_resume_picker_modal, render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, handle_key_event};
 use crate::theme::Theme;
@@ -51,8 +51,132 @@ fn delete_credential_and_rotate_session(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeTarget {
+    None,
+    Latest,
+    Id(String),
+    Picker { all_dirs: bool },
+}
+
+enum PersistEvent {
+    Append {
+        conv_id: String,
+        msg: ChatMessage,
+    },
+    Replace {
+        conv_id: String,
+        msgs: Vec<ChatMessage>,
+    },
+    Status {
+        conv_id: String,
+        status: String,
+    },
+}
+
+pub struct ConversationLock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl ConversationLock {
+    pub fn try_acquire(conversation_id: &str) -> Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let locks_dir = std::path::PathBuf::from(home).join(".dume/agent/locks");
+        std::fs::create_dir_all(&locks_dir)?;
+        let path = locks_dir.join(format!("{}.lock", conversation_id));
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                anyhow::bail!(
+                    "Conversation '{}' is currently active in another session",
+                    conversation_id
+                );
+            }
+        }
+
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for ConversationLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn repair_conversation_history(messages: &mut Vec<ChatMessage>) -> (bool, Option<String>) {
+    let mut repaired = false;
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == dume_provider::Role::Assistant {
+            if let Some(tool_calls) = messages[i].tool_calls.clone() {
+                if !tool_calls.is_empty() {
+                    let mut j = i + 1;
+                    let mut existing_tool_ids = std::collections::HashSet::new();
+                    while j < messages.len() && messages[j].role == dume_provider::Role::Tool {
+                        if let Some(ref tcid) = messages[j].tool_call_id {
+                            existing_tool_ids.insert(tcid.clone());
+                        }
+                        j += 1;
+                    }
+                    for tc in &tool_calls {
+                        if !existing_tool_ids.contains(&tc.id) {
+                            let synth = ChatMessage::tool(
+                                format!("[Interrupted: session terminated before tool '{}' could complete]", tc.name),
+                                tc.id.clone(),
+                            );
+                            messages.insert(j, synth);
+                            existing_tool_ids.insert(tc.id.clone());
+                            j += 1;
+                            repaired = true;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let interrupted_user_prompt = if let Some(last) = messages.last() {
+        if last.role == dume_provider::Role::User {
+            let prompt = last.content.clone();
+            messages.pop();
+            repaired = true;
+            Some(prompt)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (repaired, interrupted_user_prompt)
+}
+
 enum ConversationEvent {
     Stream(StreamEvent),
+    AssistantTurnCompleted(ChatMessage),
+    ToolTurnCompleted(ChatMessage),
+    Compacted(Vec<ChatMessage>),
     Finished {
         messages: Vec<ChatMessage>,
         error: Option<String>,
@@ -157,6 +281,10 @@ pub enum ModalState {
         is_streaming: bool,
         streaming_reply: String,
     },
+    ResumePicker {
+        sessions: Vec<RecentSessionSummary>,
+        selected_idx: usize,
+    },
 }
 
 pub struct App {
@@ -184,6 +312,7 @@ pub struct App {
     pub temp_input: String,
     pub busy_started_at: Option<std::time::Instant>,
     pub recent_sessions: Vec<RecentSessionSummary>,
+    pub conversation_id: String,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -235,6 +364,15 @@ fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
     let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
     let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
     if let Ok(store) = HarnessStore::open(&db_path, &artifacts_dir) {
+        let current_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string));
+        let list = store
+            .list_recent_conversations(current_dir.as_deref(), 5)
+            .unwrap_or_default();
+        if !list.is_empty() {
+            return list;
+        }
         store.list_recent_sessions(5).unwrap_or_default()
     } else {
         Vec::new()
@@ -277,6 +415,7 @@ impl App {
             temp_input: String::new(),
             busy_started_at: None,
             recent_sessions,
+            conversation_id: dume_provider::types::StreamRequestContext::new().session_id,
         }
     }
 
@@ -302,6 +441,7 @@ impl App {
                 "/model",
                 "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
             ),
+            ("/resume", "Resume a previous conversation session"),
             ("/subagents", "Show or set the model used by subagents"),
             (
                 "/login",
@@ -446,6 +586,9 @@ impl App {
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
             }
             ConversationEvent::Stream(_) => {}
+            ConversationEvent::AssistantTurnCompleted(_) => {}
+            ConversationEvent::ToolTurnCompleted(_) => {}
+            ConversationEvent::Compacted(_) => {}
             ConversationEvent::Finished { messages, error, session_id } => {
                 if let Some(session_id) = session_id {
                     self.session_id = session_id;
@@ -607,13 +750,17 @@ impl App {
 }
 
 pub async fn run_tui(model: &str) -> Result<()> {
+    run_tui_with_target(model, ResumeTarget::None).await
+}
+
+pub async fn run_tui_with_target(model: &str, target: ResumeTarget) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, model).await;
+    let res = run_app(&mut terminal, model, target).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -623,11 +770,22 @@ pub async fn run_tui(model: &str) -> Result<()> {
     res
 }
 
+#[cfg(unix)]
+async fn wait_for_signal(
+    sighup: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+) {
+    tokio::select! {
+        _ = sighup.recv() => (),
+        _ = sigterm.recv() => (),
+    }
+}
+
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     model: &str,
+    target: ResumeTarget,
 ) -> Result<()> {
-    let mut app = App::new(model);
     let mut reader = EventStream::new();
     let (stream_tx, mut stream_rx) = mpsc::channel::<ConversationEvent>(100);
     let cancellation = CancellationToken::new();
@@ -635,17 +793,155 @@ async fn run_app<B: ratatui::backend::Backend>(
     let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
     let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
     let harness_store = Arc::new(HarnessStore::open(&db_path, &artifacts_dir)?);
+    let raw_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = dume_store::resolve_project_root(&raw_cwd)
+        .to_str()
+        .unwrap_or(".")
+        .to_string();
+
+    let mut initial_conversation_id = dume_provider::types::StreamRequestContext::new().session_id;
+    let mut initial_messages = Vec::new();
+    let mut initial_model = model.to_string();
+    let mut initial_provider_session_id = dume_provider::types::StreamRequestContext::new().session_id;
+    let mut pending_interrupted_prompt = None;
+    let mut initial_modal = ModalState::None;
+    let mut resume_notice = None;
+
+    match target {
+        ResumeTarget::None => {
+            let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+            resume_notice = detect_interrupted_session_notice(&harness_store, &cwd, &initial_conversation_id);
+        }
+        ResumeTarget::Latest => {
+            if let Ok(Some(rec)) = harness_store.latest_conversation_for_cwd(&cwd) {
+                match harness_store.load_conversation(&rec.id) {
+                    Ok((loaded_rec, msg_recs)) => {
+                        initial_conversation_id = loaded_rec.id.clone();
+                        initial_model = loaded_rec.model.clone();
+                        initial_provider_session_id = loaded_rec.provider_session_id.clone();
+                        for mr in msg_recs {
+                            if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                                initial_messages.push(chat_msg);
+                            }
+                        }
+                        let (was_repaired, prompt) = repair_conversation_history(&mut initial_messages);
+                        pending_interrupted_prompt = prompt;
+                        let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                        resume_notice = Some(if was_repaired {
+                            format!("Resumed conversation {} (recovered from interrupted state).", short_id)
+                        } else {
+                            format!("Resumed conversation {}.", short_id)
+                        });
+                    }
+                    Err(e) => {
+                        let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+                        resume_notice = Some(format!("Failed to load previous conversation: {}. Started new session.", e));
+                    }
+                }
+            } else {
+                let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+                resume_notice = Some("No previous conversation found in this directory. Started new session.".to_string());
+            }
+        }
+        ResumeTarget::Id(target_id) => {
+            let found = harness_store.load_conversation(&target_id).ok().or_else(|| {
+                let list = harness_store.list_conversations(None, 50).ok()?;
+                let matched = list.into_iter().find(|c| c.id.starts_with(&target_id))?;
+                harness_store.load_conversation(&matched.id).ok()
+            });
+            match found {
+                Some((loaded_rec, msg_recs)) => {
+                    initial_conversation_id = loaded_rec.id.clone();
+                    initial_model = loaded_rec.model.clone();
+                    initial_provider_session_id = loaded_rec.provider_session_id.clone();
+                    for mr in msg_recs {
+                        if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                            initial_messages.push(chat_msg);
+                        }
+                    }
+                    let (was_repaired, prompt) = repair_conversation_history(&mut initial_messages);
+                    pending_interrupted_prompt = prompt;
+                    let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                    resume_notice = Some(if was_repaired {
+                        format!("Resumed conversation {} (recovered from interrupted state).", short_id)
+                    } else {
+                        format!("Resumed conversation {}.", short_id)
+                    });
+                }
+                None => {
+                    let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+                    resume_notice = Some(format!("Conversation '{}' not found. Started new session.", target_id));
+                }
+            }
+        }
+        ResumeTarget::Picker { all_dirs } => {
+            let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+            let query_cwd = if all_dirs { None } else { Some(cwd.as_str()) };
+            let sessions = harness_store.list_recent_conversations(query_cwd, 20).unwrap_or_default();
+            initial_modal = ModalState::ResumePicker {
+                sessions,
+                selected_idx: 0,
+            };
+        }
+    }
+
+    let mut conversation_lock = match ConversationLock::try_acquire(&initial_conversation_id) {
+        Ok(l) => l,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to acquire lock for conversation '{}': {}", initial_conversation_id, e));
+        }
+    };
+
+    let mut app = App::new(&initial_model);
+    app.conversation_id = initial_conversation_id.clone();
+    app.session_id = initial_provider_session_id;
+    app.messages = initial_messages;
+    app.modal = initial_modal;
+    if let Some(prompt) = pending_interrupted_prompt {
+        app.input_buffer = prompt;
+        app.cursor_pos = app.input_buffer.chars().count();
+    }
+    if let Some(notice) = resume_notice {
+        app.messages.push(ChatMessage::ui_notice(notice));
+    }
+
+    let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<PersistEvent>();
+    let store_for_persist = harness_store.clone();
+    let persist_handle = tokio::spawn(async move {
+        while let Some(event) = persist_rx.recv().await {
+            match event {
+                PersistEvent::Append { conv_id, msg } => {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = store_for_persist.append_conversation_message(&conv_id, &json);
+                    }
+                }
+                PersistEvent::Replace { conv_id, msgs } => {
+                    let json_vec: Vec<String> = msgs.iter().filter_map(|m| serde_json::to_string(m).ok()).collect();
+                    let _ = store_for_persist.replace_conversation_messages(&conv_id, &json_vec);
+                }
+                PersistEvent::Status { conv_id, status } => {
+                    let _ = store_for_persist.set_conversation_status(&conv_id, &status);
+                }
+            }
+        }
+    });
+
     let mut raw_dispatcher = ToolDispatcher::new(
         std::env::current_dir()?,
-        model,
+        &app.model,
         cancellation.clone(),
     );
-    raw_dispatcher = raw_dispatcher.with_store(harness_store);
+    raw_dispatcher = raw_dispatcher.with_store(harness_store.clone());
     let dispatcher = Arc::new(Mutex::new(raw_dispatcher));
     let mut task = None;
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     // Spawn non-blocking background task to check for latest release
     let update_tx = stream_tx.clone();
@@ -886,6 +1182,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                         input,
                         *is_streaming,
                         streaming_reply,
+                        &app.theme,
+                    );
+                }
+                ModalState::ResumePicker { sessions, selected_idx } => {
+                    render_resume_picker_modal(
+                        f,
+                        f.area(),
+                        sessions,
+                        *selected_idx,
                         &app.theme,
                     );
                 }
@@ -1292,6 +1597,74 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     continue;
                                 }
+                                ModalState::ResumePicker { sessions, selected_idx } => {
+                                    match key.code {
+                                        crossterm::event::KeyCode::Esc => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Up => {
+                                            if *selected_idx == 0 {
+                                                if !sessions.is_empty() {
+                                                    *selected_idx = sessions.len() - 1;
+                                                }
+                                            } else {
+                                                *selected_idx -= 1;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Down => {
+                                            if !sessions.is_empty() {
+                                                if *selected_idx + 1 >= sessions.len() {
+                                                    *selected_idx = 0;
+                                                } else {
+                                                    *selected_idx += 1;
+                                                }
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Enter => {
+                                            let target_id = sessions.get(*selected_idx).map(|s| s.session_id.clone());
+                                            app.modal = ModalState::None;
+                                            if let Some(session_id) = target_id {
+                                                match ConversationLock::try_acquire(&session_id) {
+                                                    Ok(new_lock) => {
+                                                        match harness_store.load_conversation(&session_id) {
+                                                            Ok((loaded_rec, msg_recs)) => {
+                                                                conversation_lock = new_lock;
+                                                                app.conversation_id = loaded_rec.id.clone();
+                                                                app.model = loaded_rec.model.clone();
+                                                                app.session_id = loaded_rec.provider_session_id.clone();
+                                                                app.messages.clear();
+                                                                for mr in msg_recs {
+                                                                    if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                                                                        app.messages.push(chat_msg);
+                                                                    }
+                                                                }
+                                                                let (was_repaired, prompt) = repair_conversation_history(&mut app.messages);
+                                                                if let Some(p) = prompt {
+                                                                    app.input_buffer = p;
+                                                                    app.cursor_pos = app.input_buffer.chars().count();
+                                                                }
+                                                                let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                                                                app.messages.push(ChatMessage::ui_notice(if was_repaired {
+                                                                    format!("Switched to conversation {} (repaired interrupted state).", short_id)
+                                                                } else {
+                                                                    format!("Switched to conversation {}.", short_id)
+                                                                }));
+                                                            }
+                                                            Err(e) => {
+                                                                app.messages.push(ChatMessage::ui_notice(format!("Failed to load conversation: {}", e)));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        app.messages.push(ChatMessage::ui_notice(format!("Cannot resume conversation: {}", e)));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
                                 ModalState::None => {}
                             }
 
@@ -1562,6 +1935,64 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             app.streaming_text.clear();
                                             app.auto_scroll = true;
                                             app.scroll_offset = 0;
+                                            let _ = persist_tx.send(PersistEvent::Replace {
+                                                conv_id: app.conversation_id.clone(),
+                                                msgs: Vec::new(),
+                                            });
+                                            continue;
+                                        } else if trimmed == "/resume" || trimmed.starts_with("/resume ") {
+                                            let arg = trimmed.strip_prefix("/resume").unwrap_or("").trim();
+                                            if arg.is_empty() || arg == "all" {
+                                                let all_dirs = arg == "all";
+                                                let query_cwd = if all_dirs { None } else { Some(cwd.as_str()) };
+                                                let sessions = harness_store.list_recent_conversations(query_cwd, 20).unwrap_or_default();
+                                                app.modal = ModalState::ResumePicker {
+                                                    sessions,
+                                                    selected_idx: 0,
+                                                };
+                                            } else {
+                                                let target_id = arg;
+                                                let found = harness_store.load_conversation(target_id).ok().or_else(|| {
+                                                    let list = harness_store.list_conversations(None, 50).ok()?;
+                                                    let matched = list.into_iter().find(|c| c.id.starts_with(target_id))?;
+                                                    harness_store.load_conversation(&matched.id).ok()
+                                                });
+                                                match found {
+                                                    Some((loaded_rec, msg_recs)) => {
+                                                        match ConversationLock::try_acquire(&loaded_rec.id) {
+                                                            Ok(new_lock) => {
+                                                                conversation_lock = new_lock;
+                                                                app.conversation_id = loaded_rec.id.clone();
+                                                                app.model = loaded_rec.model.clone();
+                                                                app.session_id = loaded_rec.provider_session_id.clone();
+                                                                app.messages.clear();
+                                                                for mr in msg_recs {
+                                                                    if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                                                                        app.messages.push(chat_msg);
+                                                                    }
+                                                                }
+                                                                let (was_repaired, prompt) = repair_conversation_history(&mut app.messages);
+                                                                if let Some(p) = prompt {
+                                                                    app.input_buffer = p;
+                                                                    app.cursor_pos = app.input_buffer.chars().count();
+                                                                }
+                                                                let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                                                                app.messages.push(ChatMessage::ui_notice(if was_repaired {
+                                                                    format!("Switched to conversation {} (repaired interrupted state).", short_id)
+                                                                } else {
+                                                                    format!("Switched to conversation {}.", short_id)
+                                                                }));
+                                                            }
+                                                            Err(e) => {
+                                                                app.messages.push(ChatMessage::ui_notice(format!("Cannot resume conversation: {}", e)));
+                                                            }
+                                                        }
+                                                    }
+                                                    None => {
+                                                        app.messages.push(ChatMessage::ui_notice(format!("Conversation '{}' not found.", target_id)));
+                                                    }
+                                                }
+                                            }
                                             continue;
                                         } else if trimmed == "/skills" {
                                             app.skills.reload();
@@ -1620,7 +2051,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else if trimmed == "/help" {
                                             app.skills.reload();
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /subagents                - Show subagent model setting\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /resume [all|<id>]        - Resume a previous session\n  /subagents                - Show subagent model setting\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {
@@ -1650,18 +2081,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         format!("Execute skill '{}' with instructions: {}", skill.name, rest_args)
                                                     }
                                                 } else if rest_args.is_empty() {
-                                                    format!("Execute skill '{}':
-
-{}", skill.name, skill.content)
+                                                    format!("Execute skill '{}':\n\n{}", skill.name, skill.content)
                                                 } else {
-                                                    format!("Execute skill '{}' with instructions: {}
-
-{}", skill.name, rest_args, skill.content)
+                                                    format!("Execute skill '{}' with instructions: {}\n\n{}", skill.name, rest_args, skill.content)
                                                 };
                                                 app.prompt_history.push(format!("/{}", cmd));
                                                 app.history_index = None;
                                                 app.temp_input.clear();
                                                 app.messages.push(ChatMessage::user(format!("/{}", cmd)));
+                                                let _ = persist_tx.send(PersistEvent::Append {
+                                                    conv_id: app.conversation_id.clone(),
+                                                    msg: ChatMessage::user(format!("/{}", cmd)),
+                                                });
                                                 app.messages.push(ChatMessage::ui_notice(format!("Loaded skill '{}': {}", skill.name, skill.description)));
                                                 app.is_busy = true;
                                                 app.busy_started_at = Some(std::time::Instant::now());
@@ -1694,6 +2125,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.history_index = None;
                                         app.temp_input.clear();
                                         app.messages.push(ChatMessage::user(content.clone()));
+                                        let _ = persist_tx.send(PersistEvent::Append {
+                                            conv_id: app.conversation_id.clone(),
+                                            msg: ChatMessage::user(content.clone()),
+                                        });
                                         app.is_busy = true;
                                         app.busy_started_at = Some(std::time::Instant::now());
 
@@ -1737,7 +2172,35 @@ async fn run_app<B: ratatui::backend::Backend>(
                         spawn_codex_catalog_refresh(stream_tx.clone());
                     }
                 }
+                match &stream_event {
+                    ConversationEvent::AssistantTurnCompleted(msg) => {
+                        let _ = persist_tx.send(PersistEvent::Append {
+                            conv_id: app.conversation_id.clone(),
+                            msg: msg.clone(),
+                        });
+                    }
+                    ConversationEvent::ToolTurnCompleted(msg) => {
+                        let _ = persist_tx.send(PersistEvent::Append {
+                            conv_id: app.conversation_id.clone(),
+                            msg: msg.clone(),
+                        });
+                    }
+                    ConversationEvent::Compacted(msgs) => {
+                        let _ = persist_tx.send(PersistEvent::Replace {
+                            conv_id: app.conversation_id.clone(),
+                            msgs: msgs.clone(),
+                        });
+                    }
+                    _ => {}
+                }
                 app.receive(stream_event);
+            }
+            _ = wait_for_signal(&mut sighup, &mut sigterm) => {
+                let _ = persist_tx.send(PersistEvent::Status {
+                    conv_id: app.conversation_id.clone(),
+                    status: "interrupted".to_string(),
+                });
+                break;
             }
             _ = ticker.tick() => {
                 if app.is_busy {
@@ -1749,6 +2212,13 @@ async fn run_app<B: ratatui::backend::Backend>(
       }
       Ok(())
     }.await;
+
+    let _ = persist_tx.send(PersistEvent::Status {
+        conv_id: app.conversation_id.clone(),
+        status: "closed".to_string(),
+    });
+    drop(persist_tx);
+    let _ = persist_handle.await;
 
     cancellation.cancel();
     stream_rx.close();
@@ -1882,19 +2352,26 @@ async fn dispatch_authenticated(
         },
     )
     .await;
-    let mut state = session_state
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?;
-    if result.is_err() {
-        if let Some(pending) = state.pending.take() {
-            if *messages == pending.before {
-                *messages = pending.after;
+    let (had_compaction, new_session_id) = {
+        let mut state = session_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?;
+        let had_compaction = state.pending.is_some();
+        if result.is_err() {
+            if let Some(pending) = state.pending.take() {
+                if *messages == pending.before {
+                    *messages = pending.after;
+                }
             }
         }
-    }
-    *session_id = state.session_id.clone();
+        *session_id = state.session_id.clone();
+        (had_compaction, state.session_id.clone())
+    };
     result?;
-    Ok(session_id.clone())
+    if had_compaction {
+        let _ = tx.send(ConversationEvent::Compacted(messages.clone())).await;
+    }
+    Ok(new_session_id)
 }
 
 #[derive(Default)]
@@ -2029,7 +2506,8 @@ where
             result = async { tokio::try_join!(stream(messages.clone(), sub_tx), collect) } => result?,
         };
         *messages = prepared_messages;
-        messages.push(assistant);
+        messages.push(assistant.clone());
+        let _ = tx.send(ConversationEvent::AssistantTurnCompleted(assistant)).await;
         if tool_calls.is_empty() {
             return Ok(());
         }
@@ -2041,7 +2519,8 @@ where
             ))))
             .await?;
             let tool_res = dispatcher.execute(call, &messages).await?;
-            messages.push(tool_res);
+            messages.push(tool_res.clone());
+            let _ = tx.send(ConversationEvent::ToolTurnCompleted(tool_res)).await;
             tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
                 "[Finished {}]\n",
                 name
@@ -2580,4 +3059,149 @@ mod tests {
         )
         .is_ok());
     }
+
+    #[test]
+    fn test_repair_conversation_history_clean_complete() {
+        let mut messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant_with_tool_calls("Let me run a command", vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: "{}".to_string(),
+                }
+            ]),
+            ChatMessage::tool("Command output", "call_1"),
+            ChatMessage::assistant("All done!"),
+        ];
+
+        let (repaired, interrupted) = repair_conversation_history(&mut messages);
+        assert!(!repaired);
+        assert!(interrupted.is_none());
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
+    fn test_repair_conversation_history_synthesizes_missing_tool_responses() {
+        let mut messages = vec![
+            ChatMessage::user("Build and test"),
+            ChatMessage::assistant_with_tool_calls("Running tools", vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "cargo_check".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "cargo_test".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ]),
+            ChatMessage::tool("Check ok", "call_1"),
+            // call_2 is missing because process was forcefully killed
+        ];
+
+        let (repaired, interrupted) = repair_conversation_history(&mut messages);
+        assert!(repaired);
+        assert!(interrupted.is_none());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3].role, Role::Tool);
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert!(messages[3].content.contains("Interrupted"));
+    }
+
+    #[test]
+    fn test_repair_conversation_history_pops_interrupted_user_prompt() {
+        let mut messages = vec![
+            ChatMessage::user("First prompt"),
+            ChatMessage::assistant("First answer"),
+            ChatMessage::user("Second interrupted prompt"),
+        ];
+
+        let (repaired, interrupted) = repair_conversation_history(&mut messages);
+        assert!(repaired);
+        assert_eq!(interrupted.as_deref(), Some("Second interrupted prompt"));
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_conversation_file_lock_mutual_exclusion() {
+        let conv_id = format!("test_lock_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let lock1 = ConversationLock::try_acquire(&conv_id).expect("First lock acquire must succeed");
+        let lock2_res = ConversationLock::try_acquire(&conv_id);
+        assert!(lock2_res.is_err(), "Second lock acquire must fail while held");
+
+        drop(lock1);
+        let lock3_res = ConversationLock::try_acquire(&conv_id);
+        assert!(lock3_res.is_ok(), "Lock acquire must succeed after previous lock is dropped");
+    }
+
+    #[test]
+    fn test_detect_interrupted_session_notice() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let artifacts_dir = temp_dir.path().join("artifacts");
+        let store = HarnessStore::open(temp_dir.path().join("test.db"), &artifacts_dir).unwrap();
+        let cwd = "/test/repo";
+
+        // No sessions initially
+        assert!(detect_interrupted_session_notice(&store, cwd, "current_1").is_none());
+
+        // Create an interrupted session with messages
+        store.create_conversation("prev_1", cwd, "model", "sess").unwrap();
+        let user_msg = ChatMessage::user("Fix build error in main.rs");
+        let json = serde_json::to_string(&user_msg).unwrap();
+        store.append_conversation_message("prev_1", &json).unwrap();
+        store.set_conversation_status("prev_1", "interrupted").unwrap();
+
+        let notice = detect_interrupted_session_notice(&store, cwd, "current_1");
+        assert!(notice.is_some());
+        let text = notice.unwrap();
+        assert!(text.contains("prev_1"));
+        assert!(text.contains("Fix build error in main.rs"));
+        assert!(text.contains("/resume"));
+
+        // When previous session is closed, notice is None
+        store.set_conversation_status("prev_1", "closed").unwrap();
+        assert!(detect_interrupted_session_notice(&store, cwd, "current_1").is_none());
+    }
+}
+
+pub fn detect_interrupted_session_notice(
+    store: &HarnessStore,
+    cwd: &str,
+    current_conv_id: &str,
+) -> Option<String> {
+    if let Ok(Some(interrupted)) = store.latest_interrupted_conversation_for_cwd(cwd, Some(current_conv_id)) {
+        if let Ok((rec, msg_recs)) = store.load_conversation(&interrupted.id) {
+            if !msg_recs.is_empty() {
+                let short_id = if rec.id.len() >= 8 { &rec.id[..8] } else { &rec.id };
+                let preview = msg_recs
+                    .iter()
+                    .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.message_json).ok())
+                    .find(|cm| cm.role == dume_provider::Role::User)
+                    .map(|cm| {
+                        let first_line = cm.content.lines().next().unwrap_or("").trim();
+                        if first_line.chars().count() > 40 {
+                            let truncated: String = first_line.chars().take(37).collect();
+                            format!("\"{truncated}...\"")
+                        } else if !first_line.is_empty() {
+                            format!("\"{first_line}\"")
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let desc = if preview.is_empty() {
+                    format!("id: {short_id}")
+                } else {
+                    format!("{preview} (id: {short_id})")
+                };
+                return Some(format!(
+                    "Previous interrupted session detected in this repository: {desc}. Type /resume to restore, or continue in this new session."
+                ));
+            }
+        }
+    }
+    None
 }

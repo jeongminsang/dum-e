@@ -183,6 +183,28 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            cwd TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider_session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversations_cwd ON conversations(cwd, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            conversation_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            idx INTEGER NOT NULL,
+            message_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (conversation_id, generation, idx),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
         "#,
     )?;
 

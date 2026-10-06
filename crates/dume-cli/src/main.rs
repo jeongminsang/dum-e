@@ -16,6 +16,18 @@ use std::time::Duration;
     about = "DUM-E Clean-Engine Autonomous Multi-Agent Harness (Rust)"
 )]
 struct Cli {
+    /// Resume the latest conversation in this directory
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+
+    /// Resume a conversation by ID or open interactive session picker
+    #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+
+    /// Show/search conversations across all directories
+    #[arg(long = "all")]
+    all: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -67,6 +79,27 @@ enum Commands {
     Interactive {
         #[arg(long, default_value = "")]
         model: String,
+        /// Resume the latest conversation in this directory
+        #[arg(short = 'c', long = "continue")]
+        continue_session: bool,
+        /// Resume a conversation by ID or open interactive session picker
+        #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+        /// Show/search conversations across all directories
+        #[arg(long = "all")]
+        all: bool,
+    },
+    /// Export a conversation to JSONL format
+    Export {
+        /// Conversation ID to export (defaults to latest in current directory)
+        id: Option<String>,
+        /// Output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<std::path::PathBuf>,
+        #[arg(long, default_value = ".dume/agent/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/artifacts")]
+        artifacts_dir: String,
     },
     /// Create a new goal
     Goal {
@@ -200,8 +233,22 @@ async fn main() -> Result<()> {
         }) => {
             print_status(&db_path, &artifacts_dir)?;
         }
-        Some(Commands::Interactive { model }) => {
-            dume_tui::run_tui(&model).await?;
+        Some(Commands::Interactive {
+            model,
+            continue_session,
+            resume,
+            all,
+        }) => {
+            let target = resolve_resume_target(continue_session, resume, all);
+            dume_tui::run_tui_with_target(&model, target).await?;
+        }
+        Some(Commands::Export {
+            id,
+            output,
+            db_path,
+            artifacts_dir,
+        }) => {
+            run_export(id.as_deref(), output.as_deref(), &db_path, &artifacts_dir)?;
         }
         Some(Commands::Goal {
             id,
@@ -343,9 +390,92 @@ async fn main() -> Result<()> {
             println!("{}", runner.render_markdown_report(&report));
         }
         None => {
-            // Default to interactive TUI
-            dume_tui::run_tui("").await?;
+            let target = resolve_resume_target(cli.continue_session, cli.resume, cli.all);
+            dume_tui::run_tui_with_target("", target).await?;
         }
+    }
+
+    Ok(())
+}
+
+fn resolve_resume_target(continue_session: bool, resume: Option<String>, all: bool) -> dume_tui::ResumeTarget {
+    if continue_session {
+        dume_tui::ResumeTarget::Latest
+    } else if let Some(id_str) = resume {
+        let trimmed = id_str.trim();
+        if trimmed.is_empty() {
+            dume_tui::ResumeTarget::Picker { all_dirs: all }
+        } else {
+            dume_tui::ResumeTarget::Id(trimmed.to_string())
+        }
+    } else {
+        dume_tui::ResumeTarget::None
+    }
+}
+
+fn run_export(
+    id: Option<&str>,
+    output_path: Option<&std::path::Path>,
+    db_path: &str,
+    artifacts_dir: &str,
+) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let resolved_db = if db_path == ".dume/agent/harness.db" {
+        std::path::PathBuf::from(home).join(".dume/agent/harness.db")
+    } else {
+        std::path::PathBuf::from(db_path)
+    };
+    let store = HarnessStore::open(&resolved_db, artifacts_dir)?;
+
+    let target_id = match id {
+        Some(target) => {
+            let found = store.load_conversation(target).ok().or_else(|| {
+                let list = store.list_conversations(None, 50).ok()?;
+                let matched = list.into_iter().find(|c| c.id.starts_with(target))?;
+                store.load_conversation(&matched.id).ok()
+            });
+            match found {
+                Some((rec, _)) => rec.id,
+                None => anyhow::bail!("Conversation '{}' not found", target),
+            }
+        }
+        None => {
+            let raw_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let cwd = dume_store::resolve_project_root(&raw_cwd)
+                .to_str()
+                .unwrap_or(".")
+                .to_string();
+            match store.latest_conversation_for_cwd(&cwd)? {
+                Some(rec) => rec.id,
+                None => anyhow::bail!("No conversations found for current directory"),
+            }
+        }
+    };
+
+    let (record, msg_records) = store.load_conversation(&target_id)?;
+    let mut out_lines = Vec::new();
+
+    let meta = serde_json::json!({
+        "_type": "header",
+        "conversation_id": record.id,
+        "cwd": record.cwd,
+        "model": record.model,
+        "status": record.status,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    });
+    out_lines.push(serde_json::to_string(&meta)?);
+
+    for msg in msg_records {
+        out_lines.push(msg.message_json);
+    }
+
+    let result_content = out_lines.join("\n") + "\n";
+    if let Some(path) = output_path {
+        std::fs::write(path, result_content)?;
+        println!("Exported conversation '{}' to {}", target_id, path.display());
+    } else {
+        print!("{}", result_content);
     }
 
     Ok(())

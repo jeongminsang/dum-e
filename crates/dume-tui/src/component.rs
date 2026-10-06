@@ -1281,3 +1281,86 @@ pub fn render_btw_modal(
     f.render_widget(block, modal_area);
     f.render_widget(paragraph, inner);
 }
+
+pub fn render_resume_picker_modal(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[RecentSessionSummary],
+    selected_idx: usize,
+    theme: &Theme,
+) {
+    let width = 76.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" Resume Conversation (Enter: Select, Esc: Cancel, ↑/↓: Navigate) ");
+
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines = Vec::new();
+    if sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved conversations found.",
+            Style::default().fg(theme.status_bar_fg),
+        )));
+    } else {
+        for (i, s) in sessions.iter().enumerate() {
+            let is_selected = i == selected_idx;
+            let cursor = if is_selected { " ➔ " } else { "   " };
+            let short_id = if s.session_id.len() >= 8 {
+                &s.session_id[..8]
+            } else {
+                &s.session_id
+            };
+            let preview = s.preview.trim().lines().next().unwrap_or("Empty session");
+            let preview_trunc = if preview.chars().count() > 36 {
+                let p: String = preview.chars().take(33).collect();
+                format!("{}...", p)
+            } else {
+                preview.to_string()
+            };
+
+            let row_style = if is_selected {
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.foreground)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(cursor, Style::default().fg(theme.accent)),
+                Span::styled(
+                    format!("{:<9}", short_id),
+                    if is_selected {
+                        Style::default()
+                            .fg(theme.border_focused)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.border_focused)
+                    },
+                ),
+                Span::styled(
+                    format!("({} msgs) ", s.message_count),
+                    Style::default().fg(theme.border),
+                ),
+                Span::styled(preview_trunc, row_style),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph, inner);
+}
+

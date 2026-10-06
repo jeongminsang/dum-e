@@ -441,6 +441,7 @@ dependencies = [
  "dume-store",
  "dume-worker",
  "futures-util",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

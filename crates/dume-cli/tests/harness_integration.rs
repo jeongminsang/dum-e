@@ -1713,3 +1713,103 @@ async fn test_binary_cli_lifecycle_end_to_end() {
 async fn test_binary_cli_http_failure_does_not_complete_attempt() {
     run_binary_cli_lifecycle(true).await;
 }
+
+#[test]
+fn test_conversation_recovery_and_export_lifecycle() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("harness.db");
+    let artifacts_dir = dir.path().join("artifacts");
+    let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+
+    let cwd = "/test/repo/workspace";
+    let conv_id = "conv_e2e_recovery_1";
+
+    // 1. Create conversation
+    let rec = store
+        .create_conversation(conv_id, cwd, "openai/gpt-4o", "prov_sess_1")
+        .unwrap();
+    assert_eq!(rec.id, conv_id);
+    assert_eq!(rec.status, "active");
+
+    // 2. Append turn messages
+    store
+        .append_conversation_message(conv_id, r#"{"role":"user","content":"Run unit tests"}"#)
+        .unwrap();
+    store
+        .append_conversation_message(
+            conv_id,
+            r#"{"role":"assistant","content":"Running cargo test","tool_calls":[{"id":"tc_1","name":"cargo_test","arguments":"{}"}]}"#,
+        )
+        .unwrap();
+    store
+        .append_conversation_message(
+            conv_id,
+            r#"{"role":"tool","content":"test passed","tool_call_id":"tc_1"}"#,
+        )
+        .unwrap();
+    store
+        .append_conversation_message(
+            conv_id,
+            r#"{"role":"assistant","content":"All tests passed successfully."}"#,
+        )
+        .unwrap();
+
+    // 3. Query latest and recent summary
+    let latest = store.latest_conversation_for_cwd(cwd).unwrap().unwrap();
+    assert_eq!(latest.id, conv_id);
+
+    let recents = store.list_recent_conversations(Some(cwd), 10).unwrap();
+    assert_eq!(recents.len(), 1);
+    assert_eq!(recents[0].session_id, conv_id);
+    assert_eq!(recents[0].message_count, 4);
+    assert_eq!(recents[0].preview, "Run unit tests");
+
+    // 4. Export to JSONL file
+    let export_path = dir.path().join("exported.jsonl");
+    let (record, msg_records) = store.load_conversation(conv_id).unwrap();
+    let mut lines = Vec::new();
+    let header = serde_json::json!({
+        "_type": "header",
+        "conversation_id": record.id,
+        "cwd": record.cwd,
+        "model": record.model,
+        "status": record.status,
+    });
+    lines.push(serde_json::to_string(&header).unwrap());
+    for m in &msg_records {
+        lines.push(m.message_json.clone());
+    }
+    std::fs::write(&export_path, lines.join("\n") + "\n").unwrap();
+
+    let exported_content = std::fs::read_to_string(&export_path).unwrap();
+    let exported_lines: Vec<&str> = exported_content.trim().lines().collect();
+    assert_eq!(exported_lines.len(), 5); // 1 header + 4 messages
+    assert!(exported_lines[0].contains("conv_e2e_recovery_1"));
+    assert!(exported_lines[1].contains("Run unit tests"));
+    assert!(exported_lines[4].contains("All tests passed successfully."));
+
+    // 5. Simulate interrupted tool crash and history repair
+    store
+        .append_conversation_message(
+            conv_id,
+            r#"{"role":"assistant","content":"Calling tool","tool_calls":[{"id":"tc_2","name":"slow_tool","arguments":"{}"}]}"#,
+        )
+        .unwrap();
+    // (Simulate crash: tc_2 response never written before exit)
+
+    let (_, mut messages_to_repair) = store.load_conversation(conv_id).unwrap();
+    let mut parsed_messages: Vec<dume_provider::types::ChatMessage> = messages_to_repair
+        .iter_mut()
+        .map(|m| serde_json::from_str(&m.message_json).unwrap())
+        .collect();
+
+    let (was_repaired, interrupted_prompt) =
+        dume_tui::app::repair_conversation_history(&mut parsed_messages);
+    assert!(was_repaired);
+    assert!(interrupted_prompt.is_none());
+    assert_eq!(parsed_messages.len(), 6);
+    assert_eq!(parsed_messages[5].role, dume_provider::types::Role::Tool);
+    assert_eq!(parsed_messages[5].tool_call_id.as_deref(), Some("tc_2"));
+    assert!(parsed_messages[5].content.contains("Interrupted"));
+}
+
