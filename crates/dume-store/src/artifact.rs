@@ -19,7 +19,10 @@ impl ArtifactStore {
         if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Invalid artifact hash '{}': must be 64-char hex SHA-256", hash),
+                format!(
+                    "Invalid artifact hash '{}': must be 64-char hex SHA-256",
+                    hash
+                ),
             ));
         }
         Ok(())
@@ -31,16 +34,25 @@ impl ArtifactStore {
         let shard = self.base_dir.join(&hash[..2]);
         let shard_meta = fs::symlink_metadata(&shard)?;
         if shard_meta.file_type().is_symlink() || !shard_meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard must be a real directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact shard must be a real directory",
+            ));
         }
         if !fs::canonicalize(&shard)?.starts_with(&root) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard escapes the configured store"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact shard escapes the configured store",
+            ));
         }
 
         let path = shard.join(hash);
         let path_meta = fs::symlink_metadata(&path)?;
         if path_meta.file_type().is_symlink() || !path_meta.is_file() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact must be a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact must be a regular file",
+            ));
         }
         let file = OpenOptions::new().read(true).open(&path)?;
         let opened_meta = file.metadata()?;
@@ -48,12 +60,18 @@ impl ArtifactStore {
         {
             use std::os::unix::fs::MetadataExt;
             if path_meta.dev() != opened_meta.dev() || path_meta.ino() != opened_meta.ino() {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact path changed while opening"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Artifact path changed while opening",
+                ));
             }
         }
         #[cfg(not(unix))]
         if !fs::canonicalize(&path)?.starts_with(root) || !opened_meta.is_file() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact path escapes the configured store"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact path escapes the configured store",
+            ));
         }
         Ok(file)
     }
@@ -68,10 +86,16 @@ impl ArtifactStore {
         fs::create_dir_all(&shard_dir)?;
         let shard_metadata = fs::symlink_metadata(&shard_dir)?;
         if shard_metadata.file_type().is_symlink() || !shard_metadata.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard must be a real directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact shard must be a real directory",
+            ));
         }
         if !fs::canonicalize(&shard_dir)?.starts_with(fs::canonicalize(&self.base_dir)?) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Artifact shard escapes the configured store"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Artifact shard escapes the configured store",
+            ));
         }
 
         let final_path = shard_dir.join(&hash);
@@ -81,7 +105,14 @@ impl ArtifactStore {
         }
 
         // Unique temp file name prevents race conditions across concurrent writers of identical/different artifacts
-        let unique_id = format!("{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        let unique_id = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let temp_path = shard_dir.join(format!("{}.tmp.{}", &hash, unique_id));
         {
             let mut file = File::create(&temp_path)?;
@@ -109,7 +140,10 @@ impl ArtifactStore {
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Concurrent artifact collision with hash mismatch for {}", hash),
+                        format!(
+                            "Concurrent artifact collision with hash mismatch for {}",
+                            hash
+                        ),
                     ));
                 }
             } else {
@@ -117,6 +151,84 @@ impl ArtifactStore {
             }
         }
 
+        Ok(hash)
+    }
+
+    /// Ingest a file without loading it into memory. The source is copied to a
+    /// unique temporary file while hashing, then atomically committed by hash.
+    pub fn save_artifact_from_file<P: AsRef<Path>>(&self, source: P) -> Result<String, io::Error> {
+        let mut input = File::open(source)?;
+        let root = fs::canonicalize(&self.base_dir)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let unique_id = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let staging_path = self.base_dir.join(format!(".artifact.tmp.{unique_id}"));
+        let copy_result = (|| {
+            let mut staging = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging_path)?;
+            loop {
+                let n = input.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+                staging.write_all(&buffer[..n])?;
+            }
+            staging.sync_all()?;
+            Ok::<_, io::Error>(())
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(&staging_path);
+            return Err(error);
+        }
+        let hash = hex::encode(hasher.finalize());
+        let shard_dir = self.base_dir.join(&hash[..2]);
+        if let Err(error) = fs::create_dir_all(&shard_dir) {
+            let _ = fs::remove_file(&staging_path);
+            return Err(error);
+        }
+        let shard_valid = fs::symlink_metadata(&shard_dir).and_then(|meta| {
+            Ok(!meta.file_type().is_symlink()
+                && meta.is_dir()
+                && fs::canonicalize(&shard_dir)?.starts_with(&root))
+        });
+        match shard_valid {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(&staging_path);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Artifact shard must be a real directory inside the store",
+                ));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&staging_path);
+                return Err(error);
+            }
+        }
+        let final_path = shard_dir.join(&hash);
+        if final_path.exists() {
+            let verified = self.get_artifact(&hash);
+            let _ = fs::remove_file(&staging_path);
+            verified?;
+            return Ok(hash);
+        }
+        let result = match fs::rename(&staging_path, &final_path) {
+            Ok(()) => Ok(()),
+            Err(_e) if final_path.exists() => self.get_artifact(&hash).map(|_| ()),
+            Err(error) => Err(error),
+        };
+        let _ = fs::remove_file(&staging_path);
+        result?;
         Ok(hash)
     }
 
@@ -132,7 +244,10 @@ impl ArtifactStore {
         if !actual_hash.eq_ignore_ascii_case(hash) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Artifact corruption detected: expected hash {} but content has {}", hash, actual_hash),
+                format!(
+                    "Artifact corruption detected: expected hash {} but content has {}",
+                    hash, actual_hash
+                ),
             ));
         }
 
@@ -140,7 +255,12 @@ impl ArtifactStore {
     }
 
     /// Read bounded range from an artifact with offset and limit using streaming and seeking
-    pub fn get_artifact_range(&self, hash: &str, offset: usize, limit: usize) -> Result<Vec<u8>, io::Error> {
+    pub fn get_artifact_range(
+        &self,
+        hash: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<u8>, io::Error> {
         let (bytes, _) = self.get_artifact_range_with_total(hash, offset, limit)?;
         Ok(bytes)
     }
@@ -171,7 +291,10 @@ impl ArtifactStore {
         if !actual_hash.eq_ignore_ascii_case(hash) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Artifact corruption detected: expected hash {} but content has {}", hash, actual_hash),
+                format!(
+                    "Artifact corruption detected: expected hash {} but content has {}",
+                    hash, actual_hash
+                ),
             ));
         }
 
@@ -210,6 +333,31 @@ mod tests {
     }
 
     #[test]
+    fn streams_file_into_content_addressed_artifact() {
+        let dir = tempdir().unwrap();
+        let store = ArtifactStore::new(dir.path().join("store")).unwrap();
+        let source = dir.path().join("source.bin");
+        let data = vec![0x5a; 3 * 1024 * 1024 + 17];
+        fs::write(&source, &data).unwrap();
+        let expected = hex::encode(Sha256::digest(&data));
+        let hash = store.save_artifact_from_file(&source).unwrap();
+        assert_eq!(hash, expected);
+        assert_eq!(store.get_artifact(&hash).unwrap(), data);
+    }
+
+    #[test]
+    fn file_ingestion_read_error_does_not_commit_partial_artifact() {
+        let dir = tempdir().unwrap();
+        let store = ArtifactStore::new(dir.path().join("store")).unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            store.save_artifact_from_file(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read_dir(dir.path().join("store")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn test_artifact_tampering_corruption_detection() {
         let dir = tempdir().unwrap();
         let store = ArtifactStore::new(dir.path()).unwrap();
@@ -226,7 +374,10 @@ mod tests {
         let res = store.get_artifact(&hash);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert_eq!(store.save_artifact(data).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            store.save_artifact(data).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -234,7 +385,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = ArtifactStore::new(dir.path()).unwrap();
 
-        let res = store.get_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let res =
+            store.get_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::NotFound);
     }

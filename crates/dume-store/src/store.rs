@@ -55,7 +55,7 @@ pub fn resolve_project_root(start_dir: &Path) -> PathBuf {
 }
 
 pub struct HarnessStore {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     pub artifacts: ArtifactStore,
     pub db_path: PathBuf,
 }
@@ -1039,7 +1039,8 @@ impl HarnessStore {
             ),
         };
 
-        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_slice.as_slice(), |r| {
             let session_id: String = r.get(0)?;
@@ -1249,16 +1250,18 @@ impl HarnessStore {
     ) -> Result<i64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let generation: i64 = tx.query_row(
-            "SELECT generation FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |r| r.get(0),
-        ).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                StoreError::NotFound(format!("conversation {conversation_id}"))
-            }
-            other => StoreError::Db(other),
-        })?;
+        let generation: i64 = tx
+            .query_row(
+                "SELECT generation FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("conversation {conversation_id}"))
+                }
+                other => StoreError::Db(other),
+            })?;
 
         let next_idx: i64 = tx.query_row(
             "SELECT COALESCE(MAX(idx), -1) + 1 FROM conversation_messages WHERE conversation_id = ?1 AND generation = ?2",
@@ -1291,16 +1294,18 @@ impl HarnessStore {
     ) -> Result<i64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let current_gen: i64 = tx.query_row(
-            "SELECT generation FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |r| r.get(0),
-        ).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                StoreError::NotFound(format!("conversation {conversation_id}"))
-            }
-            other => StoreError::Db(other),
-        })?;
+        let current_gen: i64 = tx
+            .query_row(
+                "SELECT generation FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("conversation {conversation_id}"))
+                }
+                other => StoreError::Db(other),
+            })?;
 
         let new_gen = current_gen + 1;
         let now = now_millis();
@@ -1358,10 +1363,13 @@ impl HarnessStore {
             id_param_idx
         );
 
-        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let affected = conn.execute(&sql, params_slice.as_slice())?;
         if affected == 0 {
-            return Err(StoreError::NotFound(format!("conversation {conversation_id}")));
+            return Err(StoreError::NotFound(format!(
+                "conversation {conversation_id}"
+            )));
         }
         Ok(())
     }
@@ -1378,7 +1386,9 @@ impl HarnessStore {
             params![status, now, conversation_id],
         )?;
         if affected == 0 {
-            return Err(StoreError::NotFound(format!("conversation {conversation_id}")));
+            return Err(StoreError::NotFound(format!(
+                "conversation {conversation_id}"
+            )));
         }
         Ok(())
     }
@@ -1388,31 +1398,33 @@ impl HarnessStore {
         conversation_id: &str,
     ) -> Result<(ConversationRecord, Vec<ConversationMessageRecord>), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let record = conn.query_row(
-            r#"
+        let record = conn
+            .query_row(
+                r#"
             SELECT id, cwd, model, provider_session_id, status, generation, created_at, updated_at
             FROM conversations
             WHERE id = ?1
             "#,
-            params![conversation_id],
-            |r| {
-                Ok(ConversationRecord {
-                    id: r.get(0)?,
-                    cwd: r.get(1)?,
-                    model: r.get(2)?,
-                    provider_session_id: r.get(3)?,
-                    status: r.get(4)?,
-                    generation: r.get(5)?,
-                    created_at: r.get(6)?,
-                    updated_at: r.get(7)?,
-                })
-            },
-        ).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                StoreError::NotFound(format!("conversation {conversation_id}"))
-            }
-            other => StoreError::Db(other),
-        })?;
+                params![conversation_id],
+                |r| {
+                    Ok(ConversationRecord {
+                        id: r.get(0)?,
+                        cwd: r.get(1)?,
+                        model: r.get(2)?,
+                        provider_session_id: r.get(3)?,
+                        status: r.get(4)?,
+                        generation: r.get(5)?,
+                        created_at: r.get(6)?,
+                        updated_at: r.get(7)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("conversation {conversation_id}"))
+                }
+                other => StoreError::Db(other),
+            })?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -1546,7 +1558,8 @@ impl HarnessStore {
             ),
         };
 
-        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_slice.as_slice(), |r| {
             Ok(ConversationRecord {
@@ -1621,7 +1634,9 @@ impl HarnessStore {
         })
     }
 
-    fn map_request_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<dume_core::types::RequestUsage> {
+    fn map_request_usage_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<dume_core::types::RequestUsage> {
         Ok(dume_core::types::RequestUsage {
             request_id: r.get(0)?,
             session_id: r.get(1)?,
@@ -2120,7 +2135,14 @@ mod tests {
             .append_session_message(session_id, "tool", "tool 3 output", None, Some("t3"), false)
             .unwrap();
         store
-            .append_session_message(session_id, "assistant", "All three tools completed.", None, None, false)
+            .append_session_message(
+                session_id,
+                "assistant",
+                "All three tools completed.",
+                None,
+                None,
+                false,
+            )
             .unwrap();
         store
             .append_session_message(session_id, "user", "Follow up prompt", None, None, false)
@@ -2140,7 +2162,9 @@ mod tests {
         // Without atomic multi-tool protection, messages 0, 1, 2 would be archived,
         // leaving orphaned tool messages 3 and 4 at the start of the active context!
         // With atomic multi-tool protection, all contiguous tool results (2, 3, 4) are advanced into the archive window.
-        store.compact_session(session_id, "Compact summary: completed 3 tools", 4).unwrap();
+        store
+            .compact_session(session_id, "Compact summary: completed 3 tools", 4)
+            .unwrap();
 
         let active_msgs = store.list_active_context_messages(session_id).unwrap();
         // Active messages should be:
@@ -2158,7 +2182,10 @@ mod tests {
         // Verify active context NEVER begins with an orphaned tool result
         for (role, _, _, tool_call_id, is_sum) in &active_msgs {
             if !is_sum && role == "tool" {
-                panic!("Active context must not have orphaned tool result! Found: {:?}", tool_call_id);
+                panic!(
+                    "Active context must not have orphaned tool result! Found: {:?}",
+                    tool_call_id
+                );
             }
         }
     }
@@ -2173,9 +2200,11 @@ mod tests {
             .unwrap();
         let incoming = vec![("user".to_string(), "new".to_string(), None, None, false)];
 
-        assert!(store
-            .persist_and_compact_session(session_id, &incoming, "checkpoint", 0)
-            .is_err());
+        assert!(
+            store
+                .persist_and_compact_session(session_id, &incoming, "checkpoint", 0)
+                .is_err()
+        );
         assert_eq!(store.list_session_messages(session_id).unwrap().len(), 1);
         assert_eq!(
             store.list_active_context_messages(session_id).unwrap()[0].1,
@@ -2287,7 +2316,8 @@ mod tests {
                 );
                 CREATE INDEX idx_request_usage_session ON request_usage(session_id);
                 "#,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // 2. Open via HarnessStore::open which runs initialize_schema and migrations
@@ -2314,7 +2344,9 @@ mod tests {
             created_at: 100,
         };
         assert!(store.record_request_usage(&req).unwrap());
-        let list = store.get_benchmark_request_usages("bench_migrated").unwrap();
+        let list = store
+            .get_benchmark_request_usages("bench_migrated")
+            .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].request_id, "req_migrated_1");
     }
@@ -2372,10 +2404,15 @@ mod tests {
         let (comp_conv, comp_msgs) = store.load_conversation("conv_1").unwrap();
         assert_eq!(comp_conv.generation, 1);
         assert_eq!(comp_msgs.len(), 2);
-        assert_eq!(comp_msgs[0].message_json, r#"{"role":"system","content":"checkpoint"}"#);
+        assert_eq!(
+            comp_msgs[0].message_json,
+            r#"{"role":"system","content":"checkpoint"}"#
+        );
 
         // 6. Query latest and list
-        let latest = store.latest_conversation_for_cwd("/workspace/repo").unwrap();
+        let latest = store
+            .latest_conversation_for_cwd("/workspace/repo")
+            .unwrap();
         assert!(latest.is_some());
         assert_eq!(latest.unwrap().id, "conv_1");
 
@@ -2385,7 +2422,9 @@ mod tests {
         let list_other = store.list_conversations(Some("/other/path"), 10).unwrap();
         assert!(list_other.is_empty());
 
-        let recents = store.list_recent_conversations(Some("/workspace/repo"), 10).unwrap();
+        let recents = store
+            .list_recent_conversations(Some("/workspace/repo"), 10)
+            .unwrap();
         assert_eq!(recents.len(), 1);
         assert_eq!(recents[0].session_id, "conv_1");
         assert_eq!(recents[0].message_count, 2);
@@ -2399,7 +2438,9 @@ mod tests {
         assert!(interrupted.is_none());
 
         // Set conv_1 back to 'interrupted'
-        store.set_conversation_status("conv_1", "interrupted").unwrap();
+        store
+            .set_conversation_status("conv_1", "interrupted")
+            .unwrap();
         let interrupted = store
             .latest_interrupted_conversation_for_cwd("/workspace/repo", None)
             .unwrap();
