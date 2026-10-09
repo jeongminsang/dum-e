@@ -259,6 +259,28 @@ impl TokenUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
+    ProviderError {
+        kind: ProviderFailureKind,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
+    AttemptStarted {
+        context: StreamRequestContext,
+        model: String,
+    },
+    AttemptFinished {
+        context: StreamRequestContext,
+        model: String,
+        outcome: AttemptOutcome,
+        duration_ms: u64,
+        usage: Option<TokenUsage>,
+        error: Option<String>,
+    },
+    Retrying {
+        next_attempt: usize,
+        delay_ms: u64,
+        reason: String,
+    },
     TextDelta(String),
     /// Opaque replay metadata. Never render as transcript or streaming text.
     CodexReasoning(Vec<Value>),
@@ -275,6 +297,22 @@ pub enum StreamEvent {
         finish_reason: String,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    Transient,
+    Auth,
+    InvalidRequest,
+    Context,
+    Protocol,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Succeeded,
+    Failed,
 }
 
 /// Request and session context for model invocations.

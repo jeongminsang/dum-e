@@ -1,5 +1,7 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
+use crate::types::{
+    ChatMessage, ProviderFailureKind, Role, StreamEvent, TokenUsage, ToolDefinition,
+};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -107,7 +109,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn anthropic_multi_system_and_cache_control() {
         let sse = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
@@ -126,7 +127,10 @@ mod tests {
             parameters: json!({"type":"object"}),
         }];
         let (tx, _rx) = mpsc::channel(16);
-        provider.stream("claude-3-7", &messages, &tools, tx).await.unwrap();
+        provider
+            .stream("claude-3-7", &messages, &tools, tx)
+            .await
+            .unwrap();
         let (_headers, body) = server.join().unwrap();
         let system = body["system"].as_array().expect("system should be array");
         assert_eq!(system.len(), 2);
@@ -135,7 +139,9 @@ mod tests {
         assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         // Messages tail caching: last turn in messages should also have cache_control
-        let msgs = body["messages"].as_array().expect("messages should be array");
+        let msgs = body["messages"]
+            .as_array()
+            .expect("messages should be array");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
     }
@@ -158,12 +164,27 @@ mod tests {
             parameters: json!({"type":"object"}),
         }];
         let (tx, _rx) = mpsc::channel(16);
-        provider.stream("claude-3-7", &messages, &tools, tx).await.unwrap();
+        provider
+            .stream("claude-3-7", &messages, &tools, tx)
+            .await
+            .unwrap();
         let (_headers, body) = server.join().unwrap();
         // None of system, tools, or messages should have cache_control
-        assert!(body.get("system").and_then(|s| s[0].get("cache_control")).is_none());
-        assert!(body.get("tools").and_then(|t| t[0].get("cache_control")).is_none());
-        assert!(body.get("messages").and_then(|m| m[0]["content"][0].get("cache_control")).is_none());
+        assert!(
+            body.get("system")
+                .and_then(|s| s[0].get("cache_control"))
+                .is_none()
+        );
+        assert!(
+            body.get("tools")
+                .and_then(|t| t[0].get("cache_control"))
+                .is_none()
+        );
+        assert!(
+            body.get("messages")
+                .and_then(|m| m[0]["content"][0].get("cache_control"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -194,7 +215,11 @@ mod tests {
             "http://api.anthropic.com/v1",
             "http://localhost:8080/v1",
         ] {
-            assert!(!AnthropicProvider::new("key").with_base_url(url).should_cache());
+            assert!(
+                !AnthropicProvider::new("key")
+                    .with_base_url(url)
+                    .should_cache()
+            );
         }
     }
 }
@@ -231,9 +256,8 @@ impl AnthropicProvider {
         if let Some(enabled) = self.prompt_caching {
             return enabled;
         }
-        reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
-            url.scheme() == "https" && url.host_str() == Some("api.anthropic.com")
-        })
+        reqwest::Url::parse(&self.base_url)
+            .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("api.anthropic.com"))
     }
 
     fn headers(&self) -> Result<HeaderMap> {
@@ -293,7 +317,8 @@ impl AnthropicProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        self.stream_with_context(model, messages, tools, None, tx).await
+        self.stream_with_context(model, messages, tools, None, tx)
+            .await
     }
 
     pub async fn stream_with_context(
@@ -365,7 +390,10 @@ impl AnthropicProvider {
         // to the last eligible turn in messages (growing conversation tail cache)
         if caching_enabled && !formatted_msgs.is_empty() {
             let last_idx = formatted_msgs.len() - 1;
-            if let Some(content_arr) = formatted_msgs[last_idx].get_mut("content").and_then(|c| c.as_array_mut()) {
+            if let Some(content_arr) = formatted_msgs[last_idx]
+                .get_mut("content")
+                .and_then(|c| c.as_array_mut())
+            {
                 if let Some(last_block) = content_arr.last_mut() {
                     last_block["cache_control"] = json!({"type": "ephemeral"});
                 }
@@ -425,7 +453,7 @@ impl AnthropicProvider {
             body["tools"] = json!(tools_val);
         }
 
-        let resp = self.client.post_with_retry(&url, headers, &body, 3).await?;
+        let resp = self.client.post_once(&url, headers, &body).await?;
         let mut stream = resp.bytes_stream().eventsource();
         let mut completed = false;
 
@@ -507,42 +535,72 @@ impl AnthropicProvider {
                                 }
                                 "message_start" => {
                                     if let Some(msg) = parsed.get("message") {
-                                         if let Some(usage) = msg.get("usage") {
-                                             let raw_input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                             let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                             let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64());
-                                             let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64());
-                                             let normalized_input = raw_input + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
-                                             if normalized_input > 0 || output > 0 || cache_read.is_some() || cache_write.is_some() {
-                                                 let _ = tx.send(StreamEvent::Usage(TokenUsage {
-                                                     input_tokens: normalized_input,
-                                                     output_tokens: output,
-                                                     total_tokens: normalized_input + output,
-                                                     cache_read_tokens: cache_read,
-                                                     cache_write_tokens: cache_write,
-                                                     raw_usage: Some(usage.clone()),
-                                                     is_complete: true,
-                                                 })).await;
-                                             }
-                                         }
-                                     }
+                                        if let Some(usage) = msg.get("usage") {
+                                            let raw_input = usage
+                                                .get("input_tokens")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0);
+                                            let output = usage
+                                                .get("output_tokens")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0);
+                                            let cache_read = usage
+                                                .get("cache_read_input_tokens")
+                                                .and_then(|v| v.as_i64());
+                                            let cache_write = usage
+                                                .get("cache_creation_input_tokens")
+                                                .and_then(|v| v.as_i64());
+                                            let normalized_input = raw_input
+                                                + cache_read.unwrap_or(0)
+                                                + cache_write.unwrap_or(0);
+                                            if normalized_input > 0
+                                                || output > 0
+                                                || cache_read.is_some()
+                                                || cache_write.is_some()
+                                            {
+                                                let _ = tx
+                                                    .send(StreamEvent::Usage(TokenUsage {
+                                                        input_tokens: normalized_input,
+                                                        output_tokens: output,
+                                                        total_tokens: normalized_input + output,
+                                                        cache_read_tokens: cache_read,
+                                                        cache_write_tokens: cache_write,
+                                                        raw_usage: Some(usage.clone()),
+                                                        is_complete: true,
+                                                    }))
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                 }
                                 "message_delta" => {
                                     if let Some(usage) = parsed.get("usage") {
-                                         let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                         let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64());
-                                         let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64());
-                                         if output > 0 || cache_read.is_some() || cache_write.is_some() {
-                                             let _ = tx.send(StreamEvent::Usage(TokenUsage {
-                                                 input_tokens: 0,
-                                                 output_tokens: output,
-                                                 total_tokens: output,
-                                                 cache_read_tokens: cache_read,
-                                                 cache_write_tokens: cache_write,
-                                                 raw_usage: Some(usage.clone()),
-                                                 is_complete: true,
-                                             })).await;
-                                         }
+                                        let output = usage
+                                            .get("output_tokens")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0);
+                                        let cache_read = usage
+                                            .get("cache_read_input_tokens")
+                                            .and_then(|v| v.as_i64());
+                                        let cache_write = usage
+                                            .get("cache_creation_input_tokens")
+                                            .and_then(|v| v.as_i64());
+                                        if output > 0
+                                            || cache_read.is_some()
+                                            || cache_write.is_some()
+                                        {
+                                            let _ = tx
+                                                .send(StreamEvent::Usage(TokenUsage {
+                                                    input_tokens: 0,
+                                                    output_tokens: output,
+                                                    total_tokens: output,
+                                                    cache_read_tokens: cache_read,
+                                                    cache_write_tokens: cache_write,
+                                                    raw_usage: Some(usage.clone()),
+                                                    is_complete: true,
+                                                }))
+                                                .await;
+                                        }
                                     }
                                     if let Some(stop) = parsed
                                         .get("delta")
@@ -558,9 +616,34 @@ impl AnthropicProvider {
                                     }
                                 }
                                 "error" => {
-                                    let message =
-                                        format!("Anthropic response error: {}", parsed["error"]);
-                                    let _ = tx.send(StreamEvent::Error(message.clone())).await;
+                                    let error = &parsed["error"];
+                                    let code =
+                                        error.get("type").and_then(Value::as_str).unwrap_or("");
+                                    let message = format!(
+                                        "Anthropic response error [{code}]: {}",
+                                        error.get("message").and_then(Value::as_str).unwrap_or("")
+                                    );
+                                    let kind = match code {
+                                        "overloaded_error" | "server_busy" => {
+                                            ProviderFailureKind::Transient
+                                        }
+                                        "authentication_error" | "permission_error" => {
+                                            ProviderFailureKind::Auth
+                                        }
+                                        "invalid_request_error" => {
+                                            ProviderFailureKind::InvalidRequest
+                                        }
+                                        "context_length_exceeded" => ProviderFailureKind::Context,
+                                        "" => ProviderFailureKind::Unknown,
+                                        _ => ProviderFailureKind::Unknown,
+                                    };
+                                    let _ = tx
+                                        .send(StreamEvent::ProviderError {
+                                            kind,
+                                            message: message.clone(),
+                                            retry_after_ms: None,
+                                        })
+                                        .await;
                                     anyhow::bail!(message);
                                 }
                                 "message_stop" => break,

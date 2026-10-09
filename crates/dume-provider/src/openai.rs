@@ -1,6 +1,7 @@
 use crate::client::LlmClient;
 use crate::types::{
-    ChatMessage, Role, StreamEvent, StreamRequestContext, TokenUsage, ToolDefinition,
+    ChatMessage, ProviderFailureKind, Role, StreamEvent, StreamRequestContext, TokenUsage,
+    ToolDefinition,
 };
 use anyhow::{Context, Result, bail};
 use eventsource_stream::Eventsource;
@@ -22,6 +23,43 @@ pub struct OpenAiProvider {
     base_url: String,
     opencode_profile: Option<OpenCodeProfile>,
     deepseek: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ProviderStreamFailure {
+    kind: ProviderFailureKind,
+    message: String,
+}
+
+fn openai_stream_failure(error: &Value) -> ProviderStreamFailure {
+    let detail = error.get("error").unwrap_or(error);
+    let code = detail
+        .get("code")
+        .or_else(|| detail.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let kind = match code {
+        "overloaded_error"
+        | "overload"
+        | "server_busy"
+        | "server_error"
+        | "resource_exhausted"
+        | "rate_limit_exceeded"
+        | "rate_limit_error" => ProviderFailureKind::Transient,
+        "invalid_api_key" | "authentication_error" | "unauthorized" | "permission_denied" => {
+            ProviderFailureKind::Auth
+        }
+        "context_length_exceeded" | "maximum_context_length_exceeded" => {
+            ProviderFailureKind::Context
+        }
+        "invalid_request_error" | "bad_request" => ProviderFailureKind::InvalidRequest,
+        _ => ProviderFailureKind::Unknown,
+    };
+    ProviderStreamFailure {
+        kind,
+        message: error.to_string(),
+    }
 }
 
 impl OpenAiProvider {
@@ -86,7 +124,17 @@ impl OpenAiProvider {
             .stream_inner(model, messages, tools, context, &tx)
             .await;
         if let Err(error) = &result {
-            let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+            if let Some(failure) = error.downcast_ref::<ProviderStreamFailure>() {
+                let _ = tx
+                    .send(StreamEvent::ProviderError {
+                        kind: failure.kind,
+                        message: failure.message.clone(),
+                        retry_after_ms: None,
+                    })
+                    .await;
+            } else {
+                let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+            }
         }
         result
     }
@@ -226,7 +274,7 @@ impl OpenAiProvider {
             body["tools"] = json!(tools_val);
         }
 
-        let resp = self.client.post_with_retry(&url, headers, &body, 3).await?;
+        let resp = self.client.post_once(&url, headers, &body).await?;
         let mut stream = resp.bytes_stream().eventsource();
 
         while let Some(event_res) = stream.next().await {
@@ -238,8 +286,8 @@ impl OpenAiProvider {
                     {
                         let parsed = serde_json::from_str::<Value>(&event.data)
                             .context("Invalid OpenAI SSE JSON")?;
-                        if parsed.get("error").is_some() {
-                            bail!("OpenAI response error");
+                        if let Some(error) = parsed.get("error") {
+                            return Err(anyhow::Error::new(openai_stream_failure(error)));
                         }
                         anyhow::ensure!(parsed["choices"].is_array(), "Missing OpenAI choices");
                         if self.deepseek {
@@ -382,6 +430,31 @@ mod tests {
     use super::*;
     use crate::types::ToolCall;
 
+    #[test]
+    fn structured_error_formats_classify_only_exact_codes() {
+        for response in [
+            json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}),
+            json!({"error":{"type":"rate_limit_exceeded","message":"busy"}}),
+            json!({"error":{"code":"rate_limit_exceeded","message":"busy","provider":"opencode"}}),
+        ] {
+            assert_eq!(
+                openai_stream_failure(&response).kind,
+                ProviderFailureKind::Transient
+            );
+        }
+        assert_eq!(
+            openai_stream_failure(&json!({"error":{"code":"invalid_api_key","message":"no"}})).kind,
+            ProviderFailureKind::Auth
+        );
+        assert_eq!(
+            openai_stream_failure(
+                &json!({"error":{"code":"vendor_custom","message":"rate limit"}})
+            )
+            .kind,
+            ProviderFailureKind::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn deepseek_replays_reasoning_and_reports_cache_hits() {
         let sse = format!(
@@ -485,7 +558,17 @@ mod tests {
                     .is_err()
             );
             server.join().unwrap();
-            assert!(matches!(rx.recv().await, Some(StreamEvent::Error(_))));
+            let terminal = rx.recv().await;
+            match sse {
+                "data: {\"error\":{\"message\":\"denied\"}}\n\n" => assert!(matches!(
+                    terminal,
+                    Some(StreamEvent::ProviderError {
+                        kind: ProviderFailureKind::Unknown,
+                        ..
+                    })
+                )),
+                _ => assert!(matches!(terminal, Some(StreamEvent::Error(_)))),
+            }
             assert!(rx.recv().await.is_none());
         }
     }

@@ -1436,7 +1436,15 @@ fn isolated_cli_command(program: &str, home: &std::path::Path) -> std::process::
         .current_dir(home);
 
     // Native Windows needs these system environment variables to launch child processes and resolve networking
-    for var in ["SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "ComSpec", "COMSPEC", "PATHEXT"] {
+    for var in [
+        "SystemRoot",
+        "SYSTEMROOT",
+        "windir",
+        "WINDIR",
+        "ComSpec",
+        "COMSPEC",
+        "PATHEXT",
+    ] {
         if let Some(val) = std::env::var_os(var) {
             command.env(var, val);
         }
@@ -1645,7 +1653,11 @@ async fn run_binary_cli_lifecycle(reject: bool) {
             !worker_out.status.success(),
             "HTTP rejection must fail the CLI"
         );
-        assert!(String::from_utf8_lossy(&worker_out.stderr).contains("401"));
+        let worker_stderr = String::from_utf8_lossy(&worker_out.stderr);
+        assert!(
+            worker_stderr.contains("401"),
+            "HTTP rejection status missing from worker error: {worker_stderr}"
+        );
         assert!(
             completed.is_none(),
             "Failed inference must not emit a completed manifest"
@@ -1812,4 +1824,3 @@ fn test_conversation_recovery_and_export_lifecycle() {
     assert_eq!(parsed_messages[5].tool_call_id.as_deref(), Some("tc_2"));
     assert!(parsed_messages[5].content.contains("Interrupted"));
 }
-

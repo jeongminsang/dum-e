@@ -24,4 +24,6 @@ pub use runtime::{
     AgentRole, ResolvedProvider, RoleModelProfile, is_model_supported, is_transport_supported,
     resolve_model, resolve_provider, resolve_role_provider,
 };
-pub use types::{ChatMessage, Role, StreamEvent, ToolCall, ToolDefinition};
+pub use types::{
+    AttemptOutcome, ChatMessage, ProviderFailureKind, Role, StreamEvent, ToolCall, ToolDefinition,
+};

@@ -215,10 +215,11 @@ fn client() -> Result<Client> {
 
 async fn token_request(
     config: &OAuthProviderConfig,
+    token_url: &str,
     params: &[(&str, &str)],
 ) -> Result<OAuthTokenResponse> {
     let request = client()?
-        .post(config.token_url)
+        .post(token_url)
         .header("Accept", "application/json");
     let request = if config.client_id == ANTHROPIC_CLIENT_ID {
         request.json(
@@ -277,7 +278,7 @@ pub async fn exchange_code_for_token(
     if config.client_id == ANTHROPIC_CLIENT_ID {
         params.push(("state", state));
     }
-    let token = token_request(config, &params).await?;
+    let token = token_request(config, config.token_url, &params).await?;
     anyhow::ensure!(
         token.refresh_token.is_some(),
         "OAuth login response missing refresh token"
@@ -289,8 +290,17 @@ pub async fn refresh_oauth_token(
     config: &OAuthProviderConfig,
     refresh: &str,
 ) -> Result<OAuthTokenResponse> {
+    refresh_oauth_token_at(config, config.token_url, refresh).await
+}
+
+pub(crate) async fn refresh_oauth_token_at(
+    config: &OAuthProviderConfig,
+    token_url: &str,
+    refresh: &str,
+) -> Result<OAuthTokenResponse> {
     token_request(
         config,
+        token_url,
         &[
             ("grant_type", "refresh_token"),
             ("client_id", config.client_id),

@@ -1,10 +1,11 @@
 pub mod app;
 pub mod component;
 pub mod keybinding;
+pub mod program_status;
 pub mod theme;
 
 pub use app::{App, ResumeTarget, run_tui, run_tui_with_target};
-pub use keybinding::Action;
+pub use keybinding::{Action, KeyBindings};
 pub use theme::Theme;
 
 #[cfg(test)]

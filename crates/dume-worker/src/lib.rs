@@ -4,7 +4,9 @@ pub mod context;
 pub mod executor;
 pub mod host;
 pub mod ipc;
+pub mod mcp_runtime;
 pub mod output_limits;
+pub mod runtime;
 pub mod subagent_settings;
 pub mod tools;
 
@@ -13,4 +15,6 @@ pub use cancel::terminate_process_group;
 pub use executor::WorkerExecutor;
 pub use host::WorkerHost;
 pub use ipc::{HostToWorkerMessage, WorkerToHostMessage};
+pub use mcp_runtime::{McpRuntime, tool_search_definition};
+pub use runtime::{RunSession, ToolStart};
 pub use tools::LocalToolExecutor;

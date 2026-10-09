@@ -4,7 +4,8 @@ use crate::component::{
     render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
     render_resume_picker_modal, render_status_bar, render_transcript, render_update_modal,
 };
-use crate::keybinding::{Action, handle_key_event};
+use crate::keybinding::{Action, KeyBindings};
+use crate::program_status::{ProgramStatus, ProgramStatusReporter};
 use crate::theme::Theme;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream};
@@ -17,8 +18,10 @@ use dume_core::updater::UpdateInfo;
 use dume_provider::ModelInfo;
 use dume_provider::runtime::resolve_provider;
 use dume_provider::types::{ChatMessage, StreamEvent, ToolCall};
+use dume_store::{BoundaryResult, InputKind, RuntimeScope};
 use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
+use dume_worker::runtime::{RunSession, ToolStart};
 use dume_worker::subagent_settings::SubagentSettings;
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -26,6 +29,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -60,10 +64,6 @@ pub enum ResumeTarget {
 }
 
 enum PersistEvent {
-    Append {
-        conv_id: String,
-        msg: ChatMessage,
-    },
     Replace {
         conv_id: String,
         msgs: Vec<ChatMessage>,
@@ -139,7 +139,10 @@ pub fn repair_conversation_history(messages: &mut Vec<ChatMessage>) -> (bool, Op
                     for tc in &tool_calls {
                         if !existing_tool_ids.contains(&tc.id) {
                             let synth = ChatMessage::tool(
-                                format!("[Interrupted: session terminated before tool '{}' could complete]", tc.name),
+                                format!(
+                                    "[Interrupted: session terminated before tool '{}' could complete]",
+                                    tc.name
+                                ),
                                 tc.id.clone(),
                             );
                             messages.insert(j, synth);
@@ -174,10 +177,9 @@ pub fn repair_conversation_history(messages: &mut Vec<ChatMessage>) -> (bool, Op
 
 enum ConversationEvent {
     Stream(StreamEvent),
-    AssistantTurnCompleted(ChatMessage),
-    ToolTurnCompleted(ChatMessage),
     Compacted(Vec<ChatMessage>),
     Finished {
+        run_id: Option<String>,
         messages: Vec<ChatMessage>,
         error: Option<String>,
         session_id: Option<String>,
@@ -194,6 +196,7 @@ enum ConversationEvent {
         result: Result<std::path::PathBuf, String>,
     },
     BtwStreamDelta(String),
+    BtwRetrying,
     BtwFinished(Result<String, String>),
     CatalogRefreshFinished(Result<Option<usize>, String>),
 }
@@ -201,7 +204,13 @@ enum ConversationEvent {
 fn selectable_models() -> Vec<ModelInfo> {
     let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
     let authenticated: BTreeSet<_> = [
-        "anthropic", "openai", "google", "deepseek", "openai-codex", "opencode", "opencode-go",
+        "anthropic",
+        "openai",
+        "google",
+        "deepseek",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
     ]
     .into_iter()
     .filter(|provider| store.has_credential(provider))
@@ -210,7 +219,8 @@ fn selectable_models() -> Vec<ModelInfo> {
         .unwrap_or_default()
         .into_iter()
         .filter(|model| {
-            dume_provider::is_model_supported(model) && authenticated.contains(model.provider.as_str())
+            dume_provider::is_model_supported(model)
+                && authenticated.contains(model.provider.as_str())
         })
         .collect()
 }
@@ -219,7 +229,11 @@ fn subagent_command(command: &str, parent_model: &str, path: &std::path::Path) -
     let mut settings = SubagentSettings::load_from(path)?;
     if command == "/subagents" {
         let model = settings.model.as_deref().unwrap_or(parent_model);
-        let source = if settings.model.is_some() { "configured" } else { "inherited" };
+        let source = if settings.model.is_some() {
+            "configured"
+        } else {
+            "inherited"
+        };
         return Ok(format!(
             "Subagent model: {model} ({source})\nUse /subagents model <provider/model> or /subagents model inherit."
         ));
@@ -244,7 +258,9 @@ fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
         let result = dume_provider::ModelCatalog::refresh_codex_cache_if_stale()
             .await
             .map_err(|error| format!("{error:#}"));
-        let _ = tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+        let _ = tx
+            .send(ConversationEvent::CatalogRefreshFinished(result))
+            .await;
     });
 }
 
@@ -305,6 +321,7 @@ pub struct App {
     pub last_ctrl_c: Option<std::time::Instant>,
     pub available_update: Option<UpdateInfo>,
     pub session_usage: (i64, i64, i64, i64, i64), // (input, output, total, cache_read, cache_write)
+    pub session_usage_incomplete: usize,
     pub current_turn_usage: dume_provider::types::TokenUsage,
     pub session_id: String,
     pub prompt_history: Vec<String>,
@@ -313,6 +330,10 @@ pub struct App {
     pub busy_started_at: Option<std::time::Instant>,
     pub recent_sessions: Vec<RecentSessionSummary>,
     pub conversation_id: String,
+    pub current_run_id: Option<String>,
+    pub last_run_metrics: Option<dume_store::RunMetrics>,
+    pub session_elapsed_ms: i64,
+    pub session_timing_complete: bool,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -337,6 +358,166 @@ fn get_persisted_or_default_model(model: Option<&str>) -> String {
 
     // Default to gpt 5.6 luna (openai-codex/gpt-5.6-luna)
     "openai-codex/gpt-5.6-luna".to_string()
+}
+
+fn format_duration(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0).saturating_add(500) / 1000;
+    if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "DONE",
+        "failed" | "interrupted" => "ERROR",
+        "cancelled" => "CANCELLED",
+        "needs_attention" => "ATTENTION",
+        _ => "RUN",
+    }
+}
+
+fn format_session_metrics(metrics: &dume_store::ConversationRuntimeMetrics) -> String {
+    let mut text = format!("Session runs: {}", metrics.runs.len());
+    for run in &metrics.runs {
+        if !matches!(&run.scope, RuntimeScope::Conversation(_)) {
+            continue;
+        }
+        text.push_str(&format!(
+            "\n{} {}{}",
+            status_label(&run.status),
+            format_duration(run.elapsed_ms),
+            if run.timing_complete {
+                ""
+            } else {
+                " (lower bound)"
+            }
+        ));
+        for attempt in metrics
+            .model_attempts
+            .iter()
+            .filter(|attempt| attempt.run_id == run.run_id)
+        {
+            let duration = attempt
+                .duration_ms
+                .map(format_duration)
+                .unwrap_or_else(|| "time missing".into());
+            let usage = attempt
+                .usage
+                .as_ref()
+                .map(|usage| {
+                    let input = usage
+                        .get("input_tokens")
+                        .and_then(serde_json::Value::as_i64);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_i64);
+                    match (input, output) {
+                        (Some(input), Some(output)) => format!("usage in={input} out={output}"),
+                        _ => "usage missing/incomplete".into(),
+                    }
+                })
+                .unwrap_or_else(|| "usage missing".into());
+            text.push_str(&format!(
+                "\n  Model {}: {}{}; {}",
+                attempt.model,
+                duration,
+                if attempt.state == "failed" {
+                    " (failed/retry)"
+                } else {
+                    ""
+                },
+                usage
+            ));
+        }
+    }
+    for tool in &metrics.tool_executions {
+        text.push_str(&format!("\nTool {}", tool.name));
+    }
+    for attempt in &metrics.tool_attempts {
+        text.push_str(&format!(
+            "\n  Tool attempt {} {}",
+            attempt.state,
+            attempt
+                .duration_ms
+                .map(format_duration)
+                .unwrap_or_else(|| "time missing".into())
+        ));
+    }
+    text
+}
+
+fn refresh_session_timing(app: &mut App, store: &HarnessStore) -> Result<()> {
+    let metrics = store.conversation_runtime_metrics(&app.conversation_id)?;
+    let primary: Vec<_> = metrics
+        .runs
+        .iter()
+        .filter(|run| matches!(&run.scope, RuntimeScope::Conversation(_)))
+        .collect();
+    app.session_elapsed_ms = primary.iter().map(|run| run.elapsed_ms).sum();
+    app.session_timing_complete =
+        !primary.is_empty() && primary.iter().all(|run| run.timing_complete);
+    app.last_run_metrics = primary.last().map(|run| dume_store::RunMetrics {
+        run_id: run.run_id.clone(),
+        status: run.status.clone(),
+        elapsed_ms: run.elapsed_ms,
+        timing_complete: run.timing_complete,
+    });
+    let mut usage = (0i64, 0i64, 0i64, 0i64, 0i64);
+    let mut incomplete = 0;
+    for attempt in &metrics.model_attempts {
+        let Some(value) = attempt.usage.as_ref() else {
+            incomplete += 1;
+            continue;
+        };
+        let input = value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_i64);
+        let output = value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_i64);
+        if input.is_none() || output.is_none() {
+            incomplete += 1;
+        }
+        let input = input.unwrap_or(0);
+        let output = output.unwrap_or(0);
+        usage.0 += input;
+        usage.1 += output;
+        usage.2 += value
+            .get("total_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(input + output);
+        usage.3 += value
+            .get("cache_read_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        usage.4 += value
+            .get("cache_write_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+    }
+    app.session_usage = usage;
+    app.session_usage_incomplete = incomplete;
+    Ok(())
+}
+
+fn find_resumable_run(
+    store: &HarnessStore,
+    conversation_id: &str,
+    requested: &str,
+) -> Result<dume_store::RunRecord> {
+    let metrics = store.conversation_runtime_metrics(conversation_id)?;
+    metrics.runs.into_iter().rev().find(|run| {
+        (requested.is_empty() || run.run_id == requested)
+            && matches!(run.status.as_str(), "interrupted" | "needs_attention")
+            && store.tool_executions_for_run(&run.run_id).is_ok_and(|tools| tools.iter().all(|tool| tool.state != "outcome_unknown"))
+    }).ok_or_else(|| anyhow::anyhow!(if requested.is_empty() {
+        "No interrupted or resolved-attention run is resumable in this conversation."
+    } else {
+        "Run is not resumable here, is not paused for recovery, or has unresolved unsafe tool outcomes."
+    }))
 }
 
 pub fn persist_last_used_model(model: &str) {
@@ -408,6 +589,7 @@ impl App {
             last_ctrl_c: None,
             available_update: None,
             session_usage: (0, 0, 0, 0, 0),
+            session_usage_incomplete: 0,
             current_turn_usage: dume_provider::types::TokenUsage::default(),
             session_id: dume_provider::types::StreamRequestContext::new().session_id,
             prompt_history: Vec::new(),
@@ -416,6 +598,10 @@ impl App {
             busy_started_at: None,
             recent_sessions,
             conversation_id: dume_provider::types::StreamRequestContext::new().session_id,
+            current_run_id: None,
+            last_run_metrics: None,
+            session_elapsed_ms: 0,
+            session_timing_complete: false,
         }
     }
 
@@ -442,6 +628,7 @@ impl App {
                 "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
             ),
             ("/resume", "Resume a previous conversation session"),
+            ("/run", "Explicitly resume a paused durable run"),
             ("/subagents", "Show or set the model used by subagents"),
             (
                 "/login",
@@ -453,6 +640,12 @@ impl App {
             ),
             ("/update", "Check and install DUM-E in-place update"),
             ("/usage", "Display session token usage statistics"),
+            (
+                "/session",
+                "Display persisted run, model-attempt, and tool timing",
+            ),
+            ("/queue", "List, withdraw, or resume queued inputs"),
+            ("/follow-up", "Queue a follow-up input"),
             (
                 "/btw",
                 "Isolated side-question chat without tools or session pollution",
@@ -559,6 +752,10 @@ impl App {
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
                 self.streaming_text.push_str(&delta);
             }
+            ConversationEvent::Stream(StreamEvent::Retrying { .. }) => {
+                self.streaming_text.clear();
+                self.current_turn_usage = dume_provider::types::TokenUsage::default();
+            }
             ConversationEvent::Stream(StreamEvent::ToolCallDelta {
                 name,
                 arguments_delta,
@@ -574,38 +771,28 @@ impl App {
                 self.current_turn_usage.merge_cumulative(&usage);
             }
             ConversationEvent::Stream(StreamEvent::Completed { .. }) => {
-                self.session_usage.0 += self.current_turn_usage.input_tokens;
-                self.session_usage.1 += self.current_turn_usage.output_tokens;
-                self.session_usage.2 += self.current_turn_usage.total_tokens;
-                if let Some(r) = self.current_turn_usage.cache_read_tokens {
-                    self.session_usage.3 += r;
-                }
-                if let Some(w) = self.current_turn_usage.cache_write_tokens {
-                    self.session_usage.4 += w;
-                }
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
             }
             ConversationEvent::Stream(_) => {}
-            ConversationEvent::AssistantTurnCompleted(_) => {}
-            ConversationEvent::ToolTurnCompleted(_) => {}
             ConversationEvent::Compacted(_) => {}
-            ConversationEvent::Finished { messages, error, session_id } => {
+            ConversationEvent::Finished {
+                run_id,
+                messages,
+                error,
+                session_id,
+            } => {
+                if run_id
+                    .as_ref()
+                    .is_some_and(|run_id| self.current_run_id.as_deref() != Some(run_id.as_str()))
+                {
+                    return;
+                }
                 if let Some(session_id) = session_id {
                     self.session_id = session_id;
                 }
-                if self.current_turn_usage.input_tokens > 0 || self.current_turn_usage.output_tokens > 0 {
-                    self.session_usage.0 += self.current_turn_usage.input_tokens;
-                    self.session_usage.1 += self.current_turn_usage.output_tokens;
-                    self.session_usage.2 += self.current_turn_usage.total_tokens;
-                    if let Some(r) = self.current_turn_usage.cache_read_tokens {
-                        self.session_usage.3 += r;
-                    }
-                    if let Some(w) = self.current_turn_usage.cache_write_tokens {
-                        self.session_usage.4 += w;
-                    }
-                    self.current_turn_usage = dume_provider::types::TokenUsage::default();
-                }
+                self.current_turn_usage = dume_provider::types::TokenUsage::default();
                 self.messages = messages;
+
                 if let Some(error) = error {
                     self.messages
                         .push(ChatMessage::ui_notice(format!("Error: {}", error)));
@@ -617,7 +804,8 @@ impl App {
             ConversationEvent::OAuthComplete { provider, result } => {
                 match result {
                     Ok(()) => {
-                        self.session_id = dume_provider::types::StreamRequestContext::new().session_id;
+                        self.session_id =
+                            dume_provider::types::StreamRequestContext::new().session_id;
                         self.messages.push(ChatMessage::ui_notice(format!(
                             "Successfully authenticated {}! You can now use this provider.",
                             provider
@@ -685,6 +873,14 @@ impl App {
                     *is_streaming = true;
                 }
             }
+            ConversationEvent::BtwRetrying => {
+                if let ModalState::BtwChat {
+                    streaming_reply, ..
+                } = &mut self.modal
+                {
+                    streaming_reply.clear();
+                }
+            }
             ConversationEvent::BtwFinished(res) => {
                 if let ModalState::BtwChat {
                     history,
@@ -694,11 +890,9 @@ impl App {
                 } = &mut self.modal
                 {
                     *is_streaming = false;
-                    let reply = match res {
-                        Ok(text) => text,
-                        Err(e) => format!("Error: {}", e),
-                    };
-                    history.push(("assistant".to_string(), reply));
+                    if let Ok(text) = res {
+                        history.push(("assistant".to_string(), text));
+                    }
                     streaming_reply.clear();
                 }
             }
@@ -714,29 +908,45 @@ impl App {
                         filter,
                         provider_tabs,
                         active_tab_idx,
-                    } = &mut self.modal {
-                        let selected = filtered.get(*selected_idx).map(|m| (m.provider.clone(), m.id.clone()));
-                        let active_provider = provider_tabs.get(*active_tab_idx).cloned().unwrap_or_default();
+                    } = &mut self.modal
+                    {
+                        let selected = filtered
+                            .get(*selected_idx)
+                            .map(|m| (m.provider.clone(), m.id.clone()));
+                        let active_provider = provider_tabs
+                            .get(*active_tab_idx)
+                            .cloned()
+                            .unwrap_or_default();
                         *models = selectable_models();
                         *provider_tabs = std::iter::once("All".to_string())
                             .chain(models.iter().map(|m| m.provider.clone()))
                             .collect::<BTreeSet<_>>()
                             .into_iter()
                             .collect();
-                        if let Some(index) = provider_tabs.iter().position(|p| p == &active_provider) {
+                        if let Some(index) =
+                            provider_tabs.iter().position(|p| p == &active_provider)
+                        {
                             *active_tab_idx = index;
                         } else {
                             *active_tab_idx = 0;
                         }
                         let tab = &provider_tabs[*active_tab_idx];
                         let query = filter.to_lowercase();
-                        *filtered = models.iter().filter(|m| {
-                            (tab == "All" || &m.provider == tab)
-                                && (m.id.to_lowercase().contains(&query)
-                                    || m.provider.to_lowercase().contains(&query))
-                        }).cloned().collect();
+                        *filtered = models
+                            .iter()
+                            .filter(|m| {
+                                (tab == "All" || &m.provider == tab)
+                                    && (m.id.to_lowercase().contains(&query)
+                                        || m.provider.to_lowercase().contains(&query))
+                            })
+                            .cloned()
+                            .collect();
                         *selected_idx = selected
-                            .and_then(|(provider, id)| filtered.iter().position(|m| m.provider == provider && m.id == id))
+                            .and_then(|(provider, id)| {
+                                filtered
+                                    .iter()
+                                    .position(|m| m.provider == provider && m.id == id)
+                            })
                             .unwrap_or(0);
                     }
                 }
@@ -786,6 +996,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     model: &str,
     target: ResumeTarget,
 ) -> Result<()> {
+    let keybindings = KeyBindings::load_default()?;
     let mut reader = EventStream::new();
     let (stream_tx, mut stream_rx) = mpsc::channel::<ConversationEvent>(100);
     let cancellation = CancellationToken::new();
@@ -802,15 +1013,22 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut initial_conversation_id = dume_provider::types::StreamRequestContext::new().session_id;
     let mut initial_messages = Vec::new();
     let mut initial_model = model.to_string();
-    let mut initial_provider_session_id = dume_provider::types::StreamRequestContext::new().session_id;
+    let mut initial_provider_session_id =
+        dume_provider::types::StreamRequestContext::new().session_id;
     let mut pending_interrupted_prompt = None;
     let mut initial_modal = ModalState::None;
     let mut resume_notice = None;
 
     match target {
         ResumeTarget::None => {
-            let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
-            resume_notice = detect_interrupted_session_notice(&harness_store, &cwd, &initial_conversation_id);
+            let _ = harness_store.create_conversation(
+                &initial_conversation_id,
+                &cwd,
+                &initial_model,
+                &initial_provider_session_id,
+            );
+            resume_notice =
+                detect_interrupted_session_notice(&harness_store, &cwd, &initial_conversation_id);
         }
         ResumeTarget::Latest => {
             if let Ok(Some(rec)) = harness_store.latest_conversation_for_cwd(&cwd) {
@@ -820,64 +1038,116 @@ async fn run_app<B: ratatui::backend::Backend>(
                         initial_model = loaded_rec.model.clone();
                         initial_provider_session_id = loaded_rec.provider_session_id.clone();
                         for mr in msg_recs {
-                            if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                            if let Ok(chat_msg) =
+                                serde_json::from_str::<ChatMessage>(&mr.message_json)
+                            {
                                 initial_messages.push(chat_msg);
                             }
                         }
-                        let (was_repaired, prompt) = repair_conversation_history(&mut initial_messages);
+                        let (was_repaired, prompt) =
+                            repair_conversation_history(&mut initial_messages);
                         pending_interrupted_prompt = prompt;
-                        let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                        let short_id = if loaded_rec.id.len() >= 8 {
+                            &loaded_rec.id[..8]
+                        } else {
+                            &loaded_rec.id
+                        };
                         resume_notice = Some(if was_repaired {
-                            format!("Resumed conversation {} (recovered from interrupted state).", short_id)
+                            format!(
+                                "Resumed conversation {} (recovered from interrupted state).",
+                                short_id
+                            )
                         } else {
                             format!("Resumed conversation {}.", short_id)
                         });
                     }
                     Err(e) => {
-                        let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
-                        resume_notice = Some(format!("Failed to load previous conversation: {}. Started new session.", e));
+                        let _ = harness_store.create_conversation(
+                            &initial_conversation_id,
+                            &cwd,
+                            &initial_model,
+                            &initial_provider_session_id,
+                        );
+                        resume_notice = Some(format!(
+                            "Failed to load previous conversation: {}. Started new session.",
+                            e
+                        ));
                     }
                 }
             } else {
-                let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
-                resume_notice = Some("No previous conversation found in this directory. Started new session.".to_string());
+                let _ = harness_store.create_conversation(
+                    &initial_conversation_id,
+                    &cwd,
+                    &initial_model,
+                    &initial_provider_session_id,
+                );
+                resume_notice = Some(
+                    "No previous conversation found in this directory. Started new session."
+                        .to_string(),
+                );
             }
         }
         ResumeTarget::Id(target_id) => {
-            let found = harness_store.load_conversation(&target_id).ok().or_else(|| {
-                let list = harness_store.list_conversations(None, 50).ok()?;
-                let matched = list.into_iter().find(|c| c.id.starts_with(&target_id))?;
-                harness_store.load_conversation(&matched.id).ok()
-            });
+            let found = harness_store
+                .load_conversation(&target_id)
+                .ok()
+                .or_else(|| {
+                    let list = harness_store.list_conversations(None, 50).ok()?;
+                    let matched = list.into_iter().find(|c| c.id.starts_with(&target_id))?;
+                    harness_store.load_conversation(&matched.id).ok()
+                });
             match found {
                 Some((loaded_rec, msg_recs)) => {
                     initial_conversation_id = loaded_rec.id.clone();
                     initial_model = loaded_rec.model.clone();
                     initial_provider_session_id = loaded_rec.provider_session_id.clone();
                     for mr in msg_recs {
-                        if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json) {
+                        if let Ok(chat_msg) = serde_json::from_str::<ChatMessage>(&mr.message_json)
+                        {
                             initial_messages.push(chat_msg);
                         }
                     }
                     let (was_repaired, prompt) = repair_conversation_history(&mut initial_messages);
                     pending_interrupted_prompt = prompt;
-                    let short_id = if loaded_rec.id.len() >= 8 { &loaded_rec.id[..8] } else { &loaded_rec.id };
+                    let short_id = if loaded_rec.id.len() >= 8 {
+                        &loaded_rec.id[..8]
+                    } else {
+                        &loaded_rec.id
+                    };
                     resume_notice = Some(if was_repaired {
-                        format!("Resumed conversation {} (recovered from interrupted state).", short_id)
+                        format!(
+                            "Resumed conversation {} (recovered from interrupted state).",
+                            short_id
+                        )
                     } else {
                         format!("Resumed conversation {}.", short_id)
                     });
                 }
                 None => {
-                    let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
-                    resume_notice = Some(format!("Conversation '{}' not found. Started new session.", target_id));
+                    let _ = harness_store.create_conversation(
+                        &initial_conversation_id,
+                        &cwd,
+                        &initial_model,
+                        &initial_provider_session_id,
+                    );
+                    resume_notice = Some(format!(
+                        "Conversation '{}' not found. Started new session.",
+                        target_id
+                    ));
                 }
             }
         }
         ResumeTarget::Picker { all_dirs } => {
-            let _ = harness_store.create_conversation(&initial_conversation_id, &cwd, &initial_model, &initial_provider_session_id);
+            let _ = harness_store.create_conversation(
+                &initial_conversation_id,
+                &cwd,
+                &initial_model,
+                &initial_provider_session_id,
+            );
             let query_cwd = if all_dirs { None } else { Some(cwd.as_str()) };
-            let sessions = harness_store.list_recent_conversations(query_cwd, 20).unwrap_or_default();
+            let sessions = harness_store
+                .list_recent_conversations(query_cwd, 20)
+                .unwrap_or_default();
             initial_modal = ModalState::ResumePicker {
                 sessions,
                 selected_idx: 0,
@@ -888,7 +1158,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut conversation_lock = match ConversationLock::try_acquire(&initial_conversation_id) {
         Ok(l) => l,
         Err(e) => {
-            return Err(anyhow::anyhow!("Failed to acquire lock for conversation '{}': {}", initial_conversation_id, e));
+            return Err(anyhow::anyhow!(
+                "Failed to acquire lock for conversation '{}': {}",
+                initial_conversation_id,
+                e
+            ));
         }
     };
 
@@ -896,6 +1170,28 @@ async fn run_app<B: ratatui::backend::Backend>(
     app.conversation_id = initial_conversation_id.clone();
     app.session_id = initial_provider_session_id;
     app.messages = initial_messages;
+    match harness_store.conversation_runtime_metrics(&app.conversation_id) {
+        Ok(metrics) => {
+            let primary: Vec<_> = metrics
+                .runs
+                .iter()
+                .filter(|run| matches!(&run.scope, RuntimeScope::Conversation(_)))
+                .collect();
+            app.session_elapsed_ms = primary.iter().map(|run| run.elapsed_ms).sum();
+            app.session_timing_complete =
+                !primary.is_empty() && primary.iter().all(|run| run.timing_complete);
+            app.last_run_metrics = primary.last().map(|run| dume_store::RunMetrics {
+                run_id: run.run_id.clone(),
+                status: run.status.clone(),
+                elapsed_ms: run.elapsed_ms,
+                timing_complete: run.timing_complete,
+            });
+        }
+        Err(error) => app.messages.push(ChatMessage::ui_notice(format!(
+            "Could not load session timing: {error}"
+        ))),
+    }
+    let _ = refresh_session_timing(&mut app, &harness_store);
     app.modal = initial_modal;
     if let Some(prompt) = pending_interrupted_prompt {
         app.input_buffer = prompt;
@@ -910,13 +1206,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     let persist_handle = tokio::spawn(async move {
         while let Some(event) = persist_rx.recv().await {
             match event {
-                PersistEvent::Append { conv_id, msg } => {
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        let _ = store_for_persist.append_conversation_message(&conv_id, &json);
-                    }
-                }
                 PersistEvent::Replace { conv_id, msgs } => {
-                    let json_vec: Vec<String> = msgs.iter().filter_map(|m| serde_json::to_string(m).ok()).collect();
+                    let json_vec: Vec<String> = msgs
+                        .iter()
+                        .filter_map(|m| serde_json::to_string(m).ok())
+                        .collect();
                     let _ = store_for_persist.replace_conversation_messages(&conv_id, &json_vec);
                 }
                 PersistEvent::Status { conv_id, status } => {
@@ -926,17 +1220,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
     });
 
-    let mut raw_dispatcher = ToolDispatcher::new(
-        std::env::current_dir()?,
-        &app.model,
-        cancellation.clone(),
-    );
+    let mut raw_dispatcher =
+        ToolDispatcher::new(std::env::current_dir()?, &app.model, cancellation.clone());
     raw_dispatcher = raw_dispatcher.with_store(harness_store.clone());
     let dispatcher = Arc::new(Mutex::new(raw_dispatcher));
     let mut task = None;
+    let mut btw_tasks: Vec<(CancellationToken, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut status_reporter = ProgramStatusReporter::new(io::stdout().is_terminal());
 
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -963,7 +1256,9 @@ async fn run_app<B: ratatui::backend::Backend>(
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result.map_err(|error| format!("{error:#}")));
-        let _ = catalog_tx.send(ConversationEvent::CatalogRefreshFinished(result)).await;
+        let _ = catalog_tx
+            .send(ConversationEvent::CatalogRefreshFinished(result))
+            .await;
     });
     spawn_codex_catalog_refresh(stream_tx.clone());
 
@@ -1031,6 +1326,17 @@ async fn run_app<B: ratatui::backend::Backend>(
 
             let update_str = app.available_update.as_ref().map(|u| u.latest_version.as_str());
             let elapsed_secs = app.busy_started_at.map(|t| t.elapsed().as_secs_f32());
+            let last_run = app.last_run_metrics.as_ref().map(|m| {
+                let d = format_duration(m.elapsed_ms);
+                let outcome = status_label(&m.status);
+                if m.timing_complete { format!("{outcome} {d}") } else { format!("{outcome} 최소 {d}") }
+            });
+            let session_elapsed = if app.session_timing_complete {
+                Some(format_duration(app.session_elapsed_ms))
+            } else if app.session_elapsed_ms > 0 {
+                Some(format!("최소 {}", format_duration(app.session_elapsed_ms)))
+            } else { None };
+            let session_usage = format!("TOKENS {}{}", app.session_usage.2, if app.session_usage_incomplete > 0 { format!(" +{} incomplete", app.session_usage_incomplete) } else { String::new() });
             render_status_bar(
                 f,
                 chunks[2],
@@ -1038,6 +1344,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.thinking,
                 app.is_busy,
                 elapsed_secs,
+                last_run.as_deref(),
+                session_elapsed.as_deref(),
+                Some(&session_usage),
                 anim_tick,
                 update_str,
                 &app.theme,
@@ -1545,52 +1854,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let model_name = app.model.clone();
                                             let btw_history = history.clone();
                                             let tx = stream_tx.clone();
+                                            let store = harness_store.clone();
+                                            let parent_id = app.conversation_id.clone();
+                                            let cwd = cwd.clone();
+                                            let cancellation = cancellation.child_token();
+                                            let task_cancel = cancellation.clone();
 
-                                            tokio::spawn(async move {
-                                                let cred_store = dume_provider::CredentialStore::new(
-                                                    dume_provider::CredentialStore::default_path(),
-                                                );
-                                                let provider_res = dume_provider::runtime::resolve_provider(&model_name, &cred_store).await;
-                                                match provider_res {
-                                                    Ok(provider) => {
-                                                        let mut msgs = vec![
-                                                            ChatMessage::system("You are a helpful coding assistant answering a quick side-question without tools. Keep your answer direct and concise.")
-                                                        ];
-                                                        for (r, content) in btw_history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
-                                                            if r == "user" {
-                                                                msgs.push(ChatMessage::user(content));
-                                                            } else {
-                                                                msgs.push(ChatMessage::assistant(content));
-                                                            }
-                                                        }
-                                                        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(50);
-                                                        let stream_tx = tx.clone();
-                                                        let btw_ctx = dume_provider::types::StreamRequestContext::new();
-                                                        tokio::spawn(async move {
-                                                            let _ = provider.stream_with_context(&msgs, &[], Some(&btw_ctx), sub_tx).await;
-                                                        });
-                                                        let mut full_text = String::new();
-                                                        while let Some(evt) = sub_rx.recv().await {
-                                                            match evt {
-                                                                StreamEvent::TextDelta(d) => {
-                                                                    full_text.push_str(&d);
-                                                                    let _ = stream_tx.send(ConversationEvent::BtwStreamDelta(d)).await;
-                                                                }
-                                                                StreamEvent::Completed { .. } => break,
-                                                                StreamEvent::Error(err) => {
-                                                                    let _ = stream_tx.send(ConversationEvent::BtwFinished(Err(err))).await;
-                                                                    return;
-                                                                }
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                        let _ = stream_tx.send(ConversationEvent::BtwFinished(Ok(full_text))).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx.send(ConversationEvent::BtwFinished(Err(e.to_string()))).await;
-                                                    }
-                                                }
+                                            let handle = tokio::spawn(async move {
+                                                let result = run_btw_request(
+                                                    &model_name, &cwd, &parent_id, btw_history, store,
+                                                    cancellation, tx.clone(),
+                                                    |model, messages, context, events| async move {
+                                                        let provider = dume_provider::runtime::resolve_provider(
+                                                            &model,
+                                                            &dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path()),
+                                                        ).await?;
+                                                        provider.stream_with_context(&messages, &[], Some(&context), events).await
+                                                    },
+                                                ).await;
+                                                let _ = tx.send(ConversationEvent::BtwFinished(result)).await;
                                             });
+                                            btw_tasks.push((task_cancel, handle));
                                         }
                                     } else if let crossterm::event::KeyCode::Char(c) = key.code {
                                         input.push(c);
@@ -1621,6 +1905,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
                                         crossterm::event::KeyCode::Enter => {
+                                            if app.is_busy {
+                                                app.messages.push(ChatMessage::ui_notice("Cannot switch conversations while a run is active; the picker remains open."));
+                                                continue;
+                                            }
                                             let target_id = sessions.get(*selected_idx).map(|s| s.session_id.clone());
                                             app.modal = ModalState::None;
                                             if let Some(session_id) = target_id {
@@ -1630,6 +1918,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                             Ok((loaded_rec, msg_recs)) => {
                                                                 conversation_lock = new_lock;
                                                                 app.conversation_id = loaded_rec.id.clone();
+                                                                let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
@@ -1672,7 +1961,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             let autocomplete_items = app.get_autocomplete_items();
                             let is_autocomplete_active = !autocomplete_items.is_empty();
 
-                            match handle_key_event(key) {
+                            match keybindings.action(key) {
                                 Action::Quit => {
                                     // 1. If currently busy streaming, first Ctrl+C cancels the active turn
                                     if app.is_busy {
@@ -1794,6 +2083,30 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.input_buffer = selected.name.clone();
                                     }
 
+                                    if app.is_busy && !app.input_buffer.trim().is_empty() {
+                                        let draft = app.input_buffer.trim();
+                                        let (kind, content) = draft.strip_prefix("/follow-up ")
+                                            .map(|content| (InputKind::FollowUp, content.trim()))
+                                            .unwrap_or((InputKind::Steer, draft));
+                                        if content.is_empty() { continue; }
+                                        let request_id = dume_provider::types::StreamRequestContext::new().request_id;
+                                        match harness_store.admit_input(
+                                            RuntimeScope::Conversation(app.conversation_id.clone()),
+                                            &request_id,
+                                            kind,
+                                            &content,
+                                        ) {
+                                            Ok(_) => {
+                                                app.input_buffer.clear();
+                                                app.cursor_pos = 0;
+                                            }
+                                            Err(error) => app.messages.push(ChatMessage::ui_notice(
+                                                format!("Could not queue steer: {error}"),
+                                            )),
+                                        }
+                                        continue;
+                                    }
+
                                     if !app.input_buffer.trim().is_empty() && !app.is_busy {
                                         let content = std::mem::take(&mut app.input_buffer);
                                         app.cursor_pos = 0;
@@ -1802,7 +2115,121 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.autocomplete_index = 0;
 
                                         let trimmed = content.trim();
-                                        if trimmed == "/model" || trimmed == "/model " {
+                                        if trimmed == "/follow-up" || trimmed.starts_with("/follow-up ") {
+                                            let follow_up = trimmed.strip_prefix("/follow-up").unwrap_or("").trim();
+                                            if follow_up.is_empty() {
+                                                app.input_buffer = content;
+                                                app.cursor_pos = app.input_buffer.chars().count();
+                                                continue;
+                                            }
+                                            let request_id = dume_provider::types::StreamRequestContext::new().request_id;
+                                            match harness_store.admit_input(
+                                                RuntimeScope::Conversation(app.conversation_id.clone()),
+                                                &request_id,
+                                                InputKind::FollowUp,
+                                                follow_up,
+                                            ) {
+                                                Ok(_) => app.messages.push(ChatMessage::ui_notice("Follow-up queued.")),
+                                                Err(error) => {
+                                                    app.input_buffer = content;
+                                                    app.cursor_pos = app.input_buffer.chars().count();
+                                                    app.messages.push(ChatMessage::ui_notice(format!("Could not queue follow-up: {error}")));
+                                                }
+                                            }
+                                            continue;
+                                        } else if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
+                                            let operation = trimmed.strip_prefix("/mcp").unwrap_or("").trim();
+                                            let mut active_dispatcher = dispatcher.lock().await;
+                                            let result = match operation {
+                                                "" | "list" | "status" => {
+                                                    let status = active_dispatcher.mcp_status();
+                                                    if status.is_empty() { "MCP is not initialized for an admitted conversation run.".to_string() } else { status }
+                                                }
+                                                "refresh" => match active_dispatcher.refresh_mcp().await {
+                                                    Ok(()) => active_dispatcher.mcp_status(),
+                                                    Err(error) => format!("MCP refresh failed: {error:#}"),
+                                                },
+                                                _ => "Usage: /mcp [list|status|refresh]".to_string(),
+                                            };
+                                            app.messages.push(ChatMessage::ui_notice(result));
+                                            continue;
+                                        } else if trimmed == "/run resume" || trimmed.starts_with("/run resume ") {
+                                            let run_id = trimmed.strip_prefix("/run resume").unwrap_or("").trim();
+                                            let result = (|| -> Result<String> {
+                                                if app.is_busy { anyhow::bail!("A conversation run is already active."); }
+                                                let candidate = find_resumable_run(&harness_store, &app.conversation_id, run_id)?;
+                                                let run_id = candidate.run_id;
+                                                let history = harness_store.conversation_history(&app.conversation_id)?;
+                                                let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
+                                                app.current_run_id = Some(run_id.clone());
+                                                app.is_busy = true;
+                                                app.busy_started_at = Some(std::time::Instant::now());
+                                                let model_name = app.model.clone();
+                                                let session_id = app.session_id.clone();
+                                                let run_cancel = cancellation.child_token();
+                                                current_stream_cancel = Some(run_cancel.clone());
+                                                task = Some(spawn_admitted_run(
+                                                    model_name, session_id, messages, stream_tx.clone(), dispatcher.clone(),
+                                                    run_cancel, harness_store.clone(), app.conversation_id.clone(), run_id.clone(),
+                                                ));
+                                                Ok(format!("Resuming paused run {run_id} without submitting new input."))
+                                            })();
+                                            app.messages.push(ChatMessage::ui_notice(match result {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Cannot resume run: {error:#}"),
+                                            }));
+                                            continue;
+                                        } else if trimmed.starts_with("/queue") {
+                                            let args = trimmed.strip_prefix("/queue").unwrap_or("").trim();
+                                            let scope = RuntimeScope::Conversation(app.conversation_id.clone());
+                                            let mut resumed_receipt = None;
+                                            let result = if args.is_empty() || args == "list" {
+                                                harness_store.inbox(&scope, &["pending", "paused"])
+                                                    .map(|rows| {
+                                                        if rows.is_empty() { "Queue is empty.".to_string() }
+                                                        else { rows.into_iter().map(|row| format!("#{} {:?} [{}] {}", row.input_id, row.kind, row.state, row.payload)).collect::<Vec<_>>().join("\n") }
+                                                    })
+                                            } else if let Some(id) = args.strip_prefix("withdraw ") {
+                                                id.parse::<i64>().map_err(|_| dume_store::StoreError::InvalidSessionState("Usage: /queue withdraw <input-id>".into()))
+                                                    .and_then(|id| harness_store.withdraw_input(&scope, id).map(|removed| if removed { format!("Withdrew queued input #{id}.") } else { format!("Input #{id} is no longer withdrawable.") }))
+                                            } else if let Some(id) = args.strip_prefix("resume ") {
+                                                id.parse::<i64>().map_err(|_| dume_store::StoreError::InvalidSessionState("Usage: /queue resume <input-id>".into()))
+                                                    .and_then(|id| harness_store.reactivate_paused_input(&scope, id).map(|receipt| {
+                                                        let message = format!("Reactivated input #{id} ({}) as {:?}.", receipt.disposition, receipt.run_id);
+                                                        resumed_receipt = Some(receipt);
+                                                        message
+                                                    }))
+                                            } else {
+                                                Err(dume_store::StoreError::InvalidSessionState("Usage: /queue [list|withdraw <input-id>|resume <input-id>]".into()))
+                                            };
+                                            app.messages.push(ChatMessage::ui_notice(match result {
+                                                Ok(message) => message,
+                                                Err(error) => {
+                                                    app.input_buffer = content.clone();
+                                                    app.cursor_pos = app.input_buffer.chars().count();
+                                                    format!("Queue operation failed: {error}")
+                                                },
+                                            }));
+                                            if !app.is_busy {
+                                                if let Some(run_id) = resumed_receipt.and_then(|receipt| receipt.run_id) {
+                                                    let history = harness_store.conversation_history(&app.conversation_id)?;
+                                                    let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
+                                                    app.current_run_id = Some(run_id.clone());
+                                                    app.is_busy = true;
+                                                    app.busy_started_at = Some(std::time::Instant::now());
+                                                    let model_name = app.model.clone();
+                                                    let session_id = app.session_id.clone();
+                                                    let tx = stream_tx.clone();
+                                                    let run_cancel = cancellation.child_token();
+                                                    current_stream_cancel = Some(run_cancel.clone());
+                                                    let task_dispatcher = dispatcher.clone();
+                                                    let store = harness_store.clone();
+                                                    let conversation_id = app.conversation_id.clone();
+                                                    task = Some(spawn_admitted_run(model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id));
+                                                }
+                                            }
+                                            continue;
+                                        } else if trimmed == "/model" || trimmed == "/model " {
                                             let models = selectable_models();
 
                                             if models.is_empty() {
@@ -1910,11 +2337,37 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             continue;
                                         } else if trimmed == "/usage" {
-                                            let (input, output, total, cache_read, cache_write) = app.session_usage;
-                                            app.messages.push(ChatMessage::ui_notice(format!(
-                                                "Session Token Usage:\n  Input Tokens:       {}\n  Output Tokens:      {}\n  Total Tokens:       {}\n  Cache Read Tokens:  {}\n  Cache Write Tokens: {}",
-                                                input, output, total, cache_read, cache_write
-                                            )));
+                                            match harness_store.conversation_runtime_metrics(&app.conversation_id) {
+                                                Ok(metrics) => {
+                                                    let mut input = 0i64;
+                                                    let mut output = 0i64;
+                                                    let mut missing = 0usize;
+                                                    for attempt in &metrics.model_attempts {
+                                                        if let Some(usage) = &attempt.usage {
+                                                            match (usage.get("input_tokens").and_then(serde_json::Value::as_i64), usage.get("output_tokens").and_then(serde_json::Value::as_i64)) {
+                                                                (Some(i), Some(o)) => { input += i; output += o; }
+                                                                _ => missing += 1,
+                                                            }
+                                                        } else { missing += 1; }
+                                                    }
+                                                    app.messages.push(ChatMessage::ui_notice(format!("Persisted model-attempt usage: input={input}, output={output}, total={}, missing attempts={missing}", input + output)));
+                                                }
+                                                Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not load usage metrics: {error}"))),
+                                            }
+                                            continue;
+                                        } else if trimmed == "/session" {
+                                            match harness_store.conversation_runtime_metrics(&app.conversation_id) {
+                                                Ok(metrics) => {
+                                                    let mut report = format_session_metrics(&metrics);
+                                                    let auxiliary_id = format!("btw:{}", app.conversation_id);
+                                                    if let Ok(auxiliary) = harness_store.conversation_runtime_metrics(&auxiliary_id) {
+                                                        report.push_str("\n\nAuxiliary /btw usage (separate from primary session):");
+                                                        report.push_str(&format_session_metrics(&auxiliary));
+                                                    }
+                                                    app.messages.push(ChatMessage::ui_notice(report));
+                                                }
+                                                Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not load session metrics: {error}"))),
+                                            }
                                             continue;
                                         } else if trimmed == "/btw" || trimmed.starts_with("/btw ") {
                                             let initial_query = if trimmed.starts_with("/btw ") {
@@ -1930,15 +2383,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             };
                                             continue;
                                         } else if trimmed == "/clear" {
+                                            let scope = RuntimeScope::Conversation(app.conversation_id.clone());
+                                            let active = harness_store.active_run(&scope)?;
+                                            let needs_attention = harness_store.conversation_runtime_metrics(&app.conversation_id)?
+                                                .runs.iter().any(|run| run.status == "needs_attention");
+                                            if app.is_busy || active.is_some() || needs_attention {
+                                                app.input_buffer = content;
+                                                app.cursor_pos = app.input_buffer.chars().count();
+                                                app.messages.push(ChatMessage::ui_notice("Cannot clear while a run is active or needs attention."));
+                                                continue;
+                                            }
+                                            if let Err(error) = harness_store.replace_conversation_messages(&app.conversation_id, &[]) {
+                                                app.input_buffer = content;
+                                                app.cursor_pos = app.input_buffer.chars().count();
+                                                app.messages.push(ChatMessage::ui_notice(format!("Could not clear conversation: {error}")));
+                                                continue;
+                                            }
                                             app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             app.messages.clear();
                                             app.streaming_text.clear();
                                             app.auto_scroll = true;
                                             app.scroll_offset = 0;
-                                            let _ = persist_tx.send(PersistEvent::Replace {
-                                                conv_id: app.conversation_id.clone(),
-                                                msgs: Vec::new(),
-                                            });
                                             continue;
                                         } else if trimmed == "/resume" || trimmed.starts_with("/resume ") {
                                             let arg = trimmed.strip_prefix("/resume").unwrap_or("").trim();
@@ -1963,6 +2428,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                             Ok(new_lock) => {
                                                                 conversation_lock = new_lock;
                                                                 app.conversation_id = loaded_rec.id.clone();
+                                                                let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
@@ -2026,6 +2492,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         }
                                                         Ok(None) => {
                                                             let _ = update_tx.send(ConversationEvent::Finished {
+                                                                run_id: None,
                                                                 messages: vec![ChatMessage::ui_notice(format!(
                                                                     "DUM-E is already up to date (v{}).",
                                                                     current_version
@@ -2036,6 +2503,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         }
                                                         Err(e) => {
                                                             let _ = update_tx.send(ConversationEvent::Finished {
+                                                                run_id: None,
                                                                 messages: vec![ChatMessage::ui_notice(format!(
                                                                     "Update check failed: {}",
                                                                     e
@@ -2051,7 +2519,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else if trimmed == "/help" {
                                             app.skills.reload();
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /resume [all|<id>]        - Resume a previous session\n  /subagents                - Show subagent model setting\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /resume [all|<id>]        - Resume a previous conversation session\n  /run resume [run-id]      - Explicitly resume a paused run in this conversation\n  /queue resume <input-id> - Reactivate a paused queued input\n  /subagents                - Show or set the model used by subagents\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {
@@ -2089,10 +2557,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 app.history_index = None;
                                                 app.temp_input.clear();
                                                 app.messages.push(ChatMessage::user(format!("/{}", cmd)));
-                                                let _ = persist_tx.send(PersistEvent::Append {
-                                                    conv_id: app.conversation_id.clone(),
-                                                    msg: ChatMessage::user(format!("/{}", cmd)),
-                                                });
                                                 app.messages.push(ChatMessage::ui_notice(format!("Loaded skill '{}': {}", skill.name, skill.description)));
                                                 app.is_busy = true;
                                                 app.busy_started_at = Some(std::time::Instant::now());
@@ -2107,9 +2571,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 let dispatcher = dispatcher.clone();
                                                 let child_cancel = cancellation.child_token();
                                                 current_stream_cancel = Some(child_cancel.clone());
+                                                let run_input = format!("/{}", cmd);
+                                                let client_id = dume_provider::types::StreamRequestContext::new().request_id;
+                                                let run_id = match harness_store.admit_input(RuntimeScope::Conversation(app.conversation_id.clone()), &client_id, InputKind::Submit, &run_input) {
+                                                    Ok(receipt) => receipt.run_id.expect("submission starts run"),
+                                                    Err(error) => {
+                                                        app.messages.push(ChatMessage::ui_notice(format!("Could not admit skill run: {error}")));
+                                                        app.is_busy = false;
+                                                        continue;
+                                                    }
+                                                };
+                                                app.current_run_id = Some(run_id.clone());
+                                                let store = harness_store.clone();
+                                                let conversation_id = app.conversation_id.clone();
 
                                                 task = Some(tokio::spawn(async move {
-                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
+                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id).await;
                                                 }));
                                                 continue;
                                             } else {
@@ -2124,11 +2601,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.prompt_history.push(content.clone());
                                         app.history_index = None;
                                         app.temp_input.clear();
+                                        let client_id = dume_provider::types::StreamRequestContext::new().request_id;
+                                        let receipt = match harness_store.admit_input(
+                                            RuntimeScope::Conversation(app.conversation_id.clone()),
+                                            &client_id,
+                                            InputKind::Submit,
+                                            &content,
+                                        ) {
+                                            Ok(receipt) => receipt,
+                                            Err(error) => {
+                                                app.messages.push(ChatMessage::ui_notice(format!("Could not admit input: {error}")));
+                                                app.input_buffer = content;
+                                                app.cursor_pos = app.input_buffer.chars().count();
+                                                continue;
+                                            }
+                                        };
                                         app.messages.push(ChatMessage::user(content.clone()));
-                                        let _ = persist_tx.send(PersistEvent::Append {
-                                            conv_id: app.conversation_id.clone(),
-                                            msg: ChatMessage::user(content.clone()),
-                                        });
                                         app.is_busy = true;
                                         app.busy_started_at = Some(std::time::Instant::now());
 
@@ -2140,10 +2628,52 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         let dispatcher = dispatcher.clone();
                                         let child_cancel = cancellation.child_token();
                                         current_stream_cancel = Some(child_cancel.clone());
+                                        let run_id = receipt.run_id.expect("admitted submission creates a run");
+                                        app.current_run_id = Some(run_id.clone());
+                                        let store = harness_store.clone();
+                                        let conversation_id = app.conversation_id.clone();
 
                                         task = Some(tokio::spawn(async move {
-                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel).await;
+                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id).await;
                                         }));
+                                    }
+                                }
+                                Action::SubmitFollowUp => {
+                                    if app.input_buffer.trim().is_empty() { continue; }
+                                    let content = app.input_buffer.trim().to_owned();
+                                    let request_id = dume_provider::types::StreamRequestContext::new().request_id;
+                                    match harness_store.admit_input(
+                                        RuntimeScope::Conversation(app.conversation_id.clone()),
+                                        &request_id,
+                                        InputKind::FollowUp,
+                                        &content,
+                                    ) {
+                                        Ok(receipt) => {
+                                            app.input_buffer.clear();
+                                            app.cursor_pos = 0;
+                                            app.messages.push(ChatMessage::ui_notice(format!("Follow-up queued ({})", receipt.disposition)));
+                                            if !app.is_busy {
+                                                if let Some(run_id) = receipt.run_id {
+                                                    let history = harness_store.conversation_history(&app.conversation_id)?;
+                                                    let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
+                                                    app.current_run_id = Some(run_id.clone());
+                                                    app.is_busy = true;
+                                                    app.busy_started_at = Some(std::time::Instant::now());
+                                                    let model_name = app.model.clone();
+                                                    let session_id = app.session_id.clone();
+                                                    let tx = stream_tx.clone();
+                                                    let run_cancel = cancellation.child_token();
+                                                    current_stream_cancel = Some(run_cancel.clone());
+                                                    let task_dispatcher = dispatcher.clone();
+                                                    let store = harness_store.clone();
+                                                    let conversation_id = app.conversation_id.clone();
+                                                    task = Some(tokio::spawn(async move {
+                                                        dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id).await;
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                        Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not queue follow-up: {error}"))),
                                     }
                                 }
                                 Action::None => {}
@@ -2167,24 +2697,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
             Some(stream_event) = stream_rx.recv() => {
+                let finished_run_id = match &stream_event {
+                    ConversationEvent::Finished { run_id: Some(run_id), .. }
+                        if app.current_run_id.as_deref() == Some(run_id.as_str()) => Some(run_id.clone()),
+                    _ => None,
+                };
                 if let ConversationEvent::OAuthComplete { provider, result: Ok(()) } = &stream_event {
                     if provider == "openai-codex" {
                         spawn_codex_catalog_refresh(stream_tx.clone());
                     }
                 }
                 match &stream_event {
-                    ConversationEvent::AssistantTurnCompleted(msg) => {
-                        let _ = persist_tx.send(PersistEvent::Append {
-                            conv_id: app.conversation_id.clone(),
-                            msg: msg.clone(),
-                        });
-                    }
-                    ConversationEvent::ToolTurnCompleted(msg) => {
-                        let _ = persist_tx.send(PersistEvent::Append {
-                            conv_id: app.conversation_id.clone(),
-                            msg: msg.clone(),
-                        });
-                    }
                     ConversationEvent::Compacted(msgs) => {
                         let _ = persist_tx.send(PersistEvent::Replace {
                             conv_id: app.conversation_id.clone(),
@@ -2194,6 +2717,52 @@ async fn run_app<B: ratatui::backend::Backend>(
                     _ => {}
                 }
                 app.receive(stream_event);
+                if let Some(finished_run_id) = finished_run_id {
+                    if app.current_run_id.as_deref() == Some(finished_run_id.as_str()) {
+                        let _ = refresh_session_timing(&mut app, &harness_store);
+                        match harness_store.run_metrics(&finished_run_id) {
+                            Ok(metric) => {
+                                app.last_run_metrics = Some(metric.clone());
+                                match harness_store.conversation_runtime_metrics(&app.conversation_id) {
+                                    Ok(metrics) => {
+                                        let primary: Vec<_> = metrics.runs.iter().filter(|run| matches!(&run.scope, RuntimeScope::Conversation(_))).collect();
+                                        app.session_elapsed_ms = primary.iter().map(|run| run.elapsed_ms).sum();
+                                        app.session_timing_complete = !primary.is_empty() && primary.iter().all(|run| run.timing_complete);
+                                    }
+                                    Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not refresh session timing: {error}"))),
+                                }
+                                let duration = format_duration(metric.elapsed_ms);
+                                let duration = if metric.timing_complete { duration } else { format!("최소 {duration}") };
+                                app.messages.push(ChatMessage::ui_notice(format!("Run {} {} ({})", status_label(&metric.status), duration, metric.run_id)));
+                            }
+                            Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Run finished, but timing could not be loaded: {error}"))),
+                        }
+                    }
+                    let scope = RuntimeScope::Conversation(app.conversation_id.clone());
+                    if let Some(next_run) = harness_store.active_run(&scope)?
+                        .filter(|run| run.run_id != finished_run_id && run.status == "queued")
+                    {
+                        let history = harness_store.conversation_history(&app.conversation_id)?;
+                        let messages = history.iter()
+                            .filter_map(|row| serde_json::from_str(&row.message_json).ok())
+                            .collect();
+                        let run_id = next_run.run_id;
+                        app.current_run_id = Some(run_id.clone());
+                        app.is_busy = true;
+                        app.busy_started_at = Some(std::time::Instant::now());
+                        let model_name = app.model.clone();
+                        let session_id = app.session_id.clone();
+                        let tx = stream_tx.clone();
+                        let run_cancel = cancellation.child_token();
+                        current_stream_cancel = Some(run_cancel.clone());
+                        let task_dispatcher = dispatcher.clone();
+                        let store = harness_store.clone();
+                        let conversation_id = app.conversation_id.clone();
+                        task = Some(tokio::spawn(async move {
+                            dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id).await;
+                        }));
+                    }
+                }
             }
             _ = wait_for_signal(&mut sighup, &mut sigterm) => {
                 let _ = persist_tx.send(PersistEvent::Status {
@@ -2209,6 +2778,19 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        let state = if cancellation.is_cancelled() {
+            ProgramStatus::Idle
+        } else if matches!(&app.modal, ModalState::LoginSelector { .. } | ModalState::ApiKeyInput { .. } | ModalState::CodexOAuthWaiting { .. }) {
+            ProgramStatus::BlockedAuth
+        } else if app.is_busy || btw_tasks.iter().any(|(_, handle)| !handle.is_finished()) {
+            ProgramStatus::Working
+        } else {
+            ProgramStatus::Idle
+        };
+        let mut stdout = io::stdout().lock();
+        status_reporter.emit(&mut stdout, state)?;
+        stdout.flush()?;
+
       }
       Ok(())
     }.await;
@@ -2221,12 +2803,45 @@ async fn run_app<B: ratatui::backend::Backend>(
     let _ = persist_handle.await;
 
     cancellation.cancel();
+    for (token, _) in &btw_tasks {
+        token.cancel();
+    }
     stream_rx.close();
     if let Some(task) = task {
         let _ = task.await;
     }
+    for (_, task) in btw_tasks {
+        let _ = task.await;
+    }
     dispatcher.lock().await.cancel_all().await;
     result
+}
+
+fn spawn_admitted_run(
+    model: String,
+    session_id: String,
+    messages: Vec<ChatMessage>,
+    tx: mpsc::Sender<ConversationEvent>,
+    dispatcher: Arc<Mutex<ToolDispatcher>>,
+    cancellation: CancellationToken,
+    store: Arc<HarnessStore>,
+    conversation_id: String,
+    run_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        dispatch_stream(
+            &model,
+            session_id,
+            messages,
+            tx,
+            dispatcher,
+            cancellation,
+            store,
+            conversation_id,
+            run_id,
+        )
+        .await;
+    })
 }
 
 async fn dispatch_stream(
@@ -2236,21 +2851,130 @@ async fn dispatch_stream(
     tx: mpsc::Sender<ConversationEvent>,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
     cancellation: CancellationToken,
+    store: Arc<HarnessStore>,
+    conversation_id: String,
+    run_id: String,
 ) {
+    let session_result = match store.get_run(&run_id) {
+        Ok(record) if matches!(record.status.as_str(), "interrupted" | "needs_attention") => {
+            RunSession::resume(store.clone(), &run_id, &conversation_id)
+        }
+        _ => RunSession::start(
+            store.clone(),
+            RuntimeScope::Conversation(conversation_id.clone()),
+            &run_id,
+            &conversation_id,
+        ),
+    };
+    let run_session = match session_result {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = tx
+                .send(ConversationEvent::Finished {
+                    run_id: Some(run_id.clone()),
+                    messages,
+                    error: Some(format!("Could not start durable run: {error:#}")),
+                    session_id: Some(session_id),
+                })
+                .await;
+            return;
+        }
+    };
     let mut dispatcher = dispatcher.lock().await;
     dispatcher.set_model(model);
-    let result = dispatch_authenticated(
-        model,
-        &mut session_id,
-        &mut messages,
-        &tx,
-        &mut dispatcher,
-        &cancellation,
-    )
-    .await;
+    if let Err(error) = run_session
+        .with_checkpoints(&cancellation, dispatcher.initialize_mcp(&conversation_id))
+        .await
+    {
+        let _ = run_session.settle(
+            "failed",
+            Some(&format!("MCP initialization failed: {error:#}")),
+        );
+        drop(dispatcher);
+        drop(run_session);
+        let _ = tx
+            .send(ConversationEvent::Finished {
+                run_id: Some(run_id),
+                messages,
+                error: Some(format!("MCP initialization failed: {error:#}")),
+                session_id: Some(session_id),
+            })
+            .await;
+        return;
+    }
+    match run_session
+        .with_checkpoints(&cancellation, dispatcher.replay_pending_tools(&run_session))
+        .await
+    {
+        Ok(replayed) => {
+            messages.extend(replayed);
+        }
+        Err(error) => {
+            let _ = run_session.settle(
+                "needs_attention",
+                Some(&format!(
+                    "Tool recovery requires operator review: {error:#}"
+                )),
+            );
+            drop(dispatcher);
+            drop(run_session);
+            let _ = tx
+                .send(ConversationEvent::Finished {
+                    run_id: Some(run_id),
+                    messages,
+                    error: Some(format!("Tool recovery requires operator review: {error:#}")),
+                    session_id: Some(session_id),
+                })
+                .await;
+            return;
+        }
+    }
+    let result = run_session
+        .with_checkpoints(
+            &cancellation,
+            dispatch_authenticated(
+                model,
+                &mut session_id,
+                &mut messages,
+                &tx,
+                &mut dispatcher,
+                &cancellation,
+                &run_session,
+            ),
+        )
+        .await;
+    if cancellation.is_cancelled() {
+        let _ = run_session.store().cancel_run(run_session.token());
+    }
     dispatcher.cancel_all().await;
+    let unknown_outcome = run_session
+        .store()
+        .tool_executions_for_run(&run_session.token().run_id)
+        .map(|items| items.iter().any(|item| item.state == "outcome_unknown"))
+        .unwrap_or(false);
+    let terminal = if cancellation.is_cancelled() {
+        "cancelled"
+    } else if unknown_outcome {
+        "needs_attention"
+    } else if result.is_ok() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let reason = result.as_ref().err().map(|error| {
+        let rendered = format!("{error:#}");
+        if rendered.contains("turn limit") {
+            format!("turn_limit: {rendered}")
+        } else {
+            rendered
+        }
+    });
+    let _ = run_session.settle(terminal, reason.as_deref());
+    drop(dispatcher);
+    drop(run_session);
     let _ = tx
         .send(ConversationEvent::Finished {
+            run_id: Some(run_id),
             messages,
             error: result.as_ref().err().map(|error| format!("{error:#}")),
             session_id: Some(session_id),
@@ -2272,11 +2996,16 @@ fn model_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut payload = vec![ChatMessage::system(
         dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT,
     )];
-    payload.extend(messages.iter().filter(|message| {
-        message.is_model_visible()
-            && !(message.role == dume_provider::Role::System
-                && message.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT)
-    }).cloned());
+    payload.extend(
+        messages
+            .iter()
+            .filter(|message| {
+                message.is_model_visible()
+                    && !(message.role == dume_provider::Role::System
+                        && message.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT)
+            })
+            .cloned(),
+    );
     payload
 }
 
@@ -2287,14 +3016,20 @@ async fn dispatch_authenticated(
     tx: &mpsc::Sender<ConversationEvent>,
     dispatcher: &mut ToolDispatcher,
     cancellation: &CancellationToken,
+    run_session: &RunSession,
 ) -> Result<String> {
-    if !messages.iter().any(|m| m.role == dume_provider::Role::System && m.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT) {
-        messages.insert(0, ChatMessage::system(dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT));
+    if !messages.iter().any(|m| {
+        m.role == dume_provider::Role::System
+            && m.content == dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT
+    }) {
+        messages.insert(
+            0,
+            ChatMessage::system(dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT),
+        );
     }
     let cred_store =
         dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
     let model = model.to_string();
-    let tools = dispatcher.tool_definitions_for_session(session_id);
     let store = dispatcher.store().cloned();
     let session_state = Arc::new(std::sync::Mutex::new(DispatchState {
         session_id: session_id.clone(),
@@ -2305,22 +3040,23 @@ async fn dispatch_authenticated(
         messages,
         tx,
         dispatcher,
+        session_id,
         cancellation,
+        Some(run_session),
         10,
-        |raw_messages, tx| {
+        |raw_messages, tools, request_session_id, tx| {
             let cred_store = cred_store.clone();
             let model = model.clone();
-            let tools = tools.clone();
             let store = store.clone();
             let session_state = Arc::clone(&session_state);
             async move {
                 let mut raw_messages = raw_messages;
                 let before = raw_messages.clone();
-                let mut session_id = session_state
+                let mut session_id = request_session_id;
+                session_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Dispatch state lock poisoned"))?
-                    .session_id
-                    .clone();
+                    .session_id = session_id.clone();
                 let compacted = dume_worker::context::prepare_request_context(
                     dume_worker::context::RequestContext {
                         model: &model,
@@ -2369,7 +3105,9 @@ async fn dispatch_authenticated(
     };
     result?;
     if had_compaction {
-        let _ = tx.send(ConversationEvent::Compacted(messages.clone())).await;
+        let _ = tx
+            .send(ConversationEvent::Compacted(messages.clone()))
+            .await;
     }
     Ok(new_session_id)
 }
@@ -2385,12 +3123,27 @@ struct StreamTurn {
 }
 
 impl StreamTurn {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn push(&mut self, event: &StreamEvent) -> Result<()> {
         if let StreamEvent::Error(error) = event {
             anyhow::bail!("Model streaming error: {}", error);
         }
+        if let StreamEvent::ProviderError { message, .. } = event {
+            anyhow::bail!("Provider error: {}", message);
+        }
+        if matches!(event, StreamEvent::Retrying { .. }) {
+            self.reset();
+            return Ok(());
+        }
         anyhow::ensure!(
-            self.finish_reason.is_none(),
+            self.finish_reason.is_none()
+                || matches!(
+                    event,
+                    StreamEvent::AttemptStarted { .. } | StreamEvent::AttemptFinished { .. }
+                ),
             "Stream event after completion"
         );
         match event {
@@ -2426,6 +3179,10 @@ impl StreamTurn {
                 call.arguments.push_str(arguments_delta);
             }
             StreamEvent::Usage(_) => {}
+            StreamEvent::AttemptStarted { .. }
+            | StreamEvent::AttemptFinished { .. }
+            | StreamEvent::ProviderError { .. }
+            | StreamEvent::Retrying { .. } => {}
             StreamEvent::Completed { finish_reason } => {
                 self.finish_reason = Some(finish_reason.clone())
             }
@@ -2470,29 +3227,135 @@ impl StreamTurn {
     }
 }
 
+async fn run_btw_request<F, Fut>(
+    model: &str,
+    cwd: &str,
+    primary_id: &str,
+    history: Vec<(String, String)>,
+    store: Arc<HarnessStore>,
+    cancellation: CancellationToken,
+    tx: mpsc::Sender<ConversationEvent>,
+    stream: F,
+) -> Result<String, String>
+where
+    F: FnOnce(
+        String,
+        Vec<ChatMessage>,
+        dume_provider::types::StreamRequestContext,
+        mpsc::Sender<StreamEvent>,
+    ) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let result: anyhow::Result<ChatMessage> = async {
+        let conversation_id = format!("btw:{primary_id}");
+        if store.load_conversation(&conversation_id).is_err() {
+            store.create_conversation(
+                &conversation_id, cwd, model,
+                &dume_provider::types::StreamRequestContext::new().session_id,
+            )?;
+        }
+        let scope = RuntimeScope::Conversation(conversation_id.clone());
+        let prompt = history.last().filter(|(role, _)| role == "user")
+            .map(|(_, text)| text.as_str()).unwrap_or("");
+        let context = dume_provider::types::StreamRequestContext::new();
+        let receipt = store.admit_input(scope, &context.request_id, InputKind::Submit, prompt)?;
+        let run_id = receipt.run_id.ok_or_else(|| anyhow::anyhow!("auxiliary admission produced no run"))?;
+        let session = RunSession::start(store.clone(), RuntimeScope::Conversation(conversation_id.clone()), &run_id, &conversation_id)?;
+        let mut messages = vec![ChatMessage::system(
+            "You are a helpful coding assistant answering a quick side-question without tools. Keep your answer direct and concise.",
+        )];
+        for (role, content) in history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+            if role == "user" { messages.push(ChatMessage::user(content)); }
+            else { messages.push(ChatMessage::assistant(content)); }
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(50);
+        let collect = async {
+            let mut turn = StreamTurn::default();
+            while let Some(event) = event_rx.recv().await {
+                session.record_model_event(&event)?;
+                if matches!(event, StreamEvent::AttemptFinished { .. }) { session.checkpoint()?; }
+                if matches!(event, StreamEvent::Retrying { .. }) {
+                    turn.reset();
+                    tx.send(ConversationEvent::BtwRetrying).await?;
+                }
+                if let StreamEvent::TextDelta(text) = &event {
+                    tx.send(ConversationEvent::BtwStreamDelta(text.clone())).await?;
+                }
+                turn.push(&event)?;
+            }
+            turn.finish().and_then(|(assistant, calls)| {
+                anyhow::ensure!(calls.is_empty(), "tool calls are disabled for /btw");
+                Ok(assistant)
+            })
+        };
+        let operation = async {
+            tokio::try_join!(stream(model.to_string(), messages, context, event_tx), collect).map(|(_, msg)| msg)
+        };
+        let result = session.with_checkpoints(&cancellation, async {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => anyhow::bail!("Auxiliary request cancelled"),
+                result = operation => result,
+            }
+        }).await;
+        let result = result.and_then(|assistant| {
+            session.record_assistant(&assistant)?;
+            Ok(assistant)
+        });
+        let terminal = if cancellation.is_cancelled() { "cancelled" } else if result.is_ok() { "succeeded" } else { "failed" };
+        let reason = result.as_ref().err().map(|error| format!("{error:#}"));
+        session.settle(terminal, reason.as_deref())?;
+        result
+    }.await;
+    result
+        .map(|message| message.content)
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn run_conversation<F, Fut>(
     messages: &mut Vec<ChatMessage>,
     tx: &mpsc::Sender<ConversationEvent>,
     dispatcher: &mut ToolDispatcher,
+    session_id: &mut String,
     cancellation: &CancellationToken,
+    run_session: Option<&RunSession>,
     max_turns: usize,
     mut stream: F,
 ) -> Result<()>
 where
-    F: FnMut(Vec<ChatMessage>, mpsc::Sender<StreamEvent>) -> Fut,
+    F: FnMut(
+        Vec<ChatMessage>,
+        Vec<dume_provider::types::ToolDefinition>,
+        String,
+        mpsc::Sender<StreamEvent>,
+    ) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<ChatMessage>>>,
 {
     for _ in 0..max_turns {
+        dispatcher.refresh_mcp().await?;
+        let tools = dispatcher.tool_definitions_for_session(session_id);
         let (sub_tx, mut sub_rx) = mpsc::channel(100);
         let collect = async {
             let mut turn = StreamTurn::default();
             while let Some(event) = sub_rx.recv().await {
+                if let Some(session) = run_session {
+                    session.record_model_event(&event)?;
+                    if matches!(event, StreamEvent::AttemptFinished { .. }) {
+                        session.checkpoint()?;
+                    }
+                }
+                if matches!(event, StreamEvent::Retrying { .. }) {
+                    turn.reset();
+                }
                 turn.push(&event)?;
                 if matches!(
                     event,
                     StreamEvent::TextDelta(_)
                         | StreamEvent::ToolCallDelta { .. }
                         | StreamEvent::Usage(_)
+                        | StreamEvent::AttemptStarted { .. }
+                        | StreamEvent::AttemptFinished { .. }
+                        | StreamEvent::Retrying { .. }
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }
@@ -2503,29 +3366,116 @@ where
         let (prepared_messages, (assistant, tool_calls)) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
-            result = async { tokio::try_join!(stream(messages.clone(), sub_tx), collect) } => result?,
+            result = async { tokio::try_join!(stream(messages.clone(), tools, session_id.clone(), sub_tx), collect) } => result?,
         };
         *messages = prepared_messages;
         messages.push(assistant.clone());
-        let _ = tx.send(ConversationEvent::AssistantTurnCompleted(assistant)).await;
+        let executions = if let Some(session) = run_session {
+            Some(session.prepare_tools(&assistant)?)
+        } else {
+            None
+        };
         if tool_calls.is_empty() {
+            dispatcher.cancel_all().await;
+            anyhow::ensure!(!cancellation.is_cancelled(), "Conversation cancelled");
+            if let Some(session) = run_session {
+                match session.boundary()? {
+                    BoundaryResult::Continue(inputs) => {
+                        for input in inputs {
+                            messages.push(ChatMessage::user(input.payload));
+                        }
+                        dispatcher.initialize_mcp(session.conversation_id()).await?;
+                        continue;
+                    }
+                    BoundaryResult::Terminal | BoundaryResult::NextRun(_) => return Ok(()),
+                }
+            }
             return Ok(());
         }
-        for call in tool_calls {
+        for (index, call) in tool_calls.into_iter().enumerate() {
             let name = call.name.clone();
             tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
                 "\n[Tool execution: {}]\n",
                 name
             ))))
             .await?;
-            let tool_res = dispatcher.execute(call, &messages).await?;
+            let started =
+                if let (Some(session), Some(executions)) = (run_session, executions.as_ref()) {
+                    Some((session, session.begin_tool(&executions[index])?))
+                } else {
+                    None
+                };
+            let call_id = call.id.clone();
+            let started_at = std::time::Instant::now();
+            let tool_res = match started {
+                Some((_, ToolStart::Cached { result })) => {
+                    serde_json::from_str::<ChatMessage>(&result)?
+                }
+                Some((session, ToolStart::Execute { attempt_id })) => {
+                    match dispatcher.execute(call, &messages).await {
+                        Ok(tool_res) => {
+                            session.finish_tool(
+                                &executions.as_ref().expect("durable tool list")[index],
+                                &attempt_id,
+                                &tool_res,
+                                started_at.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                            )?;
+                            session.checkpoint()?;
+                            tool_res
+                        }
+                        Err(error) => {
+                            let execution = &executions.as_ref().expect("durable tool list")[index];
+                            let elapsed =
+                                started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                            if let Some(failure) =
+                                error.downcast_ref::<dume_worker::tools::KnownToolFailure>()
+                            {
+                                let tool_res = ChatMessage::tool(failure.output.clone(), call_id);
+                                session.finish_tool_error(
+                                    execution,
+                                    &attempt_id,
+                                    &tool_res,
+                                    elapsed,
+                                )?;
+                                session.checkpoint()?;
+                                tool_res
+                            } else {
+                                session.mark_tool_unknown(
+                                    execution,
+                                    &attempt_id,
+                                    &format!("{error:#}"),
+                                    elapsed,
+                                )?;
+                                dispatcher.cancel_all().await;
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                None => match dispatcher.execute(call, &messages).await {
+                    Ok(tool_res) => tool_res,
+                    Err(error) => {
+                        if let Some(failure) =
+                            error.downcast_ref::<dume_worker::tools::KnownToolFailure>()
+                        {
+                            ChatMessage::tool(failure.output.clone(), call_id)
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                },
+            };
             messages.push(tool_res.clone());
-            let _ = tx.send(ConversationEvent::ToolTurnCompleted(tool_res)).await;
             tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
                 "[Finished {}]\n",
                 name
             ))))
             .await?;
+        }
+        if let Some(session) = run_session {
+            for input in session.consume_steer()? {
+                messages.push(ChatMessage::user(input.payload));
+            }
         }
     }
     anyhow::bail!("Conversation turn limit reached ({})", max_turns)
@@ -2552,38 +3502,201 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn btw_retry_keeps_failed_usage_but_only_returns_successful_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            HarnessStore::open(dir.path().join("harness.db"), &dir.path().join("artifacts"))
+                .unwrap(),
+        );
+        store
+            .create_conversation("primary", "/tmp", "fake/model", "primary-provider-session")
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let reply = run_btw_request(
+            "fake/model",
+            "/tmp",
+            "primary",
+            vec![("user".into(), "question".into())],
+            store.clone(),
+            CancellationToken::new(),
+            tx,
+            |_, _, context, events| async move {
+                let send = |event| events.send(event);
+                send(StreamEvent::AttemptStarted {
+                    context: context.clone(),
+                    model: "fake/model".into(),
+                })
+                .await
+                .unwrap();
+                send(StreamEvent::TextDelta("provisional".into()))
+                    .await
+                    .unwrap();
+                send(StreamEvent::Usage(dume_provider::types::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    total_tokens: 5,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+                send(StreamEvent::AttemptFinished {
+                    context: context.clone(),
+                    model: "fake/model".into(),
+                    outcome: dume_provider::types::AttemptOutcome::Failed,
+                    duration_ms: 10,
+                    usage: Some(dume_provider::types::TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        total_tokens: 5,
+                        ..Default::default()
+                    }),
+                    error: Some("retry".into()),
+                })
+                .await
+                .unwrap();
+                send(StreamEvent::Retrying {
+                    next_attempt: 2,
+                    delay_ms: 0,
+                    reason: "retry".into(),
+                })
+                .await
+                .unwrap();
+                let retry_context = dume_provider::types::StreamRequestContext::new();
+                send(StreamEvent::AttemptStarted {
+                    context: retry_context.clone(),
+                    model: "fake/model".into(),
+                })
+                .await
+                .unwrap();
+                send(StreamEvent::TextDelta("answer".into())).await.unwrap();
+                send(completed("stop")).await.unwrap();
+                send(StreamEvent::AttemptFinished {
+                    context: retry_context,
+                    model: "fake/model".into(),
+                    outcome: dume_provider::types::AttemptOutcome::Succeeded,
+                    duration_ms: 10,
+                    usage: None,
+                    error: None,
+                })
+                .await
+                .unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "answer");
+        while rx.try_recv().is_ok() {}
+        let metrics = store.conversation_runtime_metrics("btw:primary").unwrap();
+        assert_eq!(metrics.model_attempts.len(), 2);
+        assert_eq!(metrics.model_attempts[0].state, "failed");
+        assert!(metrics.model_attempts[0].usage.is_some());
+        assert_eq!(metrics.runs[0].status, "succeeded");
+        assert!(
+            store
+                .conversation_runtime_metrics("primary")
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+        let saved = store.conversation_history("btw:primary").unwrap();
+        assert_eq!(saved.len(), 2);
+        let user: ChatMessage = serde_json::from_str(&saved[0].message_json).unwrap();
+        assert_eq!(user, ChatMessage::user("question"));
+        let assistant: ChatMessage = serde_json::from_str(&saved[1].message_json).unwrap();
+        assert_eq!(assistant.content, "answer");
+    }
+
+    #[tokio::test]
+    async fn btw_cancellation_is_joined_and_retains_checkpointed_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            HarnessStore::open(dir.path().join("harness.db"), &dir.path().join("artifacts"))
+                .unwrap(),
+        );
+        store
+            .create_conversation("primary", "/tmp", "fake/model", "primary-provider-session")
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let task_cancel = cancellation.clone();
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            let (tx, _rx) = mpsc::channel(32);
+            run_btw_request(
+                "fake/model",
+                "/tmp",
+                "primary",
+                vec![("user".into(), "question".into())],
+                task_store,
+                task_cancel,
+                tx,
+                |_, _, context, events| async move {
+                    events
+                        .send(StreamEvent::AttemptStarted {
+                            context,
+                            model: "fake/model".into(),
+                        })
+                        .await
+                        .unwrap();
+                    events
+                        .send(StreamEvent::Usage(dume_provider::types::TokenUsage {
+                            input_tokens: 7,
+                            output_tokens: 4,
+                            total_tokens: 11,
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap();
+                    std::future::pending::<Result<()>>().await
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cancellation.cancel();
+        assert!(task.await.unwrap().is_err());
+        let metrics = store.conversation_runtime_metrics("btw:primary").unwrap();
+        assert_eq!(metrics.runs[0].status, "cancelled");
+        assert_eq!(metrics.model_attempts.len(), 1);
+        let usage = metrics.model_attempts[0].usage.as_ref().unwrap();
+        assert_eq!(usage["input_tokens"].as_i64(), Some(7));
+        assert_eq!(usage["output_tokens"].as_i64(), Some(4));
+        assert!(
+            store
+                .conversation_runtime_metrics("primary")
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+    }
+
     #[test]
     fn credential_changes_rotate_session_identity_only_after_success() {
         let dir = tempfile::tempdir().unwrap();
         let store = dume_provider::CredentialStore::new(dir.path().join("credentials.json"));
         let mut session_id = "before-login".to_string();
 
-        assert!(save_credential_and_rotate_session(
-            &store,
-            "openai",
-            "test-key",
-            &mut session_id,
-        )
-        .is_ok());
+        assert!(
+            save_credential_and_rotate_session(&store, "openai", "test-key", &mut session_id,)
+                .is_ok()
+        );
         assert_ne!(session_id, "before-login");
         assert!(store.has_credential("openai"));
 
         let logged_in_session = session_id.clone();
-        assert!(save_credential_and_rotate_session(
-            &store,
-            "openai-codex",
-            "invalid-api-key",
-            &mut session_id,
-        )
-        .is_err());
+        assert!(
+            save_credential_and_rotate_session(
+                &store,
+                "openai-codex",
+                "invalid-api-key",
+                &mut session_id,
+            )
+            .is_err()
+        );
         assert_eq!(session_id, logged_in_session);
 
-        assert!(delete_credential_and_rotate_session(
-            &store,
-            "openai",
-            &mut session_id,
-        )
-        .is_ok());
+        assert!(delete_credential_and_rotate_session(&store, "openai", &mut session_id,).is_ok());
         assert_ne!(session_id, logged_in_session);
         assert!(!store.has_credential("openai"));
     }
@@ -2592,17 +3705,18 @@ mod tests {
     fn subagent_command_persists_model_and_rejects_invalid_selection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subagents.json");
-        assert!(subagent_command("/subagents", "parent/model", &path)
-            .unwrap()
-            .contains("parent/model (inherited)"));
+        assert!(
+            subagent_command("/subagents", "parent/model", &path)
+                .unwrap()
+                .contains("parent/model (inherited)")
+        );
 
         subagent_command("/subagents model openai/gpt-5.4", "parent/model", &path).unwrap();
         assert_eq!(
             SubagentSettings::load_from(&path).unwrap().model.as_deref(),
             Some("openai/gpt-5.4")
         );
-        assert!(subagent_command("/subagents model no-such-model", "parent/model", &path)
-            .is_err());
+        assert!(subagent_command("/subagents model no-such-model", "parent/model", &path).is_err());
         assert_eq!(
             SubagentSettings::load_from(&path).unwrap().model.as_deref(),
             Some("openai/gpt-5.4")
@@ -2628,6 +3742,141 @@ mod tests {
         assert!(app.streaming_text.is_empty());
     }
 
+    #[tokio::test]
+    async fn durable_cached_and_failed_tools_reach_the_next_model_payload() {
+        for cached in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store =
+                Arc::new(HarnessStore::in_memory(directory.path().join("artifacts")).unwrap());
+            store
+                .create_conversation(
+                    "durable",
+                    directory.path().to_str().unwrap(),
+                    "test",
+                    "session",
+                )
+                .unwrap();
+            let scope = RuntimeScope::Conversation("durable".into());
+            let receipt = store
+                .admit_input(scope.clone(), "request", InputKind::Submit, "read")
+                .unwrap();
+            let session = RunSession::start(
+                store.clone(),
+                scope,
+                receipt.run_id.as_deref().unwrap(),
+                "durable",
+            )
+            .unwrap();
+            let arguments = r#"{"path":"missing.txt"}"#;
+            if cached {
+                let mut turn = StreamTurn::default();
+                turn.push(&delta(0, Some("read-once"), Some("read_file"), arguments))
+                    .unwrap();
+                turn.push(&completed("tool_calls")).unwrap();
+                let (assistant, _) = turn.finish().unwrap();
+                let execution = session.prepare_tools(&assistant).unwrap().remove(0);
+                let ToolStart::Execute { attempt_id } = session.begin_tool(&execution).unwrap()
+                else {
+                    panic!("new execution expected")
+                };
+                session
+                    .finish_tool(
+                        &execution,
+                        &attempt_id,
+                        &ChatMessage::tool("saved reply", "read-once"),
+                        0,
+                    )
+                    .unwrap();
+            }
+            let mut dispatcher =
+                ToolDispatcher::new(directory.path(), "test", CancellationToken::new())
+                    .with_store(store.clone());
+            let mut messages = vec![ChatMessage::user("read")];
+            let mut requests = Vec::new();
+            let mut provider_session = "session".to_string();
+            let (tx, _rx) = mpsc::channel(100);
+            run_conversation(
+                &mut messages,
+                &tx,
+                &mut dispatcher,
+                &mut provider_session,
+                &CancellationToken::new(),
+                Some(&session),
+                3,
+                |history, _, context, events| {
+                    requests.push(history.clone());
+                    let first = requests.len() == 1;
+                    let context = dume_provider::types::StreamRequestContext::for_session(context);
+                    async move {
+                        events
+                            .send(StreamEvent::AttemptStarted {
+                                context: context.clone(),
+                                model: "test".into(),
+                            })
+                            .await
+                            .unwrap();
+                        if first {
+                            events
+                                .send(delta(0, Some("read-once"), Some("read_file"), arguments))
+                                .await
+                                .unwrap();
+                            events.send(completed("tool_calls")).await.unwrap();
+                        } else {
+                            events
+                                .send(StreamEvent::TextDelta("finished".into()))
+                                .await
+                                .unwrap();
+                            events.send(completed("stop")).await.unwrap();
+                        }
+                        events
+                            .send(StreamEvent::AttemptFinished {
+                                context,
+                                model: "test".into(),
+                                outcome: dume_provider::AttemptOutcome::Succeeded,
+                                duration_ms: 0,
+                                usage: None,
+                                error: None,
+                            })
+                            .await
+                            .unwrap();
+                        Ok(history)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(requests.len(), 2);
+            let reply = &requests[1][2];
+            assert_eq!(reply.role, Role::Tool);
+            assert_eq!(reply.tool_call_id.as_deref(), Some("read-once"));
+            if cached {
+                assert_eq!(reply.content, "saved reply");
+            } else {
+                assert!(reply.content.contains("Tool error:"));
+            }
+            let executions = store
+                .tool_executions_for_run(&session.token().run_id)
+                .unwrap();
+            assert_eq!(executions.len(), 1);
+            assert_eq!(
+                executions[0].state,
+                if cached { "succeeded" } else { "failed" }
+            );
+            assert_eq!(
+                store.get_run(&session.token().run_id).unwrap().status,
+                "succeeded"
+            );
+            let saved = store
+                .conversation_history("durable")
+                .unwrap()
+                .into_iter()
+                .map(|row| serde_json::from_str::<ChatMessage>(&row.message_json).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(saved, messages);
+            assert!(!directory.path().join("missing.txt").exists());
+        }
+    }
+
     async fn scripted(
         messages: &mut Vec<ChatMessage>,
         dispatcher: &mut ToolDispatcher,
@@ -2637,13 +3886,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1000);
         let mut scripts = VecDeque::from(scripts);
         let mut requests = Vec::new();
+        let mut session_id = String::from("test-session");
         let result = run_conversation(
             messages,
             &tx,
             dispatcher,
+            &mut session_id,
             &CancellationToken::new(),
+            None,
             max_turns,
-            |history, tx| {
+            |history, _, _, tx| {
                 requests.push(history.clone());
                 let (events, fail) = scripts.pop_front().expect("unexpected model request");
                 async move {
@@ -2729,6 +3981,7 @@ mod tests {
         assert!(app.streaming_text.contains("[Tool Call: write_file]"));
         assert!(!app.streaming_text.contains("opaque-secret"));
         app.receive(ConversationEvent::Finished {
+            run_id: None,
             messages: messages.clone(),
             error: None,
             session_id: None,
@@ -2864,6 +4117,7 @@ mod tests {
         let mut app = App::new("test");
         app.is_busy = true;
         app.receive(ConversationEvent::Finished {
+            run_id: None,
             messages,
             error: Some(error),
             session_id: None,
@@ -2945,6 +4199,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retrying_discards_provisional_text_and_tool_calls() {
+        let mut turn = StreamTurn::default();
+        turn.push(&StreamEvent::TextDelta("discard me".into()))
+            .unwrap();
+        turn.push(&delta(0, Some("old"), Some("write_file"), "{}"))
+            .unwrap();
+        turn.push(&StreamEvent::Retrying {
+            next_attempt: 2,
+            delay_ms: 1,
+            reason: "temporary".into(),
+        })
+        .unwrap();
+        turn.push(&StreamEvent::TextDelta("kept".into())).unwrap();
+        turn.push(&completed("stop")).unwrap();
+        let (assistant, calls) = turn.finish().unwrap();
+        assert_eq!(assistant.content, "kept");
+        assert!(calls.is_empty());
+    }
+
     #[tokio::test]
     async fn cancellation_drops_live_stream_without_executing_pending_calls() {
         let dir = tempfile::tempdir().unwrap();
@@ -2953,6 +4227,7 @@ mod tests {
         let mut messages = vec![ChatMessage::user("write")];
         let (tx, _rx) = mpsc::channel(100);
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut session_id = String::from("test-session");
         struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
         impl Drop for OnDrop {
             fn drop(&mut self) {
@@ -2963,9 +4238,11 @@ mod tests {
             &mut messages,
             &tx,
             &mut dispatcher,
+            &mut session_id,
             &cancellation,
+            None,
             10,
-            |_, tx| {
+            |_, _, _, tx| {
                 let token = cancellation.clone();
                 let dropped = dropped.clone();
                 async move {
@@ -3001,16 +4278,174 @@ mod tests {
         ];
         let payload = model_messages(&history);
         assert_eq!(payload.len(), 3);
-        assert_eq!(payload[0].content, dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT);
+        assert_eq!(
+            payload[0].content,
+            dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT
+        );
         assert_eq!(payload[1].content, "First request");
         assert_eq!(payload[2].content, "Second request");
         assert_eq!(model_messages(&history[..2]), payload[..2]);
+    }
+
+    #[test]
+    fn stale_finished_event_does_not_replace_current_run_state() {
+        let mut app = App::new("test");
+        app.current_run_id = Some("run-new".into());
+        app.is_busy = true;
+        app.messages = vec![ChatMessage::user("current transcript")];
+        app.receive(ConversationEvent::Finished {
+            run_id: Some("run-old".into()),
+            messages: vec![ChatMessage::assistant("stale response")],
+            error: None,
+            session_id: None,
+        });
+        assert!(app.is_busy);
+        assert_eq!(app.messages, vec![ChatMessage::user("current transcript")]);
+    }
+
+    #[test]
+    fn explicit_run_resume_selects_saved_paused_run_without_admitting_another_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HarnessStore::open(dir.path().join("resume.db"), &dir.path().join("artifacts"))
+            .unwrap();
+        store
+            .create_conversation("resume-conversation", "/tmp", "model", "session")
+            .unwrap();
+        let scope = RuntimeScope::Conversation("resume-conversation".into());
+        let receipt = store
+            .admit_input(
+                scope.clone(),
+                "original-request",
+                InputKind::Submit,
+                "saved marker",
+            )
+            .unwrap();
+        let run_id = receipt.run_id.unwrap();
+        let token = store.start_run(scope.clone(), &run_id).unwrap();
+        store
+            .settle_run(&token, "interrupted", Some("restart"), 10)
+            .unwrap();
+
+        let selected = find_resumable_run(&store, "resume-conversation", "").unwrap();
+        assert_eq!(selected.run_id, run_id);
+        assert_eq!(
+            store
+                .conversation_history("resume-conversation")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.inbox(&scope, &[]).unwrap().len(), 1);
+        assert!(
+            find_resumable_run(&store, "resume-conversation", "other-conversation-run").is_err()
+        );
+    }
+
+    #[test]
+    fn session_usage_refreshes_from_persisted_attempts_and_reports_missing_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            HarnessStore::open(dir.path().join("usage.db"), &dir.path().join("artifacts")).unwrap();
+        store
+            .create_conversation("usage-conversation", "/tmp", "model", "session")
+            .unwrap();
+        let scope = RuntimeScope::Conversation("usage-conversation".into());
+        let receipt = store
+            .admit_input(scope.clone(), "usage-request", InputKind::Submit, "prompt")
+            .unwrap();
+        let token = store.start_run(scope, &receipt.run_id.unwrap()).unwrap();
+        store
+            .start_model_attempt(&token, "attempt-1", "session", "model")
+            .unwrap();
+        store.finish_model_attempt("attempt-1", dume_store::ModelAttemptOutcome {
+            state: "succeeded".into(), reason: None,
+            usage: Some(serde_json::json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})),
+            timing_complete: true,
+        }, 1).unwrap();
+        store
+            .start_model_attempt(&token, "attempt-2", "session", "model")
+            .unwrap();
+        store
+            .finish_model_attempt(
+                "attempt-2",
+                dume_store::ModelAttemptOutcome {
+                    state: "failed".into(),
+                    reason: Some("missing provider usage".into()),
+                    usage: None,
+                    timing_complete: false,
+                },
+                1,
+            )
+            .unwrap();
+        let mut app = App::new("model");
+        app.conversation_id = "usage-conversation".into();
+        refresh_session_timing(&mut app, &store).unwrap();
+        assert_eq!(app.session_usage.0, 10);
+        assert_eq!(app.session_usage.1, 5);
+        assert_eq!(app.session_usage.2, 15);
+        assert_eq!(app.session_usage_incomplete, 1);
+    }
+
+    #[test]
+    fn durable_inputs_preserve_fifo_and_pause_when_run_needs_attention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            HarnessStore::open(dir.path().join("queue.db"), &dir.path().join("artifacts")).unwrap();
+        store
+            .create_conversation("queue-test", "/tmp", "model", "session")
+            .unwrap();
+        let scope = RuntimeScope::Conversation("queue-test".into());
+        let active = store
+            .admit_input(scope.clone(), "first", InputKind::Submit, "first prompt")
+            .unwrap();
+        let run_id = active.run_id.unwrap();
+        let token = store.start_run(scope.clone(), &run_id).unwrap();
+        store
+            .settle_run(&token, "needs_attention", Some("operator action"), 1)
+            .unwrap();
+        let first = store
+            .admit_input(scope.clone(), "queued-1", InputKind::FollowUp, "one")
+            .unwrap();
+        let second = store
+            .admit_input(scope.clone(), "queued-2", InputKind::FollowUp, "two")
+            .unwrap();
+        assert_eq!(first.disposition, "pending");
+        assert_eq!(second.disposition, "pending");
+        let rows = store.inbox(&scope, &["paused"]).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.payload.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert!(
+            store
+                .active_run(&scope)
+                .unwrap()
+                .is_some_and(|run| run.status == "needs_attention")
+        );
     }
 
     #[tokio::test]
     async fn provider_failure_after_compaction_keeps_new_session_and_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(HarnessStore::in_memory(dir.path().join("artifacts")).unwrap());
+        store
+            .create_conversation(
+                "pipeline-test",
+                "/tmp",
+                "unknown-model",
+                "before-compaction",
+            )
+            .unwrap();
+        let receipt = store
+            .admit_input(
+                RuntimeScope::Conversation("pipeline-test".into()),
+                "pipeline-request",
+                InputKind::Submit,
+                "Preserve the public API.",
+            )
+            .unwrap();
         let dispatcher = Arc::new(Mutex::new(
             ToolDispatcher::new(dir.path(), "unknown-model", CancellationToken::new())
                 .with_store(store.clone()),
@@ -3022,6 +4457,7 @@ mod tests {
             ChatMessage::user("Continue."),
         ];
         let (tx, mut rx) = mpsc::channel(8);
+        let run_id = receipt.run_id.unwrap();
         dispatch_stream(
             "unknown-model",
             original_session.clone(),
@@ -3029,48 +4465,68 @@ mod tests {
             tx,
             dispatcher,
             CancellationToken::new(),
+            store.clone(),
+            "pipeline-test".to_string(),
+            run_id.clone(),
         )
         .await;
         let Some(ConversationEvent::Finished {
+            run_id: Some(_),
             mut messages,
             error: Some(error),
             session_id: Some(session_id),
-        }) = rx.recv().await else {
+        }) = rx.recv().await
+        else {
             panic!("expected a failed conversation with a recoverable session");
         };
-        assert!(error.contains("Unknown") || error.contains("unknown"), "{error}");
+        assert!(
+            error.contains("Unknown") || error.contains("unknown"),
+            "{error}"
+        );
+        let metrics = store.conversation_runtime_metrics("pipeline-test").unwrap();
+        assert!(
+            metrics
+                .runs
+                .iter()
+                .any(|run| run.run_id == run_id && run.status == "failed")
+        );
         assert_ne!(session_id, original_session);
         assert!(messages.iter().any(|message| {
             message.content.contains("Conversation checkpoint")
                 && message.content.contains("Preserve the public API")
         }));
-        assert!(messages.iter().all(|message| !message.content.contains(&"x".repeat(100))));
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains(&"x".repeat(100)))
+        );
 
         messages.push(ChatMessage::assistant("y".repeat(500_000)));
         messages.push(ChatMessage::user("Try again."));
-        assert!(dume_worker::context::prepare_request_context(
-            dume_worker::context::RequestContext {
+        assert!(
+            dume_worker::context::prepare_request_context(dume_worker::context::RequestContext {
                 model: "unknown-model",
                 session_id: &session_id,
                 messages: &mut messages,
                 tools: &[],
                 store: Some(&store),
-            },
-        )
-        .is_ok());
+            },)
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_repair_conversation_history_clean_complete() {
         let mut messages = vec![
             ChatMessage::user("Hello"),
-            ChatMessage::assistant_with_tool_calls("Let me run a command", vec![
-                ToolCall {
+            ChatMessage::assistant_with_tool_calls(
+                "Let me run a command",
+                vec![ToolCall {
                     id: "call_1".to_string(),
                     name: "run_command".to_string(),
                     arguments: "{}".to_string(),
-                }
-            ]),
+                }],
+            ),
             ChatMessage::tool("Command output", "call_1"),
             ChatMessage::assistant("All done!"),
         ];
@@ -3085,18 +4541,21 @@ mod tests {
     fn test_repair_conversation_history_synthesizes_missing_tool_responses() {
         let mut messages = vec![
             ChatMessage::user("Build and test"),
-            ChatMessage::assistant_with_tool_calls("Running tools", vec![
-                ToolCall {
-                    id: "call_1".to_string(),
-                    name: "cargo_check".to_string(),
-                    arguments: "{}".to_string(),
-                },
-                ToolCall {
-                    id: "call_2".to_string(),
-                    name: "cargo_test".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            ]),
+            ChatMessage::assistant_with_tool_calls(
+                "Running tools",
+                vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        name: "cargo_check".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        name: "cargo_test".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+            ),
             ChatMessage::tool("Check ok", "call_1"),
             // call_2 is missing because process was forcefully killed
         ];
@@ -3126,14 +4585,27 @@ mod tests {
 
     #[test]
     fn test_conversation_file_lock_mutual_exclusion() {
-        let conv_id = format!("test_lock_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let lock1 = ConversationLock::try_acquire(&conv_id).expect("First lock acquire must succeed");
+        let conv_id = format!(
+            "test_lock_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lock1 =
+            ConversationLock::try_acquire(&conv_id).expect("First lock acquire must succeed");
         let lock2_res = ConversationLock::try_acquire(&conv_id);
-        assert!(lock2_res.is_err(), "Second lock acquire must fail while held");
+        assert!(
+            lock2_res.is_err(),
+            "Second lock acquire must fail while held"
+        );
 
         drop(lock1);
         let lock3_res = ConversationLock::try_acquire(&conv_id);
-        assert!(lock3_res.is_ok(), "Lock acquire must succeed after previous lock is dropped");
+        assert!(
+            lock3_res.is_ok(),
+            "Lock acquire must succeed after previous lock is dropped"
+        );
     }
 
     #[test]
@@ -3147,11 +4619,15 @@ mod tests {
         assert!(detect_interrupted_session_notice(&store, cwd, "current_1").is_none());
 
         // Create an interrupted session with messages
-        store.create_conversation("prev_1", cwd, "model", "sess").unwrap();
+        store
+            .create_conversation("prev_1", cwd, "model", "sess")
+            .unwrap();
         let user_msg = ChatMessage::user("Fix build error in main.rs");
         let json = serde_json::to_string(&user_msg).unwrap();
         store.append_conversation_message("prev_1", &json).unwrap();
-        store.set_conversation_status("prev_1", "interrupted").unwrap();
+        store
+            .set_conversation_status("prev_1", "interrupted")
+            .unwrap();
 
         let notice = detect_interrupted_session_notice(&store, cwd, "current_1");
         assert!(notice.is_some());
@@ -3164,6 +4640,51 @@ mod tests {
         store.set_conversation_status("prev_1", "closed").unwrap();
         assert!(detect_interrupted_session_notice(&store, cwd, "current_1").is_none());
     }
+
+    #[test]
+    fn timing_format_and_terminal_outcomes_are_explicit() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(999), "1s");
+        assert_eq!(format_duration(60_000), "1m0s");
+        assert_eq!(status_label("succeeded"), "DONE");
+        assert_eq!(status_label("failed"), "ERROR");
+        assert_eq!(status_label("cancelled"), "CANCELLED");
+        assert_eq!(status_label("needs_attention"), "ATTENTION");
+        assert_eq!(status_label("unknown"), "RUN");
+
+        let metrics = dume_store::ConversationRuntimeMetrics {
+            runs: vec![
+                dume_store::RunRecord {
+                    run_id: "failed-run".into(),
+                    scope: RuntimeScope::Conversation("c".into()),
+                    status: "failed".into(),
+                    owner_generation: 1,
+                    reason: None,
+                    started_at: 0,
+                    ended_at: Some(0),
+                    elapsed_ms: 0,
+                    timing_complete: false,
+                },
+                dume_store::RunRecord {
+                    run_id: "cancelled-run".into(),
+                    scope: RuntimeScope::Conversation("c".into()),
+                    status: "cancelled".into(),
+                    owner_generation: 1,
+                    reason: None,
+                    started_at: 1,
+                    ended_at: Some(1),
+                    elapsed_ms: 1_500,
+                    timing_complete: true,
+                },
+            ],
+            model_attempts: vec![],
+            tool_executions: vec![],
+            tool_attempts: vec![],
+        };
+        let summary = format_session_metrics(&metrics);
+        assert!(summary.contains("ERROR 0s (lower bound)"));
+        assert!(summary.contains("CANCELLED 2s"));
+    }
 }
 
 pub fn detect_interrupted_session_notice(
@@ -3171,10 +4692,16 @@ pub fn detect_interrupted_session_notice(
     cwd: &str,
     current_conv_id: &str,
 ) -> Option<String> {
-    if let Ok(Some(interrupted)) = store.latest_interrupted_conversation_for_cwd(cwd, Some(current_conv_id)) {
+    if let Ok(Some(interrupted)) =
+        store.latest_interrupted_conversation_for_cwd(cwd, Some(current_conv_id))
+    {
         if let Ok((rec, msg_recs)) = store.load_conversation(&interrupted.id) {
             if !msg_recs.is_empty() {
-                let short_id = if rec.id.len() >= 8 { &rec.id[..8] } else { &rec.id };
+                let short_id = if rec.id.len() >= 8 {
+                    &rec.id[..8]
+                } else {
+                    &rec.id
+                };
                 let preview = msg_recs
                     .iter()
                     .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.message_json).ok())

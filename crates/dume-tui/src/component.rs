@@ -280,14 +280,12 @@ pub fn build_transcript_lines(
                 }
                 Role::System => {
                     // Notice banner format rather than plain conversational chat
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "  [ NOTICE ] ",
-                            Style::default()
-                                .fg(theme.system_msg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "  [ NOTICE ] ",
+                        Style::default()
+                            .fg(theme.system_msg)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
                     is_user_logical_line.push(false);
                     for line in msg.content.lines() {
                         let wrapped = wrap_text_line("  │ ", line, effective_width);
@@ -344,8 +342,13 @@ pub fn render_transcript(
     theme: &Theme,
 ) {
     let effective_width = area.width.max(1) as usize;
-    let (lines, is_user_logical_line) =
-        build_transcript_lines(messages, streaming_text, recent_sessions, effective_width, theme);
+    let (lines, is_user_logical_line) = build_transcript_lines(
+        messages,
+        streaming_text,
+        recent_sessions,
+        effective_width,
+        theme,
+    );
 
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -359,7 +362,11 @@ pub fn render_transcript(
     let buf = f.buffer_mut();
     for row_offset in 0..area.height as usize {
         let absolute_row = scroll + row_offset;
-        if is_user_logical_line.get(absolute_row).copied().unwrap_or(false) {
+        if is_user_logical_line
+            .get(absolute_row)
+            .copied()
+            .unwrap_or(false)
+        {
             let y = area.y + row_offset as u16;
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
@@ -396,7 +403,6 @@ pub fn calculate_transcript_height(
     );
     lines.len().min(u16::MAX as usize) as u16
 }
-
 
 pub fn render_input_bar(
     f: &mut Frame,
@@ -490,7 +496,11 @@ pub fn render_input_bar(
             if dot_x < buf.area.width && dot_y < buf.area.height {
                 if let Some(cell) = buf.cell_mut((dot_x, dot_y)) {
                     cell.set_symbol("•");
-                    cell.set_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+                    cell.set_style(
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    );
                 }
             }
         }
@@ -628,10 +638,44 @@ pub fn render_status_bar(
     thinking: ThinkingLevel,
     is_busy: bool,
     elapsed_secs: Option<f32>,
+    last_run: Option<&str>,
+    session_elapsed: Option<&str>,
+    session_usage: Option<&str>,
     anim_tick: usize,
     available_update: Option<&str>,
     theme: &Theme,
 ) {
+    if area.width < 96 {
+        let short_model: String = model.chars().take(8).collect();
+        let status = if is_busy {
+            elapsed_secs
+                .map(|seconds| format!("RUN {:.0}s", seconds))
+                .unwrap_or_else(|| "RUN".into())
+        } else {
+            last_run.unwrap_or("READY").to_string()
+        };
+        let elapsed = session_elapsed
+            .map(|value| format!("S{value}"))
+            .unwrap_or_default();
+        let usage = session_usage
+            .map(|value| {
+                value
+                    .strip_prefix("TOKENS ")
+                    .unwrap_or(value)
+                    .replace(" +", "+")
+                    .replace(" incomplete", "!")
+            })
+            .unwrap_or_default();
+        let line = Line::from(format!(
+            "{short_model} {} {status} {elapsed} T{usage}",
+            thinking.label()
+        ));
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.status_bar_bg)),
+            area,
+        );
+        return;
+    }
     let thinking_span = match thinking {
         ThinkingLevel::Off => Span::styled(" Thinking: OFF ", Style::default().fg(theme.border)),
         ThinkingLevel::Low => Span::styled(
@@ -713,6 +757,27 @@ pub fn render_status_bar(
             Style::default()
                 .fg(theme.user_msg)
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let timing = if is_busy {
+        elapsed_secs.map(|seconds| format!(" RUN {:.0}s ", seconds))
+    } else {
+        last_run.map(|last| format!(" LAST {last} "))
+    };
+    if let Some(timing) = timing {
+        spans.push(Span::styled(timing, Style::default().fg(theme.accent)));
+    }
+    if let Some(session_elapsed) = session_elapsed {
+        spans.push(Span::styled(
+            format!(" SESSION {session_elapsed} "),
+            Style::default().fg(theme.status_bar_fg),
+        ));
+    }
+    if let Some(session_usage) = session_usage {
+        spans.push(Span::styled(
+            format!(" {session_usage} "),
+            Style::default().fg(theme.status_bar_fg),
         ));
     }
 
@@ -906,7 +971,10 @@ pub fn render_login_selector_modal(
     let y = (area.height.saturating_sub(height)) / 2;
     let modal_area = Rect::new(x, y, width, height);
 
-    f.render_widget(ratatui::widgets::Clear, Rect::new(area.x, y, area.width, height));
+    f.render_widget(
+        ratatui::widgets::Clear,
+        Rect::new(area.x, y, area.width, height),
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1364,3 +1432,49 @@ pub fn render_resume_picker_modal(
     f.render_widget(paragraph, inner);
 }
 
+#[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn rendered_status(width: u16) -> String {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    Rect::new(0, 0, width, 1),
+                    "test-model",
+                    ThinkingLevel::Off,
+                    false,
+                    None,
+                    Some("ERROR 3s"),
+                    Some("7s"),
+                    Some("TOKENS 42 +1 incomplete"),
+                    0,
+                    None,
+                    &Theme::default(),
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn status_bar_renders_session_outcome_and_usage_at_narrow_and_wide_sizes() {
+        for width in [40, 80] {
+            let output = rendered_status(width);
+            assert!(output.contains("ERROR 3s"));
+            assert!(output.contains("S7s"));
+            assert!(output.contains("T42+1!"));
+        }
+    }
+}

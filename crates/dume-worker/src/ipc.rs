@@ -11,6 +11,13 @@ pub enum HostToWorkerMessage {
         worktree_path: String,
         test_command: Option<String>,
     },
+    Input {
+        kind: dume_store::InputKind,
+        client_id: String,
+        scope: dume_store::RuntimeScope,
+        epoch: i64,
+        payload: String,
+    },
     Cancel {
         reason: String,
     },
@@ -34,6 +41,9 @@ pub enum WorkerToHostMessage {
     },
     Failed {
         error: String,
+    },
+    Outcome {
+        outcome: crate::agent_loop::AgentOutcome,
     },
 }
 

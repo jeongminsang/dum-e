@@ -61,6 +61,8 @@ enum Commands {
         #[arg(long)]
         db_path: Option<String>,
         #[arg(long)]
+        artifacts_dir: Option<String>,
+        #[arg(long)]
         benchmark_run_id: Option<String>,
         #[arg(long)]
         case_id: Option<String>,
@@ -186,12 +188,119 @@ enum Commands {
         #[arg(long, default_value = ".dume/rust/harness.db")]
         db_path: std::path::PathBuf,
     },
+    /// Inspect and resolve durable agent runtime state
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+    /// Manage configured MCP servers and explicit project trust
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RuntimeCommands {
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommands,
+    },
+    Inspect {
+        run_id: String,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+    Resolve {
+        execution_id: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long)]
+        operator: String,
+        #[arg(long, value_parser = ["observed_succeeded", "observed_not_run", "retry_authorized"])]
+        decision: String,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long, requires = "decision")]
+        acknowledge_duplicate_effect: bool,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCommands {
+    List {
+        scope: String,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+    Add {
+        scope: String,
+        payload: String,
+        #[arg(long, default_value = "submit", value_parser = ["submit", "steer", "follow_up"])]
+        kind: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+    Withdraw {
+        scope: String,
+        input_id: i64,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+    Resume {
+        scope: String,
+        input_id: i64,
+        #[arg(long, default_value = ".dume/rust/harness.db")]
+        db_path: String,
+        #[arg(long, default_value = ".dume/rust/artifacts")]
+        artifacts_dir: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommands {
+    List {
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+    },
+    Trust {
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let result = dispatch(cli).await;
+    if let Err(error) = dume_provider::auth::drain_refresh_owners(Duration::from_secs(95)).await {
+        eprintln!("Credential refresh did not finish during shutdown: {error}");
+        if result.is_ok() {
+            return Err(error);
+        }
+    }
+    result
+}
 
+async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Commands::Coordinator {
             db_path,
@@ -209,6 +318,7 @@ async fn main() -> Result<()> {
             model,
             base_url,
             db_path,
+            artifacts_dir,
             benchmark_run_id,
             case_id,
             variant,
@@ -221,6 +331,7 @@ async fn main() -> Result<()> {
                 &model,
                 base_url.as_deref(),
                 db_path.as_deref(),
+                artifacts_dir.as_deref(),
                 benchmark_run_id.as_deref(),
                 case_id.as_deref(),
                 variant.as_deref(),
@@ -288,19 +399,30 @@ async fn main() -> Result<()> {
             println!("Created task '{}' under goal '{}'", task.id, task.goal_id);
         }
         Some(Commands::Models { provider }) => {
-            let codex_only = provider.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("openai-codex"));
+            let codex_only = provider
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("openai-codex"));
             if !codex_only {
-                if let Err(error) = dume_provider::ModelCatalog::refresh_remote_cache_if_stale().await {
+                if let Err(error) =
+                    dume_provider::ModelCatalog::refresh_remote_cache_if_stale().await
+                {
                     eprintln!("Model catalog refresh failed; showing local models: {error:#}");
                 }
             }
             if codex_only || provider.is_none() {
-                if codex_only && !dume_provider::CredentialStore::new(
-                    dume_provider::CredentialStore::default_path(),
-                ).has_credential("openai-codex") {
-                    eprintln!("Live Codex models require `dume login openai-codex`; showing local models.");
+                if codex_only
+                    && !dume_provider::CredentialStore::new(
+                        dume_provider::CredentialStore::default_path(),
+                    )
+                    .has_credential("openai-codex")
+                {
+                    eprintln!(
+                        "Live Codex models require `dume login openai-codex`; showing local models."
+                    );
                 }
-                if let Err(error) = dume_provider::ModelCatalog::refresh_codex_cache_if_stale().await {
+                if let Err(error) =
+                    dume_provider::ModelCatalog::refresh_codex_cache_if_stale().await
+                {
                     eprintln!("Codex catalog refresh failed; showing local models: {error:#}");
                 }
             }
@@ -349,7 +471,11 @@ async fn main() -> Result<()> {
         Some(Commands::Update { check }) => {
             run_update(check).await?;
         }
-        Some(Commands::Usage { db_path, artifacts_dir, session_id }) => {
+        Some(Commands::Usage {
+            db_path,
+            artifacts_dir,
+            session_id,
+        }) => {
             let store = HarnessStore::open(&db_path, &artifacts_dir)?;
             let usage = store.get_session_usage(&session_id)?;
             println!("Session Token Usage for '{}':", session_id);
@@ -389,6 +515,64 @@ async fn main() -> Result<()> {
             let report = runner.run().await?;
             println!("{}", runner.render_markdown_report(&report));
         }
+        Some(Commands::Runtime { command }) => match command {
+            RuntimeCommands::Queue { command } => run_queue(command)?,
+            RuntimeCommands::Inspect {
+                run_id,
+                db_path,
+                artifacts_dir,
+            } => {
+                let store = HarnessStore::open(db_path, artifacts_dir)?;
+                let run = store.get_run(&run_id)?;
+                let executions = store.tool_executions_for_run(&run_id)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"run":run,"tool_executions":executions})
+                    )?
+                );
+            }
+            RuntimeCommands::Resolve {
+                execution_id,
+                run_id,
+                revision,
+                operator,
+                decision,
+                evidence,
+                result,
+                acknowledge_duplicate_effect,
+                db_path,
+                artifacts_dir,
+            } => {
+                let store = HarnessStore::open(db_path, artifacts_dir)?;
+                let run = store.get_run(&run_id)?;
+                anyhow::ensure!(
+                    run.status == "running" || run.status == "needs_attention",
+                    "run must be active or needs attention to resolve an unknown tool"
+                );
+                let _scope_lock = store
+                    .acquire_runtime_scope_lock(&run.scope)?
+                    .context("runtime scope is owned by a live executor")?;
+                let resolution = dume_store::ToolResolution {
+                    operator,
+                    kind: decision.clone(),
+                    evidence,
+                    result,
+                    duplicate_effect_warning: acknowledge_duplicate_effect,
+                };
+                store.resolve_unknown(
+                    &dume_store::RunToken {
+                        run_id,
+                        owner_generation: run.owner_generation,
+                    },
+                    &execution_id,
+                    revision,
+                    resolution,
+                )?;
+                println!("Resolved tool execution {execution_id} as {decision}");
+            }
+        },
+        Some(Commands::Mcp { command }) => run_mcp(command).await?,
         None => {
             let target = resolve_resume_target(cli.continue_session, cli.resume, cli.all);
             dume_tui::run_tui_with_target("", target).await?;
@@ -398,7 +582,206 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_resume_target(continue_session: bool, resume: Option<String>, all: bool) -> dume_tui::ResumeTarget {
+fn runtime_scope(value: &str) -> Result<dume_store::RuntimeScope> {
+    if let Some(id) = value.strip_prefix("attempt:") {
+        anyhow::ensure!(!id.is_empty(), "attempt scope ID cannot be empty");
+        Ok(dume_store::RuntimeScope::Attempt(id.to_owned()))
+    } else {
+        let id = value.strip_prefix("conversation:").unwrap_or(value);
+        anyhow::ensure!(!id.is_empty(), "conversation scope ID cannot be empty");
+        Ok(dume_store::RuntimeScope::Conversation(id.to_owned()))
+    }
+}
+
+fn run_queue(command: QueueCommands) -> Result<()> {
+    use dume_store::InputKind;
+    match command {
+        QueueCommands::List {
+            scope,
+            db_path,
+            artifacts_dir,
+        } => {
+            let store = HarnessStore::open(db_path, artifacts_dir)?;
+            let records = store.inbox(&runtime_scope(&scope)?, &[])?;
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
+        QueueCommands::Add {
+            scope,
+            payload,
+            kind,
+            request_id,
+            db_path,
+            artifacts_dir,
+        } => {
+            anyhow::ensure!(
+                !request_id.trim().is_empty(),
+                "--request-id must not be empty"
+            );
+            let input_kind = match kind.as_str() {
+                "submit" => InputKind::Submit,
+                "steer" => InputKind::Steer,
+                "follow_up" => InputKind::FollowUp,
+                _ => unreachable!(),
+            };
+            let store = HarnessStore::open(db_path, artifacts_dir)?;
+            let receipt =
+                store.admit_input(runtime_scope(&scope)?, &request_id, input_kind, &payload)?;
+            println!("{}", serde_json::to_string(&receipt)?);
+        }
+        QueueCommands::Withdraw {
+            scope,
+            input_id,
+            db_path,
+            artifacts_dir,
+        } => {
+            let store = HarnessStore::open(db_path, artifacts_dir)?;
+            anyhow::ensure!(
+                store.withdraw_input(&runtime_scope(&scope)?, input_id)?,
+                "input {input_id} is not pending or paused"
+            );
+            println!("Withdrawn input {input_id}");
+        }
+        QueueCommands::Resume {
+            scope,
+            input_id,
+            db_path,
+            artifacts_dir,
+        } => {
+            let store = HarnessStore::open(db_path, artifacts_dir)?;
+            let receipt = store.reactivate_paused_input(&runtime_scope(&scope)?, input_id)?;
+            println!("{}", serde_json::to_string(&receipt)?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_mcp(command: McpCommands) -> Result<()> {
+    use dume_mcp::{McpConfig, McpToolBridge, TrustStore};
+    let trust_path = McpConfig::global_path()?.with_file_name("mcp-trust.json");
+    match command {
+        McpCommands::List { project } => {
+            let project_root = project
+                .as_deref()
+                .map(|p| {
+                    p.canonicalize()
+                        .with_context(|| format!("canonicalize project {}", p.display()))
+                })
+                .transpose()?;
+            let project_config = project_root.as_deref().map(|p| p.join(".dume/mcp.json"));
+            let mut loaded = McpConfig::load_with_origins(None, project_config.as_deref())?;
+            let trust = TrustStore::load(&trust_path)?;
+            let mut untrusted = Vec::new();
+            for name in loaded.project_servers.clone() {
+                let Some(server) = loaded.config.servers.get(&name) else {
+                    continue;
+                };
+                if !server.enabled {
+                    continue;
+                }
+                let digest = loaded.config.canonical_digest(&name)?;
+                let repo = project_root
+                    .as_deref()
+                    .context("project-origin MCP server requires --project")?;
+                if !trust.inspect(repo, &digest)? {
+                    untrusted.push((name.clone(), digest));
+                    if let Some(server) = loaded.config.servers.get_mut(&name) {
+                        server.enabled = false;
+                    }
+                }
+            }
+            let mut bridge = McpToolBridge::new();
+            bridge.trust = trust;
+            let connect_result = bridge
+                .connect_loaded_config(&loaded, project_root.as_deref())
+                .await;
+            let states = bridge.server_states();
+            for (name, state, _) in &states {
+                if !matches!(
+                    state,
+                    dume_mcp::ServerState::Ready | dume_mcp::ServerState::Deferred
+                ) {
+                    continue;
+                }
+                let server = &loaded.config.servers[name];
+                if server.exposure == dume_mcp::ToolExposure::Deferred {
+                    let _ = bridge.activate_deferred(name).await;
+                } else {
+                    let _ = bridge.discover_tools(name).await;
+                }
+            }
+            for (name, state, count) in bridge.server_states() {
+                let origin = if loaded.project_servers.contains(&name) {
+                    "project"
+                } else {
+                    "global"
+                };
+                let digest = loaded.config.canonical_digest(&name)?;
+                println!("{name}\t{origin}\t{state:?}\tfingerprint={digest}\ttools={count}");
+                let available = bridge
+                    .direct_tools()
+                    .into_iter()
+                    .chain(bridge.deferred_tools());
+                for tool in available.filter(|tool| tool.name.starts_with(&format!("{name}__"))) {
+                    println!("  {}\t{}", tool.name, tool.description.unwrap_or_default());
+                }
+            }
+            bridge.shutdown().await;
+            connect_result?;
+            if !untrusted.is_empty() {
+                let names = untrusted
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "project MCP server(s) are not trusted for their current per-server fingerprints: {names}; review and run `dume mcp trust --repo {}`",
+                    project_root.as_deref().unwrap().display()
+                );
+            }
+        }
+        McpCommands::Trust { repo } => {
+            let root = repo
+                .canonicalize()
+                .with_context(|| format!("canonicalize project {}", repo.display()))?;
+            let path = root.join(".dume/mcp.json");
+            anyhow::ensure!(
+                path.is_file(),
+                "project MCP config does not exist: {}",
+                path.display()
+            );
+            let loaded = McpConfig::load_with_origins(None, Some(&path))?;
+            let mut trust = TrustStore::load(&trust_path)?;
+            let mut approved = Vec::new();
+            for name in &loaded.project_servers {
+                if !loaded
+                    .config
+                    .servers
+                    .get(name)
+                    .is_some_and(|server| server.enabled)
+                {
+                    continue;
+                }
+                let digest = loaded.config.canonical_digest(name)?;
+                trust.trust(&root, digest.clone())?;
+                approved.push((name.clone(), digest));
+            }
+            trust.save(&trust_path)?;
+            for (name, digest) in approved {
+                println!(
+                    "Trusted project MCP server {name} for {} (fingerprint {digest})",
+                    root.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_resume_target(
+    continue_session: bool,
+    resume: Option<String>,
+    all: bool,
+) -> dume_tui::ResumeTarget {
     if continue_session {
         dume_tui::ResumeTarget::Latest
     } else if let Some(id_str) = resume {
@@ -473,7 +856,11 @@ fn run_export(
     let result_content = out_lines.join("\n") + "\n";
     if let Some(path) = output_path {
         std::fs::write(path, result_content)?;
-        println!("Exported conversation '{}' to {}", target_id, path.display());
+        println!(
+            "Exported conversation '{}' to {}",
+            target_id,
+            path.display()
+        );
     } else {
         print!("{}", result_content);
     }
@@ -483,13 +870,19 @@ fn run_export(
 
 async fn run_update(check_only: bool) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
-    println!("Checking for updates (current version: v{})...", current_version);
+    println!(
+        "Checking for updates (current version: v{})...",
+        current_version
+    );
 
     let repo = "jeongminsang/dum-e";
     match dume_core::updater::check_for_update(repo, current_version)? {
         Some(info) => {
             println!("\n🚀 New version available: v{}", info.latest_version);
-            println!("Target platform: {}", dume_core::updater::detect_platform()?);
+            println!(
+                "Target platform: {}",
+                dume_core::updater::detect_platform()?
+            );
             println!("Asset package: {}", info.asset_name);
             if !info.release_notes.is_empty() {
                 println!("\nRelease Notes:\n{}", info.release_notes.trim());
@@ -504,7 +897,10 @@ async fn run_update(check_only: bool) -> Result<()> {
             let replaced_path = dume_core::updater::apply_update(&info, |msg| {
                 println!("  • {}", msg);
             })?;
-            println!("\n✅ Successfully updated DUM-E in-place to v{}!", info.latest_version);
+            println!(
+                "\n✅ Successfully updated DUM-E in-place to v{}!",
+                info.latest_version
+            );
             println!("Binary location: {}", replaced_path.display());
         }
         None => {
@@ -530,7 +926,10 @@ async fn read_login_input() -> Result<String> {
 fn login_provider(provider: &str) -> Result<&str> {
     let provider = dume_provider::normalize_provider(provider);
     anyhow::ensure!(
-        matches!(provider, "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"),
+        matches!(
+            provider,
+            "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"
+        ),
         "Unsupported login provider"
     );
     Ok(provider)
@@ -620,6 +1019,7 @@ async fn run_worker_child(
     model: &str,
     base_url: Option<&str>,
     db_path: Option<&str>,
+    artifacts_dir: Option<&str>,
     benchmark_run_id: Option<&str>,
     case_id: Option<&str>,
     variant: Option<&str>,
@@ -639,31 +1039,54 @@ async fn run_worker_child(
         if let Some(base_url) = base_url {
             agent = agent.with_base_url(base_url);
         }
-        if let Some(db_p) = db_path {
-            let artifacts_dir = Path::new(db_p)
-                .parent()
-                .map(|p| p.join("artifacts"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".dume/rust/artifacts"));
-            if let Ok(store) = HarnessStore::open(db_p, &artifacts_dir) {
-                let ctx = dume_provider::types::StreamRequestContext {
-                    session_id: attempt_id.to_string(),
-                    request_id: format!("req_{}_0", attempt_id),
-                    benchmark_run_id: benchmark_run_id.map(ToString::to_string),
-                    case_id: case_id.map(ToString::to_string),
-                    variant: variant.map(ToString::to_string),
-                    attempt_id: Some(attempt_id.to_string()),
-                    agent_id: Some("main".to_string()),
-                    parent_agent_id: None,
-                };
-                agent = agent.with_store(Arc::new(store)).with_request_context(ctx);
-            }
-        }
+        let db_path = db_path.unwrap_or(".dume/rust/harness.db");
+        let artifacts_path = artifacts_dir
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                Path::new(db_path)
+                    .parent()
+                    .map(|p| p.join("artifacts"))
+                    .unwrap_or_else(|| Path::new(".dume/rust/artifacts").to_path_buf())
+            });
+        let store = HarnessStore::open(db_path, &artifacts_path)
+            .with_context(|| format!("open worker runtime store {}", db_path))?;
+        let ctx = dume_provider::types::StreamRequestContext {
+            session_id: attempt_id.to_string(),
+            request_id: format!("req_{}_0", attempt_id),
+            benchmark_run_id: benchmark_run_id.map(ToString::to_string),
+            case_id: case_id.map(ToString::to_string),
+            variant: variant.map(ToString::to_string),
+            attempt_id: Some(attempt_id.to_string()),
+            agent_id: Some("main".to_string()),
+            parent_agent_id: None,
+        };
+        agent = agent.with_store(Arc::new(store)).with_request_context(ctx);
         let progress_exec = WorkerToHostMessage::Progress {
             attempt_id: attempt_id.to_string(),
             message: format!("Agent loop executing prompt: {}", prompt),
         };
         print!("{}", serialize_message(&progress_exec)?);
-        Some(agent.run_task(prompt).await?)
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let signal_token = cancellation.clone();
+        let signal_task = tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("register SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            signal_token.cancel();
+        });
+        let outcome = agent.run_task_with_cancellation(prompt, cancellation).await;
+        signal_task.abort();
+        Some(outcome?)
     } else {
         None
     };
@@ -690,13 +1113,20 @@ async fn run_worker_child(
         None => "Worker completed attempt".to_string(),
     };
 
-    let manifest = WorkerExecutor::finalize_manifest(
-        attempt_id,
-        path,
-        test_results,
-        &summary,
-    )
-    .await?;
+    if let Some(outcome) = &agent_outcome {
+        match outcome {
+            dume_worker::AgentOutcome::Completed { .. } => {}
+            dume_worker::AgentOutcome::TurnLimitExhausted { .. } => {
+                anyhow::bail!("worker turn limit exhausted; no successful manifest emitted")
+            }
+            dume_worker::AgentOutcome::Cancelled { .. } => {
+                anyhow::bail!("worker cancelled; no successful manifest emitted")
+            }
+        }
+    }
+
+    let manifest =
+        WorkerExecutor::finalize_manifest(attempt_id, path, test_results, &summary).await?;
 
     // Send completed message to host
     let completed_msg = WorkerToHostMessage::Completed {
@@ -816,11 +1246,19 @@ async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) ->
 
     // 5. Continuous Coordinator Dispatch Loop:
     // Polls active goals, evaluates TaskDag for ready tasks, spawns workers, and verifies results
+    let worker_db_path = store.db_path.canonicalize().with_context(|| {
+        format!(
+            "canonicalize coordinator database {}",
+            store.db_path.display()
+        )
+    })?;
     let worker_host = dume_worker::WorkerHost::new(
         std::env::current_exe()?
             .to_str()
             .context("Failed to get current executable path")?,
-    );
+    )
+    .with_db_path(worker_db_path)
+    .with_artifacts_dir(artifacts_dir);
 
     let repo_p = Path::new(repo_path);
     let mut idle_iterations = 0;
@@ -896,11 +1334,16 @@ async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) ->
                                 .duration_since(std::time::UNIX_EPOCH)?
                                 .as_millis()
                         );
-                        let worktree_dir = repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
+                        let worktree_dir =
+                            repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
 
                         // 1. Create isolated worktree for worker
-                        dume_git::worktree::create_git_worktree(&repo_p, &worktree_dir, &task.target_branch)
-                            .await?;
+                        dume_git::worktree::create_git_worktree(
+                            &repo_p,
+                            &worktree_dir,
+                            &task.target_branch,
+                        )
+                        .await?;
 
                         // 2. Record attempt in store under current coordinator epoch
                         let attempt = store_clone.create_attempt(
@@ -937,8 +1380,9 @@ async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) ->
                             Ok(manifest) => {
                                 // Save manifest artifact
                                 let manifest_json = serde_json::to_string_pretty(&manifest)?;
-                                let manifest_hash =
-                                    store_clone.artifacts.save_artifact(manifest_json.as_bytes())?;
+                                let manifest_hash = store_clone
+                                    .artifacts
+                                    .save_artifact(manifest_json.as_bytes())?;
 
                                 // Serialized verification and atomic integration
                                 let _guard = int_lock.lock().await;
@@ -951,18 +1395,42 @@ async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) ->
                                 )?;
 
                                 let updated_attempt = store_clone.get_attempt(&attempt.id)?;
-                                verify_and_integrate_attempt(&store_clone, &repo_path, &updated_attempt, epoch)
-                                    .await?;
+                                verify_and_integrate_attempt(
+                                    &store_clone,
+                                    &repo_path,
+                                    &updated_attempt,
+                                    epoch,
+                                )
+                                .await?;
                             }
                             Err(e) => {
                                 tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
-                                store_clone.update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
+                                store_clone
+                                    .update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
                                 store_clone.update_task_status(&task.id, TaskStatus::Failed)?;
                             }
                         }
 
-                        // Clean up worker worktree
-                        let _ = dume_git::worktree::remove_git_worktree(&repo_p, &worktree_dir).await;
+                        // Applied worktrees are disposable; failed or unresolved evidence is retained.
+                        let completed_attempt = store_clone.get_attempt(&attempt.id)?;
+                        if let Some(candidate) = completed_attempt.candidate_commit.as_deref() {
+                            let integration =
+                                store_clone.get_integration(&task.target_branch, candidate)?;
+                            if integration
+                                .is_some_and(|record| record.status == IntegrationStatus::Applied)
+                            {
+                                if let Err(error) =
+                                    dume_git::worktree::remove_git_worktree(&repo_p, &worktree_dir)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "Applied worktree retained after cleanup failed: {}: {}",
+                                        worktree_dir.display(),
+                                        error
+                                    );
+                                }
+                            }
+                        }
                         Ok::<(), anyhow::Error>(())
                     });
                 }
@@ -1044,13 +1512,16 @@ mod login_tests {
                 "openai/gpt-5.4",
                 "--base-url",
                 "http://127.0.0.1:1234/v1",
+                "--artifacts-dir",
+                "/tmp/custom-artifacts",
             ])
             .unwrap()
             .command,
             Some(Commands::Worker {
                 base_url: Some(_),
+                artifacts_dir: Some(path),
                 ..
-            })
+            }) if path == "/tmp/custom-artifacts"
         ));
         assert!(
             Cli::try_parse_from([
@@ -1066,7 +1537,9 @@ mod login_tests {
             .is_err()
         );
         assert!(matches!(
-            Cli::try_parse_from(["dume", "update", "--check"]).unwrap().command,
+            Cli::try_parse_from(["dume", "update", "--check"])
+                .unwrap()
+                .command,
             Some(Commands::Update { check: true })
         ));
         assert!(matches!(
