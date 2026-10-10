@@ -71,6 +71,17 @@ pub fn normalize_provider(provider: &str) -> &str {
     }
 }
 
+fn credential_env(provider: &str) -> &'static str {
+    match normalize_provider(provider) {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "google" => "GEMINI_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "opencode" | "opencode-go" => "OPENCODE_API_KEY",
+        _ => "",
+    }
+}
+
 fn now_ms() -> Result<i64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -201,14 +212,7 @@ impl CredentialStore {
 
     pub async fn resolve_credential(&self, provider: &str) -> Result<Option<Credential>> {
         let provider = normalize_provider(provider);
-        let env = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" => "GEMINI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "opencode" | "opencode-go" => "OPENCODE_API_KEY",
-            _ => "",
-        };
+        let env = credential_env(provider);
         if let Ok(key) = std::env::var(env) {
             if !key.trim().is_empty() {
                 return Ok(Some(Self::api_key(&key)));
@@ -362,14 +366,7 @@ impl CredentialStore {
 
     pub fn has_credential(&self, provider: &str) -> bool {
         let provider = normalize_provider(provider);
-        let env = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" => "GEMINI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "opencode" | "opencode-go" => "OPENCODE_API_KEY",
-            _ => "",
-        };
+        let env = credential_env(provider);
         if let Ok(key) = std::env::var(env) {
             if !key.trim().is_empty() {
                 return true;
@@ -398,6 +395,12 @@ impl CredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifier_env_mapping_does_not_alias_local_backend() {
+        assert_eq!(credential_env("opencode"), "OPENCODE_API_KEY");
+        assert_eq!(credential_env("jev-local-system-one"), "");
+    }
 
     #[tokio::test]
     async fn refresh_owner_drain_is_bounded_and_completes() {

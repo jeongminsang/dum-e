@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod catalog;
+pub mod classifier;
 pub mod client;
 pub mod codex;
 pub mod gemini;
@@ -12,6 +13,10 @@ pub mod types;
 pub use anthropic::AnthropicProvider;
 pub use auth::{Credential, CredentialStore, normalize_provider};
 pub use catalog::{ModelCatalog, ModelInfo};
+pub use classifier::{
+    Classification, ClassifierBackend, ClassifierConfig, ClassifierError, ClassifierErrorKind,
+    ClassifierUsage, SystemOneClassifier,
+};
 pub use client::LlmClient;
 pub use codex::CodexProvider;
 pub use gemini::GeminiProvider;

@@ -113,7 +113,7 @@ impl ResolvedProvider {
             let _ = tx
                 .send(StreamEvent::AttemptStarted {
                     context: attempt_context.clone(),
-                    model: self.model.id.clone(),
+                    model: format!("{}/{}", self.model.provider, self.model.id),
                 })
                 .await;
             let mut usage: Option<TokenUsage> = None;
@@ -193,7 +193,7 @@ impl ResolvedProvider {
             let _ = tx
                 .send(StreamEvent::AttemptFinished {
                     context: attempt_context.clone(),
-                    model: self.model.id.clone(),
+                    model: format!("{}/{}", self.model.provider, self.model.id),
                     outcome: if succeeded {
                         AttemptOutcome::Succeeded
                     } else {
@@ -268,19 +268,7 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
         }
         "google" => api == "google-generative-ai" || api.is_empty(),
         "deepseek" => api == "openai-completions" || api.is_empty(),
-        "opencode" => {
-            api == "openai-completions"
-                || api == "openai-responses"
-                || api == "anthropic-messages"
-                || api == "google-generative-ai"
-                || api.is_empty()
-        }
-        "opencode-go" => {
-            api == "openai-completions"
-                || api == "openai-responses"
-                || api == "anthropic-messages"
-                || api.is_empty()
-        }
+        "opencode" | "opencode-go" => api == "openai-completions" || api.is_empty(),
         _ => false,
     }
 }
@@ -616,6 +604,38 @@ mod tests {
             }
         });
         (url, handle)
+    }
+
+    #[tokio::test]
+    async fn attempt_events_keep_provider_identity_while_wire_model_stays_bare() {
+        for selection in ["openai/gpt-5.4", "opencode/glm-5.1", "opencode-go/glm-5.1"] {
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let (url, server) = crate::codex::tests::fixture(body.into());
+            let provider =
+                bind_credential(resolve_model(selection).unwrap(), credential("api_key"))
+                    .unwrap()
+                    .with_base_url(&url)
+                    .unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            provider
+                .stream(&[ChatMessage::user("hi")], &[], tx)
+                .await
+                .unwrap();
+            let (_, request) = server.join().unwrap();
+            assert_eq!(request["model"], selection.split_once('/').unwrap().1);
+            let mut identities = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::AttemptStarted { model, .. } => identities.push(model),
+                    StreamEvent::AttemptFinished { model, outcome, .. } => {
+                        assert_eq!(outcome, AttemptOutcome::Succeeded);
+                        identities.push(model);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(identities, [selection, selection]);
+        }
     }
 
     #[tokio::test]
@@ -1006,7 +1026,24 @@ mod tests {
         ));
         assert!(is_transport_supported("google", "google-generative-ai"));
         assert!(is_transport_supported("opencode", "openai-completions"));
-        assert!(is_transport_supported("opencode-go", "openai-responses"));
+        for provider in ["opencode", "opencode-go"] {
+            for api in [
+                "",
+                "openai-completions",
+                "openai-responses",
+                "anthropic-messages",
+                "google-generative-ai",
+            ] {
+                let mut model = resolve_model("opencode/big-pickle").unwrap();
+                model.provider = provider.into();
+                model.api = api.into();
+                assert_eq!(
+                    is_model_supported(&model),
+                    bind_credential(model, credential("api_key")).is_ok(),
+                    "{provider}/{api}"
+                );
+            }
+        }
         assert!(!is_transport_supported("bedrock", "bedrock-runtime"));
 
         let claude = resolve_model("claude-sonnet-4-5").unwrap();
