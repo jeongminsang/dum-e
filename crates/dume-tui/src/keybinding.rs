@@ -12,6 +12,7 @@ pub enum Action {
     SubmitFollowUp,
     InsertChar(char),
     DeleteChar,
+    DeleteForward,
     CursorLeft,
     CursorRight,
     CursorHome,
@@ -21,6 +22,7 @@ pub enum Action {
     PageUp,
     PageDown,
     Clear,
+    OpenRoutingSettings,
     Tab,
     Escape,
     None,
@@ -53,16 +55,7 @@ impl KeyBindings {
         };
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("parsing {}", path.display()))?;
-        let mut assigned = HashMap::new();
-        for (key, name) in config.bindings {
-            let stroke =
-                normalize_key(&key).with_context(|| format!("invalid key binding {key:?}"))?;
-            let action = parse_action(&name).with_context(|| format!("invalid action {name:?}"))?;
-            if let Some(previous) = assigned.insert(stroke.clone(), name.clone()) {
-                bail!("key binding conflict: {key:?} maps to both {previous:?} and {name:?}");
-            }
-            bindings.insert(stroke, action);
-        }
+        apply_config(&mut bindings, config)?;
         Ok(Self { bindings })
     }
 
@@ -77,16 +70,31 @@ impl KeyBindings {
     }
 }
 
+fn apply_config(bindings: &mut HashMap<String, Action>, config: Config) -> Result<()> {
+    let mut assigned = HashMap::new();
+    for (key, name) in config.bindings {
+        let stroke = normalize_key(&key).with_context(|| format!("invalid key binding {key:?}"))?;
+        let action = parse_action(&name).with_context(|| format!("invalid action {name:?}"))?;
+        if let Some(previous) = assigned.insert(stroke.clone(), name.clone()) {
+            bail!("key binding conflict: {key:?} maps to both {previous:?} and {name:?}");
+        }
+        bindings.insert(stroke, action);
+    }
+    Ok(())
+}
+
 fn defaults() -> HashMap<String, Action> {
     [
         ("Ctrl+c", Action::Quit),
         ("Ctrl+d", Action::Quit),
         ("Ctrl+l", Action::Clear),
+        ("Ctrl+r", Action::OpenRoutingSettings),
         ("Enter", Action::SubmitInput),
         ("Ctrl+q", Action::SubmitFollowUp),
         ("Tab", Action::Tab),
         ("Esc", Action::Escape),
         ("Backspace", Action::DeleteChar),
+        ("Delete", Action::DeleteForward),
         ("Left", Action::CursorLeft),
         ("Right", Action::CursorRight),
         ("Home", Action::CursorHome),
@@ -107,9 +115,11 @@ fn parse_action(name: &str) -> Result<Action> {
         "SubmitInput" => Action::SubmitInput,
         "SubmitFollowUp" => Action::SubmitFollowUp,
         "Clear" => Action::Clear,
+        "OpenRoutingSettings" => Action::OpenRoutingSettings,
         "Tab" => Action::Tab,
         "Escape" => Action::Escape,
         "DeleteChar" => Action::DeleteChar,
+        "DeleteForward" => Action::DeleteForward,
         "CursorLeft" => Action::CursorLeft,
         "CursorRight" => Action::CursorRight,
         "CursorHome" => Action::CursorHome,
@@ -162,6 +172,7 @@ fn format_key(key: KeyEvent) -> String {
         KeyCode::Tab => "tab".into(),
         KeyCode::Esc => "esc".into(),
         KeyCode::Backspace => "backspace".into(),
+        KeyCode::Delete => "delete".into(),
         KeyCode::Left => "left".into(),
         KeyCode::Right => "right".into(),
         KeyCode::Home => "home".into(),
@@ -172,6 +183,7 @@ fn format_key(key: KeyEvent) -> String {
         KeyCode::PageDown => "pagedown".into(),
         _ => return String::new(),
     };
+    parts.sort();
     parts.push(code);
     parts.join("+")
 }
@@ -181,4 +193,100 @@ pub fn handle_key_event(key: KeyEvent) -> Action {
         bindings: defaults(),
     }
     .action(key)
+}
+
+#[cfg(test)]
+mod routing_binding_tests {
+    use super::*;
+
+    #[test]
+    fn forward_delete_default_and_remap_are_action_dispatched() {
+        let default_bindings = KeyBindings {
+            bindings: defaults(),
+        };
+        assert_eq!(
+            default_bindings.action(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            Action::DeleteForward
+        );
+        let config: Config =
+            serde_json::from_str(r#"{"bindings":{"Ctrl+Alt+x":"DeleteForward"}}"#).unwrap();
+        let mut bindings = defaults();
+        apply_config(&mut bindings, config).unwrap();
+        assert_eq!(
+            KeyBindings { bindings }.action(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::DeleteForward
+        );
+    }
+
+    #[test]
+    fn routing_settings_binding_is_remappable_without_ctrl_r_special_casing() {
+        assert_eq!(
+            KeyBindings {
+                bindings: defaults()
+            }
+            .action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Action::OpenRoutingSettings,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybindings.json");
+        fs::write(
+            &path,
+            r#"{"bindings":{"Ctrl+x":"OpenRoutingSettings","Ctrl+r":"Clear"}}"#,
+        )
+        .unwrap();
+        let config: Config = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let mut bindings = defaults();
+        apply_config(&mut bindings, config).unwrap();
+        let bindings = KeyBindings { bindings };
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Action::OpenRoutingSettings
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Action::Clear
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_remaps_match_actual_events_and_defaults_can_be_overridden() {
+        let config: Config = serde_json::from_str(
+            r#"{"bindings":{"Ctrl+Alt+x":"OpenRoutingSettings","Ctrl+r":"Clear"}}"#,
+        )
+        .unwrap();
+        let mut bindings = defaults();
+        apply_config(&mut bindings, config).unwrap();
+        let bindings = KeyBindings { bindings };
+        assert_eq!(
+            bindings.action(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::OpenRoutingSettings,
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Action::Clear,
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::Clear,
+        );
+        assert_eq!(
+            normalize_key("Ctrl+Alt+x").unwrap(),
+            format_key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+        );
+        let duplicate: Config = serde_json::from_str(
+            r#"{"bindings":{"Ctrl+Alt+x":"Clear","Alt+Ctrl+x":"OpenRoutingSettings"}}"#,
+        )
+        .unwrap();
+        let mut defaults_copy = defaults();
+        assert!(apply_config(&mut defaults_copy, duplicate).is_err());
+    }
 }

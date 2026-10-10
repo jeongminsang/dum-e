@@ -1432,11 +1432,356 @@ pub fn render_resume_picker_modal(
     f.render_widget(paragraph, inner);
 }
 
+pub fn render_routing_settings_modal(
+    f: &mut Frame,
+    area: Rect,
+    draft: &crate::app::RoutingDraft,
+    theme: &Theme,
+) {
+    let width = 76.min(area.width.saturating_sub(2).max(1));
+    let height = 18.min(area.height.saturating_sub(2).max(1));
+    let modal_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" 라우팅 설정 ");
+    let settings = &draft.settings;
+    let classifier = settings.classifier.as_ref();
+    let backend = classifier
+        .map(|c| match c.backend {
+            dume_provider::ClassifierBackend::OpenCodeZen => "OpenCode Zen",
+            dume_provider::ClassifierBackend::LocalSystemOne => "LocalSystemOne",
+        })
+        .unwrap_or("OpenCode Zen");
+    let mut rows = vec![
+        format!(
+            "{} 사용: {}",
+            marker(draft.selected, 0),
+            if settings.enabled { "예" } else { "아니요" }
+        ),
+        format!("{} 분류 서버: {}", marker(draft.selected, 1), backend),
+        format!(
+            "{} 서버 URL: {}",
+            marker(draft.selected, 2),
+            routing_visible(draft, 2, draft.field_edit)
+        ),
+        format!(
+            "{} 분류 모델: {}",
+            marker(draft.selected, 3),
+            routing_visible(draft, 3, draft.field_edit)
+        ),
+        format!(
+            "{} 표준 계획: {}",
+            marker(draft.selected, 4),
+            role_visible(settings.models.standard.as_deref())
+        ),
+        format!(
+            "{} 복잡 계획: {}",
+            marker(draft.selected, 5),
+            role_visible(settings.models.complex.as_deref())
+        ),
+        format!(
+            "{} 구현: {}",
+            marker(draft.selected, 6),
+            role_visible(settings.models.implementation.as_deref())
+        ),
+        format!(
+            "{} 분류기 키: {} [{}]",
+            marker(draft.selected, 7),
+            routing_key_mask(draft),
+            draft.key_state
+        ),
+        format!("{} 키 저장", marker(draft.selected, 8)),
+        format!("{} 키 삭제", marker(draft.selected, 9)),
+        format!("{} 설정 저장", marker(draft.selected, 10)),
+        format!("{} 수동 연결 확인", marker(draft.selected, 11)),
+        format!("{} 닫기", marker(draft.selected, 12)),
+    ];
+    if draft.picker_role.is_some() {
+        rows.push("↑/↓ 모델 선택 · Enter 적용 · Esc 취소".into());
+        rows.push(format!(
+            "{} 기본 모델 상속",
+            if draft.picker_selected == 0 {
+                "›"
+            } else {
+                " "
+            }
+        ));
+        if let Some(models) = &draft.picker_models {
+            for (idx, model) in models.iter().enumerate() {
+                let selection = idx + 1;
+                rows.push(format!(
+                    "{} {}/{}",
+                    if selection == draft.picker_selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    model.provider,
+                    model.id
+                ));
+            }
+        }
+    } else {
+        rows.push("미저장 키 입력은 연결 확인에 사용되지 않습니다.".into());
+        rows.push("Enter 실행 · Backspace 삭제 · ←/→ 커서 · Tab 다음 항목".into());
+    }
+    rows.push(draft.message.clone());
+    f.render_widget(block, modal_area);
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let selected_row = if draft.picker_role.is_some() {
+        14 + draft.picker_selected
+    } else {
+        draft.selected
+    };
+    let visual_start = rows
+        .iter()
+        .take(selected_row)
+        .map(|row| wrapped_row_count(row, inner.width))
+        .sum::<usize>();
+    let selected_visual_height = rows
+        .get(selected_row)
+        .map_or(1, |row| wrapped_row_count(row, inner.width));
+    let visible_rows = inner.height.max(1) as usize;
+    let cursor_visual_offset = if draft.field_edit && matches!(draft.selected, 2 | 3 | 7) {
+        let value = if draft.selected == 7 {
+            draft.key_input.as_str()
+        } else {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|config| {
+                    if draft.selected == 2 {
+                        config.base_url.as_str()
+                    } else {
+                        config.model.as_str()
+                    }
+                })
+                .unwrap_or("")
+        };
+        let prefix: String = value.chars().take(draft.cursor).collect();
+        (UnicodeWidthStr::width(prefix.as_str()) + 12) / usize::from(inner.width.max(1))
+    } else {
+        0
+    };
+    let target_visual_row =
+        visual_start + cursor_visual_offset.min(selected_visual_height.saturating_sub(1));
+    let scroll = target_visual_row
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(usize::from(u16::MAX)) as u16;
+    f.render_widget(
+        Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+}
+
+pub fn render_routing_probe_confirm_modal(
+    f: &mut Frame,
+    area: Rect,
+    confirmed: bool,
+    theme: &Theme,
+) {
+    let width = 72.min(area.width.saturating_sub(2).max(1));
+    let height = 9.min(area.height.saturating_sub(2).max(1));
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(ratatui::widgets::Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" 외부 연결 확인 ");
+    f.render_widget(block, modal);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("고정된 테스트 문구가 설정 서버로 전송됩니다."),
+            Line::from(
+                "외부 서버 전송으로 API 비용이 발생할 수 있으며 단가는 확인되지 않았습니다.",
+            ),
+            Line::from(format!(
+                "{} 취소     {} 전송 확인",
+                if confirmed { "  " } else { "[선택]" },
+                if confirmed { "[선택]" } else { "  " }
+            )),
+            Line::from("←/→ 또는 Tab 선택 · Enter 적용 · Esc 취소"),
+        ])
+        .wrap(Wrap { trim: false }),
+        modal.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
+}
+
+fn marker(selected: usize, index: usize) -> &'static str {
+    if selected == index { "›" } else { " " }
+}
+fn role_visible(value: Option<&str>) -> &str {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("기본 모델 사용 (상속)")
+}
+fn routing_visible(draft: &crate::app::RoutingDraft, index: usize, editing: bool) -> String {
+    if draft.selected != index || !editing {
+        return if index == 2 {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .unwrap_or_default()
+        } else {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|c| c.model.clone())
+                .unwrap_or_default()
+        };
+    }
+    let value = if index == 2 {
+        draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.base_url.as_str())
+            .unwrap_or("")
+    } else {
+        draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.model.as_str())
+            .unwrap_or("")
+    };
+    let cursor = value
+        .char_indices()
+        .nth(draft.cursor)
+        .map_or(value.len(), |(index, _)| index);
+    format!("{}│{}", &value[..cursor], &value[cursor..])
+}
+
+fn routing_key_mask(draft: &crate::app::RoutingDraft) -> String {
+    let count = draft.key_input.chars().count().min(24);
+    if draft.selected == 7 && draft.field_edit {
+        let cursor = draft.cursor.min(count);
+        format!(
+            "{}│{}",
+            "•".repeat(cursor),
+            "•".repeat(count.saturating_sub(cursor))
+        )
+    } else {
+        "•".repeat(count)
+    }
+}
+
+fn wrapped_row_count(row: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    UnicodeWidthStr::width(row).max(1).div_ceil(width)
+}
+
 #[cfg(test)]
 mod status_bar_tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                let mut row = String::new();
+                let mut skip_until = area.x;
+                for x in area.x..area.right() {
+                    let cell = &buffer[(x, y)];
+                    if x < skip_until {
+                        continue;
+                    }
+                    let symbol = cell.symbol();
+                    row.push_str(symbol);
+                    skip_until = x + UnicodeWidthStr::width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_modal_masks_unsaved_secret_and_keeps_selection_visible_at_narrow_width() {
+        for (width, height) in [(32, 12), (100, 28)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut draft = crate::app::RoutingDraft::new(
+                dume_worker::RoutingSettings::default(),
+                "없음".into(),
+            );
+            draft.selected = 12;
+            draft.key_input = "super-secret-key".into();
+            terminal
+                .draw(|frame| {
+                    render_routing_settings_modal(frame, frame.area(), &draft, &Theme::default())
+                })
+                .unwrap();
+            let rows = rendered_rows(&terminal);
+            let output = rows.join("\n");
+            assert!(output.contains("super-secret-key") == false);
+            assert!(
+                rows.iter().any(|row| row.contains("닫기")),
+                "rows: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("라우팅")),
+                "rows: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_modal_scrolls_long_edit_cursor_into_narrow_viewport() {
+        let backend = TestBackend::new(32, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut draft =
+            crate::app::RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::OpenCodeZen,
+            base_url: format!("http://127.0.0.1/{}", "경로".repeat(24)),
+            model: "model".into(),
+        });
+        draft.selected = 2;
+        draft.field_edit = true;
+        draft.cursor = draft
+            .settings
+            .classifier
+            .as_ref()
+            .unwrap()
+            .base_url
+            .chars()
+            .count();
+        terminal
+            .draw(|frame| {
+                render_routing_settings_modal(frame, frame.area(), &draft, &Theme::default())
+            })
+            .unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(rows.iter().any(|row| row.contains("›")), "rows: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains('│')), "rows: {rows:?}");
+    }
 
     fn rendered_status(width: u16) -> String {
         let backend = TestBackend::new(width, 1);
@@ -1475,6 +1820,47 @@ mod status_bar_tests {
             assert!(output.contains("ERROR 3s"));
             assert!(output.contains("S7s"));
             assert!(output.contains("T42+1!"));
+        }
+    }
+
+    #[test]
+    fn routing_modal_renders_korean_enabled_state_at_narrow_and_wide_sizes() {
+        for (width, height) in [(30, 10), (100, 30)] {
+            for enabled in [false, true] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_routing_settings_modal(
+                            frame,
+                            frame.area(),
+                            &{
+                                let mut settings = dume_worker::RoutingSettings::default();
+                                settings.enabled = enabled;
+                                let mut draft =
+                                    crate::app::RoutingDraft::new(settings, "없음".into());
+                                draft.message = "라우팅 설정을 저장했습니다.".into();
+                                draft
+                            },
+                            &Theme::default(),
+                        );
+                    })
+                    .unwrap();
+                let rows = rendered_rows(&terminal);
+                assert!(
+                    rows.iter().any(|row| row.contains("라우팅")),
+                    "rows: {rows:?}"
+                );
+                let selected = if enabled {
+                    "› 사용: 예"
+                } else {
+                    "› 사용: 아니요"
+                };
+                assert!(
+                    rows.iter().any(|row| row.contains(selected)),
+                    "rows: {rows:?}"
+                );
+            }
         }
     }
 }

@@ -2,7 +2,8 @@ use crate::component::{
     AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
     render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
     render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
-    render_resume_picker_modal, render_status_bar, render_transcript, render_update_modal,
+    render_resume_picker_modal, render_routing_probe_confirm_modal, render_routing_settings_modal,
+    render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
@@ -177,6 +178,11 @@ pub fn repair_conversation_history(messages: &mut Vec<ChatMessage>) -> (bool, Op
 
 enum ConversationEvent {
     Stream(StreamEvent),
+    RoutingDecision(dume_worker::routing::RoutingDecision),
+    RoutingProbeFinished {
+        probe_id: u64,
+        message: String,
+    },
     Compacted(Vec<ChatMessage>),
     Finished {
         run_id: Option<String>,
@@ -264,8 +270,400 @@ fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
     });
 }
 
+pub struct RoutingDraft {
+    pub(crate) settings: dume_worker::RoutingSettings,
+    pub(crate) selected: usize,
+    pub(crate) cursor: usize,
+    pub(crate) key_input: String,
+    pub(crate) key_state: String,
+    pub(crate) message: String,
+    pub(crate) picker_role: Option<dume_worker::RoutingRole>,
+    pub(crate) picker_models: Option<Vec<ModelInfo>>,
+    pub(crate) picker_selected: usize,
+    pub(crate) field_edit: bool,
+    pub(crate) probe_confirmation: bool,
+    probe_id: u64,
+    probe_cancel: Option<CancellationToken>,
+    probe_task: Option<tokio::task::AbortHandle>,
+}
+
+impl RoutingDraft {
+    pub(crate) fn new(settings: dume_worker::RoutingSettings, key_state: String) -> Self {
+        Self {
+            settings,
+            selected: 0,
+            cursor: 0,
+            key_input: String::new(),
+            key_state,
+            message: "↑/↓ 항목 · Enter 선택/편집 · Esc 닫기".into(),
+            picker_role: None,
+            picker_models: None,
+            picker_selected: 0,
+            field_edit: false,
+            probe_confirmation: false,
+            probe_id: 0,
+            probe_cancel: None,
+            probe_task: None,
+        }
+    }
+
+    fn cancel_probe(&mut self) {
+        if let Some(token) = self.probe_cancel.take() {
+            token.cancel();
+        }
+        if let Some(task) = self.probe_task.take() {
+            task.abort();
+        }
+        self.probe_id = NEXT_ROUTING_PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn cancel_probe_for_config_edit(&mut self) {
+        if self.probe_cancel.is_some() {
+            self.cancel_probe();
+            self.message = "설정이 바뀌어 연결 확인을 취소했습니다.".into();
+        }
+    }
+
+    fn refresh_key_origin(&mut self) {
+        let Ok(path) = dume_worker::RoutingSettings::global_path() else {
+            self.key_state = "HOME 경로 오류 · 인증 정보 접근 불가".into();
+            return;
+        };
+        let Some(config) = self.settings.classifier.as_ref() else {
+            self.key_state = "없음".into();
+            return;
+        };
+        let auth_path = path.with_file_name("auth.json");
+        let env = config.backend == dume_provider::ClassifierBackend::OpenCodeZen
+            && std::env::var("OPENCODE_API_KEY")
+                .ok()
+                .is_some_and(|key| !key.trim().is_empty());
+        self.key_state = routing_key_origin(config.backend, &auth_path, env);
+    }
+}
+
+fn routing_snapshot_for_run(
+    snapshot: dume_worker::routing::RoutingSnapshot,
+    run_status: Option<&str>,
+) -> dume_worker::routing::RoutingSnapshot {
+    let resuming = routing_run_status(run_status);
+    snapshot.with_epoch_preservation(resuming)
+}
+
+fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> ChatMessage {
+    let usage = decision
+        .classifier_usage
+        .as_ref()
+        .map(|usage| {
+            format!(
+                " · 분류 토큰 {}+{} (가격 미확인)",
+                usage.input_tokens, usage.output_tokens
+            )
+        })
+        .unwrap_or_default();
+    ChatMessage::ui_notice(format!(
+        "라우팅: {} → {} · {}{}",
+        decision.original_model,
+        decision.effective_model,
+        decision.notice_text(),
+        usage,
+    ))
+}
+
+fn routing_run_status(status: Option<&str>) -> bool {
+    matches!(status, Some("interrupted" | "needs_attention"))
+}
+
+const ROUTING_PROBE_PROMPT: &str = "두 수를 더하는 간단한 함수 작성 요청의 복잡도를 분류하세요.";
+
+async fn routing_probe_request(
+    config: dume_provider::ClassifierConfig,
+    credentials: dume_provider::CredentialStore,
+    cancellation: CancellationToken,
+) -> String {
+    let credential = tokio::select! { biased;
+        _ = cancellation.cancelled() => return "연결 확인이 취소되었습니다.".into(),
+        result = credentials.resolve_credential(config.backend.credential_provider()) => result.ok().flatten(),
+    };
+    let key = credential.and_then(|credential| credential.key.or(credential.access_token));
+    let classifier = match dume_provider::SystemOneClassifier::new(&config, key) {
+        Ok(classifier) => classifier,
+        Err(error) => return routing_probe_error(error.reason_code()).into(),
+    };
+    let result = tokio::select! { biased;
+        _ = cancellation.cancelled() => return "연결 확인이 취소되었습니다.".into(),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), classifier.classify(ROUTING_PROBE_PROMPT, &cancellation)) => result,
+    };
+    match result {
+        Ok(Ok(value)) => format!(
+            "연결 확인 완료 · 복잡도 {:.0}%{}",
+            value.complex_probability * 100.0,
+            value
+                .usage
+                .map(|usage| format!(
+                    " · 토큰 {}+{} (가격 미확인)",
+                    usage.input_tokens, usage.output_tokens
+                ))
+                .unwrap_or_default()
+        ),
+        Ok(Err(error)) => routing_probe_error(error.reason_code()).into(),
+        Err(_) => "분류 요청 시간이 초과되었습니다.".into(),
+    }
+}
+
+fn routing_probe_error(kind: &str) -> &'static str {
+    match kind {
+        "missing_credential" => "분류기 인증 정보가 없습니다.",
+        "invalid_configuration" => "분류기 설정이 올바르지 않습니다.",
+        "http_status" => "분류 서버 요청이 실패했습니다.",
+        "invalid_response" => "분류 서버 응답을 확인할 수 없습니다.",
+        "timeout" => "분류 요청 시간이 초과되었습니다.",
+        "cancelled" => "연결 확인이 취소되었습니다.",
+        _ => "분류 서버에 연결할 수 없습니다.",
+    }
+}
+
+fn spawn_routing_probe(
+    tasks: &mut tokio::task::JoinSet<(u64, String)>,
+    draft: &mut RoutingDraft,
+    config: dume_provider::ClassifierConfig,
+    credentials: dume_provider::CredentialStore,
+    cancellation: CancellationToken,
+) {
+    let probe_id = NEXT_ROUTING_PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    draft.probe_id = probe_id;
+    draft.probe_cancel = Some(cancellation.clone());
+    draft.probe_task = Some(tasks.spawn(async move {
+        (
+            probe_id,
+            routing_probe_request(config, credentials, cancellation).await,
+        )
+    }));
+}
+
+fn routing_key_origin(
+    backend: dume_provider::ClassifierBackend,
+    auth_path: &std::path::Path,
+    env: bool,
+) -> String {
+    if env && backend == dume_provider::ClassifierBackend::OpenCodeZen {
+        return "환경변수".into();
+    }
+    let provider = backend.credential_provider();
+    let store = dume_provider::CredentialStore::new(auth_path);
+    let saved = store
+        .load()
+        .ok()
+        .and_then(|credentials| credentials.get(provider).cloned())
+        .is_some_and(|credential| {
+            credential
+                .key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        });
+    if saved {
+        "저장됨".into()
+    } else {
+        "없음".into()
+    }
+}
+
+impl Drop for RoutingDraft {
+    fn drop(&mut self) {
+        self.cancel_probe();
+    }
+}
+
+static NEXT_ROUTING_PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn empty_routing_draft() -> RoutingDraft {
+    RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into())
+}
+
+fn routing_selected_text(draft: &RoutingDraft) -> String {
+    let config = draft.settings.classifier.as_ref();
+    match draft.selected {
+        2 => config.map(|c| c.base_url.clone()).unwrap_or_default(),
+        3 => config.map(|c| c.model.clone()).unwrap_or_default(),
+        4 => draft.settings.models.standard.clone().unwrap_or_default(),
+        5 => draft.settings.models.complex.clone().unwrap_or_default(),
+        6 => draft
+            .settings
+            .models
+            .implementation
+            .clone()
+            .unwrap_or_default(),
+        7 => draft.key_input.clone(),
+        _ => String::new(),
+    }
+}
+
+fn routing_edit_value(draft: &RoutingDraft) -> String {
+    match draft.selected {
+        2 => draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.base_url.clone())
+            .unwrap_or_default(),
+        3 => draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn routing_begin_field_edit(draft: &mut RoutingDraft) {
+    draft.cancel_probe_for_config_edit();
+    if matches!(draft.selected, 2 | 3) && draft.settings.classifier.is_none() {
+        draft.settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::OpenCodeZen,
+            base_url: String::new(),
+            model: String::new(),
+        });
+    }
+    draft.cursor = routing_edit_value(draft).chars().count();
+    draft.field_edit = true;
+}
+
+fn routing_insert_char(draft: &mut RoutingDraft, ch: char) {
+    draft.cancel_probe_for_config_edit();
+    if draft.selected == 7 {
+        draft.key_input.insert(
+            draft
+                .key_input
+                .char_indices()
+                .nth(draft.cursor)
+                .map_or(draft.key_input.len(), |(i, _)| i),
+            ch,
+        );
+        draft.cursor += 1;
+        return;
+    }
+    let Some(config) = draft.settings.classifier.as_mut() else {
+        return;
+    };
+    let text = match draft.selected {
+        2 => &mut config.base_url,
+        3 => &mut config.model,
+        _ => return,
+    };
+    let at = text
+        .char_indices()
+        .nth(draft.cursor)
+        .map_or(text.len(), |(i, _)| i);
+    text.insert(at, ch);
+    draft.cursor += 1;
+}
+
+fn routing_delete_char(draft: &mut RoutingDraft) {
+    draft.cancel_probe_for_config_edit();
+    if draft.cursor == 0 {
+        return;
+    }
+    if draft.selected == 7 {
+        let mut chars = draft.key_input.chars().collect::<Vec<_>>();
+        if draft.cursor <= chars.len() {
+            chars.remove(draft.cursor - 1);
+            draft.key_input = chars.into_iter().collect();
+            draft.cursor -= 1;
+        }
+        return;
+    }
+    let Some(config) = draft.settings.classifier.as_mut() else {
+        return;
+    };
+    let text = match draft.selected {
+        2 => &mut config.base_url,
+        3 => &mut config.model,
+        _ => return,
+    };
+    let mut chars = text.chars().collect::<Vec<_>>();
+    if draft.cursor <= chars.len() {
+        chars.remove(draft.cursor - 1);
+        *text = chars.into_iter().collect();
+        draft.cursor -= 1;
+    }
+}
+
+fn routing_delete_forward(draft: &mut RoutingDraft) {
+    draft.cancel_probe_for_config_edit();
+    let text = match draft.selected {
+        2 => draft
+            .settings
+            .classifier
+            .as_mut()
+            .map(|config| &mut config.base_url),
+        3 => draft
+            .settings
+            .classifier
+            .as_mut()
+            .map(|config| &mut config.model),
+        7 => {
+            delete_char_at(&mut draft.key_input, draft.cursor);
+            return;
+        }
+        _ => None,
+    };
+    if let Some(text) = text {
+        delete_char_at(text, draft.cursor);
+    }
+}
+
+fn delete_char_at(text: &mut String, cursor: usize) {
+    let Some((start, ch)) = text.char_indices().nth(cursor) else {
+        return;
+    };
+    text.replace_range(start..start + ch.len_utf8(), "");
+}
+
+fn routing_edit_left(draft: &mut RoutingDraft) {
+    draft.cursor = draft.cursor.saturating_sub(1);
+}
+fn routing_edit_right(draft: &mut RoutingDraft) {
+    draft.cursor = (draft.cursor + 1).min(routing_selected_text(draft).chars().count());
+}
+
+fn routing_open_role_picker(draft: &mut RoutingDraft) {
+    if dume_worker::RoutingSettings::global_path().is_err() {
+        draft.message = "HOME 경로 오류 · 모델 인증 정보를 읽지 않았습니다.".into();
+        return;
+    }
+    let models = selectable_models();
+    routing_begin_role_picker(draft, models);
+}
+
+fn routing_begin_role_picker(draft: &mut RoutingDraft, models: Vec<ModelInfo>) {
+    let role = match draft.selected {
+        4 => dume_worker::RoutingRole::StandardPlanning,
+        5 => dume_worker::RoutingRole::ComplexPlanning,
+        _ => dume_worker::RoutingRole::Implementation,
+    };
+    draft.picker_role = Some(role);
+    draft.picker_models = Some(models);
+    draft.picker_selected = 0;
+}
+
+fn routing_set_role_model(
+    draft: &mut RoutingDraft,
+    role: dume_worker::RoutingRole,
+    selected: Option<&ModelInfo>,
+) {
+    let value = selected.map(|model| format!("{}/{}", model.provider, model.id));
+    match role {
+        dume_worker::RoutingRole::StandardPlanning => draft.settings.models.standard = value,
+        dume_worker::RoutingRole::ComplexPlanning => draft.settings.models.complex = value,
+        dume_worker::RoutingRole::Implementation => draft.settings.models.implementation = value,
+    }
+}
+
 pub enum ModalState {
     None,
+    RoutingSettings(RoutingDraft),
+    RoutingProbeConfirm(RoutingDraft),
     ModelSelector {
         models: Vec<ModelInfo>,
         filtered: Vec<ModelInfo>,
@@ -334,6 +732,7 @@ pub struct App {
     pub last_run_metrics: Option<dume_store::RunMetrics>,
     pub session_elapsed_ms: i64,
     pub session_timing_complete: bool,
+    pub last_routing_decision: Option<dume_worker::routing::RoutingDecision>,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -561,6 +960,11 @@ fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
 }
 
 impl App {
+    fn begin_run(&mut self, run_id: String) {
+        self.current_run_id = Some(run_id);
+        self.last_routing_decision = None;
+    }
+
     pub fn new(model: impl Into<String>) -> Self {
         let m = model.into();
         let effective_model = if m == "anthropic/claude-sonnet-4-5" || m.is_empty() {
@@ -602,6 +1006,7 @@ impl App {
             last_run_metrics: None,
             session_elapsed_ms: 0,
             session_timing_complete: false,
+            last_routing_decision: None,
         }
     }
 
@@ -623,6 +1028,7 @@ impl App {
 
         // Built-in commands
         let builtins = [
+            ("/routing", "라우팅 설정 열기"),
             (
                 "/model",
                 "Switch model (e.g. /model anthropic/claude-sonnet-4-5)",
@@ -699,6 +1105,14 @@ impl App {
         }
     }
 
+    pub fn delete_forward(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        if self.cursor_pos < chars.len() {
+            chars.remove(self.cursor_pos);
+            self.input_buffer = chars.into_iter().collect();
+        }
+    }
+
     pub fn cursor_left(&mut self) {
         if self.cursor_pos > 0 {
             self.cursor_pos -= 1;
@@ -749,6 +1163,22 @@ impl App {
 
     fn receive(&mut self, event: ConversationEvent) {
         match event {
+            ConversationEvent::RoutingProbeFinished { probe_id, message } => {
+                if let ModalState::RoutingSettings(draft) = &mut self.modal {
+                    if draft.probe_id != probe_id {
+                        return;
+                    }
+                    draft.message = message;
+                    draft.probe_cancel = None;
+                    draft.probe_task = None;
+                }
+            }
+            ConversationEvent::RoutingDecision(decision) => {
+                self.messages
+                    .retain(|message| !message.content.starts_with("라우팅: "));
+                self.messages.push(routing_decision_notice(&decision));
+                self.last_routing_decision = Some(decision);
+            }
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
                 self.streaming_text.push_str(&delta);
             }
@@ -787,11 +1217,20 @@ impl App {
                 {
                     return;
                 }
+                let decision_notice = self
+                    .last_routing_decision
+                    .as_ref()
+                    .map(routing_decision_notice);
                 if let Some(session_id) = session_id {
                     self.session_id = session_id;
                 }
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
                 self.messages = messages;
+                if let Some(notice) = decision_notice {
+                    self.messages
+                        .retain(|message| message.content != notice.content);
+                    self.messages.push(notice);
+                }
 
                 if let Some(error) = error {
                     self.messages
@@ -960,17 +1399,26 @@ impl App {
 }
 
 pub async fn run_tui(model: &str) -> Result<()> {
-    run_tui_with_target(model, ResumeTarget::None).await
+    run_tui_with_target(
+        model,
+        ResumeTarget::None,
+        dume_worker::routing::RoutingSnapshot::load_default(false),
+    )
+    .await
 }
 
-pub async fn run_tui_with_target(model: &str, target: ResumeTarget) -> Result<()> {
+pub async fn run_tui_with_target(
+    model: &str,
+    target: ResumeTarget,
+    routing_snapshot: dume_worker::routing::RoutingSnapshot,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, model, target).await;
+    let res = run_app(&mut terminal, model, target, routing_snapshot).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -995,6 +1443,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     model: &str,
     target: ResumeTarget,
+    mut routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<()> {
     let keybindings = KeyBindings::load_default()?;
     let mut reader = EventStream::new();
@@ -1225,6 +1674,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     raw_dispatcher = raw_dispatcher.with_store(harness_store.clone());
     let dispatcher = Arc::new(Mutex::new(raw_dispatcher));
     let mut task = None;
+    let mut routing_probe_tasks = tokio::task::JoinSet::new();
     let mut btw_tasks: Vec<(CancellationToken, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
@@ -1355,6 +1805,12 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Render active modal on top
             match &app.modal {
                 ModalState::None => {}
+                ModalState::RoutingSettings(draft) => {
+                    render_routing_settings_modal(f, f.area(), draft, &app.theme);
+                }
+                ModalState::RoutingProbeConfirm(draft) => {
+                    render_routing_probe_confirm_modal(f, f.area(), draft.probe_confirmation, &app.theme);
+                }
                 ModalState::ModelSelector {
                     filtered,
                     selected_idx,
@@ -1507,6 +1963,11 @@ async fn run_app<B: ratatui::backend::Backend>(
         })?;
 
         tokio::select! {
+            completed_probe = routing_probe_tasks.join_next(), if !routing_probe_tasks.is_empty() => {
+                if let Some(Ok((probe_id, message))) = completed_probe {
+                    app.receive(ConversationEvent::RoutingProbeFinished { probe_id, message });
+                }
+            }
             maybe_event = reader.next() => {
                 if let Some(Ok(event)) = maybe_event {
                     match event {
@@ -1954,6 +2415,154 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     continue;
                                 }
+                                ModalState::RoutingSettings(draft) => {
+                                    if matches!(keybindings.action(key), Action::Escape | Action::Quit) {
+                                        draft.cancel_probe();
+                                        app.modal = ModalState::None;
+                                        continue;
+                                    }
+                                    if draft.picker_role.is_some() {
+                                        match keybindings.action(key) {
+                                            Action::Escape | Action::Quit => {
+                                                draft.picker_role = None;
+                                                draft.picker_models = None;
+                                            }
+                                            Action::ScrollUp => draft.picker_selected = draft.picker_selected.saturating_sub(1),
+                                            Action::ScrollDown => draft.picker_selected = draft.picker_selected.saturating_add(1).min(draft.picker_models.as_ref().map_or(0, Vec::len)),
+                                            Action::SubmitInput => {
+                                                if let (Some(role), Some(models)) = (draft.picker_role.take(), draft.picker_models.take()) {
+                                                    let selected = draft.picker_selected.checked_sub(1).and_then(|index| models.get(index));
+                                                    routing_set_role_model(draft, role, selected);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    match keybindings.action(key) {
+                                        Action::ScrollUp => { draft.field_edit = false; draft.selected = draft.selected.saturating_sub(1); }
+                                        Action::ScrollDown => { draft.field_edit = false; draft.selected = (draft.selected + 1).min(12); }
+                                        Action::CursorLeft if draft.field_edit => routing_edit_left(draft),
+                                        Action::CursorRight if draft.field_edit => routing_edit_right(draft),
+                                        Action::CursorHome if draft.field_edit => draft.cursor = 0,
+                                        Action::CursorEnd if draft.field_edit => draft.cursor = routing_selected_text(draft).chars().count(),
+                                        Action::DeleteChar if draft.field_edit => routing_delete_char(draft),
+                                        Action::DeleteForward if draft.field_edit => routing_delete_forward(draft),
+                                        Action::InsertChar(c) if draft.field_edit => routing_insert_char(draft, c),
+                                        Action::Tab => { draft.field_edit = false; draft.selected = (draft.selected + 1) % 13; }
+                                        Action::SubmitInput => {
+                                            match draft.selected {
+                                                0 => draft.settings.enabled = !draft.settings.enabled,
+                                                1 => {
+                                                    draft.cancel_probe_for_config_edit();
+                                                    let current = draft.settings.classifier.clone().unwrap_or(dume_provider::ClassifierConfig { backend: dume_provider::ClassifierBackend::OpenCodeZen, base_url: String::new(), model: String::new() });
+                                                    let backend = if current.backend == dume_provider::ClassifierBackend::OpenCodeZen { dume_provider::ClassifierBackend::LocalSystemOne } else { dume_provider::ClassifierBackend::OpenCodeZen };
+                                                    draft.settings.classifier = Some(dume_provider::ClassifierConfig { backend, ..current });
+                                                    draft.key_input.clear();
+                                                    draft.cursor = 0;
+                                                    draft.refresh_key_origin();
+                                                }
+                                                2 | 3 => {
+                                                    routing_begin_field_edit(draft);
+                                                }
+                                                4..=6 => routing_open_role_picker(draft),
+                                                7 => { draft.cursor = draft.key_input.chars().count(); draft.field_edit = true; }
+                                                8 => {
+                                                    draft.cancel_probe_for_config_edit();
+                                                    let provider = draft.settings.classifier.as_ref().map(|c| c.backend.credential_provider());
+                                                    if let (Some(provider), Ok(path)) = (provider, dume_worker::RoutingSettings::global_path()) {
+                                                        let store = dume_provider::CredentialStore::new(path.with_file_name("auth.json"));
+                                                        match store.save_credential(provider, &draft.key_input) {
+                                                            Ok(()) => { draft.key_input.clear(); draft.refresh_key_origin(); draft.message = "분류기 인증 키를 저장했습니다.".into(); }
+                                                            Err(_) => draft.message = "분류기 인증 키를 저장할 수 없습니다.".into(),
+                                                        }
+                                                    } else { draft.message = "전역 인증 경로를 확인할 수 없습니다.".into(); }
+                                                }
+                                                9 => {
+                                                    draft.cancel_probe_for_config_edit();
+                                                    let provider = draft.settings.classifier.as_ref().map(|c| c.backend.credential_provider());
+                                                    if let (Some(provider), Ok(path)) = (provider, dume_worker::RoutingSettings::global_path()) {
+                                                        let store = dume_provider::CredentialStore::new(path.with_file_name("auth.json"));
+                                                        match store.delete(provider) {
+                                                            Ok(()) => draft.refresh_key_origin(),
+                                                            Err(_) => draft.message = "저장된 분류기 키를 삭제할 수 없습니다.".into(),
+                                                        }
+                                                    } else { draft.message = "전역 인증 경로를 확인할 수 없습니다.".into(); }
+                                                }
+                                                10 => {
+                                                    match draft.settings.validate() {
+                                                        Err(_) => draft.message = "설정 값을 확인하세요: 주소나 분류 모델이 올바르지 않습니다.".into(),
+                                                        Ok(()) => match draft.settings.save_default() {
+                                                            Ok(()) => draft.message = "설정을 저장했습니다.".into(),
+                                                            Err(_) => draft.message = "전역 설정 경로가 안전하지 않거나 저장할 수 없습니다.".into(),
+                                                        },
+                                                    }
+                                                }
+                                                11 => {
+                                                    if draft.probe_task.is_some() { draft.message = "연결 확인이 이미 진행 중입니다.".into(); }
+                                                    else {
+                                                        draft.probe_confirmation = false;
+                                                        app.modal = ModalState::RoutingProbeConfirm(std::mem::replace(draft, empty_routing_draft()));
+                                                    }
+                                                }
+                                                12 => { draft.cancel_probe(); app.modal = ModalState::None; },
+                                                _ => {}
+                                            }
+                                        }
+                                        Action::SubmitFollowUp => {
+                                            if draft.selected == 4 { draft.settings.models.standard = None; }
+                                            else if draft.selected == 5 { draft.settings.models.complex = None; }
+                                            else if draft.selected == 6 { draft.settings.models.implementation = None; }
+                                            else if draft.selected == 9 {
+                                                draft.cancel_probe_for_config_edit();
+                                                let provider = draft.settings.classifier.as_ref().map(|c| c.backend.credential_provider());
+                                                if let (Some(provider), Ok(path)) = (provider, dume_worker::RoutingSettings::global_path()) {
+                                                    let store = dume_provider::CredentialStore::new(path.parent().unwrap_or_else(|| std::path::Path::new(".")).join("auth.json"));
+                                                    match store.delete(provider) {
+                                                        Ok(()) => draft.refresh_key_origin(),
+                                                        Err(_) => draft.message = "저장 키를 삭제할 수 없습니다.".into(),
+                                                    }
+                                                } else { draft.message = "전역 인증 경로를 확인할 수 없습니다.".into(); }
+                                            }
+                                        }
+                                        Action::Clear => if draft.selected == 7 { draft.key_input.clear(); draft.cursor = 0; },
+                                        Action::PageUp => { draft.field_edit = false; draft.selected = 0; },
+                                        Action::PageDown => { draft.field_edit = false; draft.selected = 12; },
+                                        Action::Escape => { draft.cancel_probe(); app.modal = ModalState::None; },
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                                ModalState::RoutingProbeConfirm(draft) => {
+                                    match keybindings.action(key) {
+                                    Action::CursorLeft | Action::ScrollUp => draft.probe_confirmation = false,
+                                    Action::CursorRight | Action::ScrollDown | Action::Tab => draft.probe_confirmation = true,
+                                    Action::SubmitInput if !draft.probe_confirmation => {
+                                        draft.probe_confirmation = false;
+                                        app.modal = ModalState::RoutingSettings(std::mem::replace(draft, empty_routing_draft()));
+                                    }
+                                    Action::SubmitInput => {
+                                        draft.message = "확인 중입니다…".into();
+                                        let token = CancellationToken::new();
+                                        draft.probe_cancel = Some(token.clone());
+                                        let config = draft.settings.classifier.clone();
+                                        let global_auth_path = dume_worker::RoutingSettings::global_path().ok().map(|path| path.with_file_name("auth.json"));
+                                        if let (Some(config), Some(auth_path)) = (config, global_auth_path) {
+                                            let credentials = dume_provider::CredentialStore::new(auth_path);
+                                            spawn_routing_probe(&mut routing_probe_tasks, draft, config, credentials, token);
+                                        } else {
+                                            draft.message = "HOME 경로 오류 · 인증 정보를 읽지 않았습니다.".into();
+                                        }
+                                        app.modal = ModalState::RoutingSettings(std::mem::replace(draft, empty_routing_draft()));
+                                    }
+                                    Action::Escape | Action::Quit => {
+                                        draft.cancel_probe();
+                                        app.modal = ModalState::RoutingSettings(std::mem::replace(draft, empty_routing_draft()));
+                                    }
+                                    _ => {}
+                                    }
+                                    continue;
+                                }
                                 ModalState::None => {}
                             }
 
@@ -1962,6 +2571,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                             let is_autocomplete_active = !autocomplete_items.is_empty();
 
                             match keybindings.action(key) {
+                                Action::OpenRoutingSettings => {
+                                    let (settings, message) = match dume_worker::RoutingSettings::load_default() {
+                                        Ok(settings) => (settings, "↑/↓ 항목 · Enter 선택/편집 · Esc 닫기".to_string()),
+                                        Err(_) => (dume_worker::RoutingSettings::default(), "설정을 읽지 못해 기본값으로 열었습니다.".to_string()),
+                                    };
+                                    let mut draft = RoutingDraft::new(settings, "인증 정보 없음".into());
+                                    draft.message = message;
+                                    draft.refresh_key_origin();
+                                    app.modal = ModalState::RoutingSettings(draft);
+                                }
                                 Action::Quit => {
                                     // 1. If currently busy streaming, first Ctrl+C cancels the active turn
                                     if app.is_busy {
@@ -2025,6 +2644,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 Action::DeleteChar => {
                                     app.autocomplete_dismissed = false;
                                     app.delete_char();
+                                    app.autocomplete_index = 0;
+                                }
+                                Action::DeleteForward => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_forward();
                                     app.autocomplete_index = 0;
                                 }
                                 Action::CursorLeft => app.cursor_left(),
@@ -2161,7 +2785,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 let run_id = candidate.run_id;
                                                 let history = harness_store.conversation_history(&app.conversation_id)?;
                                                 let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
-                                                app.current_run_id = Some(run_id.clone());
+                                                app.begin_run(run_id.clone());
                                                 app.is_busy = true;
                                                 app.busy_started_at = Some(std::time::Instant::now());
                                                 let model_name = app.model.clone();
@@ -2170,7 +2794,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 current_stream_cancel = Some(run_cancel.clone());
                                                 task = Some(spawn_admitted_run(
                                                     model_name, session_id, messages, stream_tx.clone(), dispatcher.clone(),
-                                                    run_cancel, harness_store.clone(), app.conversation_id.clone(), run_id.clone(),
+                                                    run_cancel, harness_store.clone(), app.conversation_id.clone(), run_id.clone(), routing_snapshot.clone(),
                                                 ));
                                                 Ok(format!("Resuming paused run {run_id} without submitting new input."))
                                             })();
@@ -2214,7 +2838,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 if let Some(run_id) = resumed_receipt.and_then(|receipt| receipt.run_id) {
                                                     let history = harness_store.conversation_history(&app.conversation_id)?;
                                                     let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
-                                                    app.current_run_id = Some(run_id.clone());
+                                                    app.begin_run(run_id.clone());
                                                     app.is_busy = true;
                                                     app.busy_started_at = Some(std::time::Instant::now());
                                                     let model_name = app.model.clone();
@@ -2225,9 +2849,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     let task_dispatcher = dispatcher.clone();
                                                     let store = harness_store.clone();
                                                     let conversation_id = app.conversation_id.clone();
-                                                    task = Some(spawn_admitted_run(model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id));
+                                                    task = Some(spawn_admitted_run(model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id, routing_snapshot.clone()));
                                                 }
                                             }
+                                            continue;
+                                        } else if trimmed == "/routing" {
+                                            let (settings, message) = match dume_worker::RoutingSettings::load_default() {
+                                                Ok(settings) => (settings, "↑/↓ 항목 · Enter 선택/편집 · Esc 닫기".to_string()),
+                                                Err(_) => (dume_worker::RoutingSettings::default(), "설정을 읽지 못해 기본값으로 열었습니다.".to_string()),
+                                            };
+                                            let mut draft = RoutingDraft::new(settings, "인증 정보 없음".into());
+                                            draft.message = message;
+                                            draft.refresh_key_origin();
+                                            app.modal = ModalState::RoutingSettings(draft);
                                             continue;
                                         } else if trimmed == "/model" || trimmed == "/model " {
                                             let models = selectable_models();
@@ -2581,12 +3215,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         continue;
                                                     }
                                                 };
-                                                app.current_run_id = Some(run_id.clone());
+                                                app.begin_run(run_id.clone());
                                                 let store = harness_store.clone();
                                                 let conversation_id = app.conversation_id.clone();
+                                                routing_snapshot.reload_for_new_input();
+                                                let run_routing = routing_snapshot.clone();
 
                                                 task = Some(tokio::spawn(async move {
-                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id).await;
+                                                    dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id, run_routing).await;
                                                 }));
                                                 continue;
                                             } else {
@@ -2629,12 +3265,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         let child_cancel = cancellation.child_token();
                                         current_stream_cancel = Some(child_cancel.clone());
                                         let run_id = receipt.run_id.expect("admitted submission creates a run");
-                                        app.current_run_id = Some(run_id.clone());
+                                        app.begin_run(run_id.clone());
                                         let store = harness_store.clone();
                                         let conversation_id = app.conversation_id.clone();
+                                        routing_snapshot.reload_for_new_input();
+                                        let run_routing = routing_snapshot.clone();
 
                                         task = Some(tokio::spawn(async move {
-                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id).await;
+                                            dispatch_stream(&model_name, session_id, msgs, tx, dispatcher, child_cancel, store, conversation_id, run_id, run_routing).await;
                                         }));
                                     }
                                 }
@@ -2656,7 +3294,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 if let Some(run_id) = receipt.run_id {
                                                     let history = harness_store.conversation_history(&app.conversation_id)?;
                                                     let messages = history.iter().filter_map(|row| serde_json::from_str(&row.message_json).ok()).collect();
-                                                    app.current_run_id = Some(run_id.clone());
+                                                    app.begin_run(run_id.clone());
                                                     app.is_busy = true;
                                                     app.busy_started_at = Some(std::time::Instant::now());
                                                     let model_name = app.model.clone();
@@ -2667,8 +3305,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     let task_dispatcher = dispatcher.clone();
                                                     let store = harness_store.clone();
                                                     let conversation_id = app.conversation_id.clone();
+                                                    routing_snapshot.reload_for_new_input();
+                                                    let run_routing = routing_snapshot.clone();
                                                     task = Some(tokio::spawn(async move {
-                                                        dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id).await;
+                                                        dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id, run_routing).await;
                                                     }));
                                                 }
                                             }
@@ -2747,7 +3387,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             .filter_map(|row| serde_json::from_str(&row.message_json).ok())
                             .collect();
                         let run_id = next_run.run_id;
-                        app.current_run_id = Some(run_id.clone());
+                        app.begin_run(run_id.clone());
                         app.is_busy = true;
                         app.busy_started_at = Some(std::time::Instant::now());
                         let model_name = app.model.clone();
@@ -2758,8 +3398,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                         let task_dispatcher = dispatcher.clone();
                         let store = harness_store.clone();
                         let conversation_id = app.conversation_id.clone();
+                        routing_snapshot.reload_for_new_input();
+                        let run_routing = routing_snapshot.clone();
                         task = Some(tokio::spawn(async move {
-                            dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id).await;
+                            dispatch_stream(&model_name, session_id, messages, tx, task_dispatcher, run_cancel, store, conversation_id, run_id, run_routing).await;
                         }));
                     }
                 }
@@ -2803,6 +3445,13 @@ async fn run_app<B: ratatui::backend::Backend>(
     let _ = persist_handle.await;
 
     cancellation.cancel();
+    if let ModalState::RoutingSettings(draft) | ModalState::RoutingProbeConfirm(draft) =
+        &mut app.modal
+    {
+        draft.cancel_probe();
+    }
+    routing_probe_tasks.abort_all();
+    while routing_probe_tasks.join_next().await.is_some() {}
     for (token, _) in &btw_tasks {
         token.cancel();
     }
@@ -2827,6 +3476,7 @@ fn spawn_admitted_run(
     store: Arc<HarnessStore>,
     conversation_id: String,
     run_id: String,
+    routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         dispatch_stream(
@@ -2839,6 +3489,7 @@ fn spawn_admitted_run(
             store,
             conversation_id,
             run_id,
+            routing_snapshot,
         )
         .await;
     })
@@ -2854,9 +3505,12 @@ async fn dispatch_stream(
     store: Arc<HarnessStore>,
     conversation_id: String,
     run_id: String,
+    routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) {
-    let session_result = match store.get_run(&run_id) {
-        Ok(record) if matches!(record.status.as_str(), "interrupted" | "needs_attention") => {
+    let previous_status = store.get_run(&run_id).ok().map(|record| record.status);
+    let resuming = routing_run_status(previous_status.as_deref());
+    let session_result = match previous_status.as_deref() {
+        Some("interrupted" | "needs_attention") => {
             RunSession::resume(store.clone(), &run_id, &conversation_id)
         }
         _ => RunSession::start(
@@ -2929,6 +3583,11 @@ async fn dispatch_stream(
             return;
         }
     }
+    let mut routing_snapshot =
+        routing_snapshot_for_run(routing_snapshot, previous_status.as_deref());
+    if !resuming {
+        routing_snapshot.reload_for_new_input();
+    }
     let result = run_session
         .with_checkpoints(
             &cancellation,
@@ -2940,6 +3599,7 @@ async fn dispatch_stream(
                 &mut dispatcher,
                 &cancellation,
                 &run_session,
+                routing_snapshot,
             ),
         )
         .await;
@@ -2987,6 +3647,11 @@ struct PendingCompaction {
     after: Vec<ChatMessage>,
 }
 
+struct PreparedRequest {
+    messages: Vec<ChatMessage>,
+    effective_model: String,
+}
+
 struct DispatchState {
     session_id: String,
     pending: Option<PendingCompaction>,
@@ -3017,6 +3682,7 @@ async fn dispatch_authenticated(
     dispatcher: &mut ToolDispatcher,
     cancellation: &CancellationToken,
     run_session: &RunSession,
+    mut routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<String> {
     if !messages.iter().any(|m| {
         m.role == dume_provider::Role::System
@@ -3026,6 +3692,9 @@ async fn dispatch_authenticated(
             0,
             ChatMessage::system(dume_core::types::PromptPrefix::BASE_SYSTEM_PROMPT),
         );
+    }
+    if cancellation.is_cancelled() {
+        anyhow::bail!("Conversation cancelled");
     }
     let cred_store =
         dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
@@ -3044,9 +3713,11 @@ async fn dispatch_authenticated(
         cancellation,
         Some(run_session),
         10,
-        |raw_messages, tools, request_session_id, tx| {
+        Some(&mut routing_snapshot),
+        &model,
+        |raw_messages, tools, request_session_id, effective_model, tx| {
             let cred_store = cred_store.clone();
-            let model = model.clone();
+            let model = effective_model;
             let store = store.clone();
             let session_state = Arc::clone(&session_state);
             async move {
@@ -3083,7 +3754,10 @@ async fn dispatch_authenticated(
                 provider
                     .stream_with_context(&provider_msgs, &tools, Some(&turn_ctx), tx)
                     .await?;
-                Ok(raw_messages)
+                Ok(PreparedRequest {
+                    messages: raw_messages,
+                    effective_model: model,
+                })
             }
         },
     )
@@ -3320,6 +3994,8 @@ async fn run_conversation<F, Fut>(
     cancellation: &CancellationToken,
     run_session: Option<&RunSession>,
     max_turns: usize,
+    mut routing_snapshot: Option<&mut dume_worker::routing::RoutingSnapshot>,
+    original_model: &str,
     mut stream: F,
 ) -> Result<()>
 where
@@ -3327,9 +4003,10 @@ where
         Vec<ChatMessage>,
         Vec<dume_provider::types::ToolDefinition>,
         String,
+        String,
         mpsc::Sender<StreamEvent>,
     ) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<ChatMessage>>>,
+    Fut: std::future::Future<Output = Result<PreparedRequest>>,
 {
     for _ in 0..max_turns {
         dispatcher.refresh_mcp().await?;
@@ -3337,7 +4014,16 @@ where
         let (sub_tx, mut sub_rx) = mpsc::channel(100);
         let collect = async {
             let mut turn = StreamTurn::default();
+            let mut actual_model = None;
             while let Some(event) = sub_rx.recv().await {
+                if let StreamEvent::AttemptFinished {
+                    model,
+                    outcome: dume_provider::AttemptOutcome::Succeeded,
+                    ..
+                } = &event
+                {
+                    actual_model = Some(model.clone());
+                }
                 if let Some(session) = run_session {
                     session.record_model_event(&event)?;
                     if matches!(event, StreamEvent::AttemptFinished { .. }) {
@@ -3360,15 +4046,34 @@ where
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }
             }
-            turn.finish()
+            let (assistant, calls) = turn.finish()?;
+            Ok((assistant, calls, actual_model))
         };
         // Both futures are scoped: errors drop the other side, never detach a producer.
-        let (prepared_messages, (assistant, tool_calls)) = tokio::select! {
+        let effective_model = if let (Some(snapshot), Some(session)) =
+            (routing_snapshot.as_deref_mut(), run_session)
+        {
+            let credentials =
+                dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+            let decision = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
+                result = dume_worker::routing::select_model(snapshot, session, original_model, messages, &credentials, cancellation) => result?,
+            };
+            let _ = tx
+                .send(ConversationEvent::RoutingDecision(decision.clone()))
+                .await;
+            decision.effective_model
+        } else {
+            original_model.to_string()
+        };
+        let (prepared, (assistant, tool_calls, actual_model)) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
-            result = async { tokio::try_join!(stream(messages.clone(), tools, session_id.clone(), sub_tx), collect) } => result?,
+            result = async { tokio::try_join!(stream(messages.clone(), tools, session_id.clone(), effective_model, sub_tx), collect) } => result?,
         };
-        *messages = prepared_messages;
+        dispatcher.set_model(actual_model.as_deref().unwrap_or(&prepared.effective_model));
+        *messages = prepared.messages;
         messages.push(assistant.clone());
         let executions = if let Some(session) = run_session {
             Some(session.prepare_tools(&assistant)?)
@@ -3381,6 +4086,11 @@ where
             if let Some(session) = run_session {
                 match session.boundary()? {
                     BoundaryResult::Continue(inputs) => {
+                        if !inputs.is_empty() {
+                            if let Some(snapshot) = routing_snapshot.as_deref_mut() {
+                                snapshot.reload_for_new_input();
+                            }
+                        }
                         for input in inputs {
                             messages.push(ChatMessage::user(input.payload));
                         }
@@ -3473,7 +4183,13 @@ where
             .await?;
         }
         if let Some(session) = run_session {
-            for input in session.consume_steer()? {
+            let inputs = session.consume_steer()?;
+            if !inputs.is_empty() {
+                if let Some(snapshot) = routing_snapshot.as_deref_mut() {
+                    snapshot.reload_for_new_input();
+                }
+            }
+            for input in inputs {
                 messages.push(ChatMessage::user(input.payload));
             }
         }
@@ -3486,6 +4202,473 @@ mod tests {
     use super::*;
     use dume_provider::types::Role;
     use std::collections::VecDeque;
+
+    #[test]
+    fn routing_field_cursor_edits_korean_by_unicode_scalar_and_roles_do_not_change_parent_model() {
+        let mut draft = RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.selected = 2;
+        draft.settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::OpenCodeZen,
+            base_url: "가나".into(),
+            model: "분류".into(),
+        });
+        draft.cursor = 1;
+        routing_insert_char(&mut draft, '다');
+        assert_eq!(
+            draft.settings.classifier.as_ref().unwrap().base_url,
+            "가다나"
+        );
+        routing_delete_char(&mut draft);
+        assert_eq!(draft.settings.classifier.as_ref().unwrap().base_url, "가나");
+        draft.selected = 5;
+        draft.picker_models = Some(Vec::new());
+        routing_set_role_model(&mut draft, dume_worker::RoutingRole::ComplexPlanning, None);
+        assert_eq!(draft.settings.models.complex, None);
+        let app = App::new("parent/model");
+        let model = ModelInfo {
+            id: "selected".into(),
+            name: "선택".into(),
+            provider: "fixture".into(),
+            api: String::new(),
+            base_url: None,
+            reasoning: false,
+            input: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            cost: None,
+        };
+        for role in [
+            dume_worker::RoutingRole::StandardPlanning,
+            dume_worker::RoutingRole::ComplexPlanning,
+            dume_worker::RoutingRole::Implementation,
+        ] {
+            routing_set_role_model(&mut draft, role, Some(&model));
+        }
+        assert_eq!(
+            draft.settings.models.standard.as_deref(),
+            Some("fixture/selected")
+        );
+        assert_eq!(
+            draft.settings.models.complex.as_deref(),
+            Some("fixture/selected")
+        );
+        assert_eq!(
+            draft.settings.models.implementation.as_deref(),
+            Some("fixture/selected")
+        );
+        routing_set_role_model(&mut draft, dume_worker::RoutingRole::Implementation, None);
+        assert_eq!(draft.settings.models.implementation, None);
+        assert_eq!(app.model, "parent/model");
+    }
+
+    #[test]
+    fn routing_role_picker_with_empty_catalog_still_offers_inheritance() {
+        let mut draft = RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.selected = 4;
+        routing_begin_role_picker(&mut draft, Vec::new());
+        assert_eq!(draft.picker_selected, 0);
+        assert_eq!(draft.picker_models.as_ref().unwrap().len(), 0);
+        let role = draft.picker_role.take().unwrap();
+        let models = draft.picker_models.take().unwrap();
+        let model = draft
+            .picker_selected
+            .checked_sub(1)
+            .and_then(|index| models.get(index));
+        routing_set_role_model(&mut draft, role, model);
+        assert_eq!(draft.settings.models.standard, None);
+    }
+
+    #[test]
+    fn blank_routing_draft_fields_can_be_edited_and_validated_without_api_key() {
+        let mut draft = RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.selected = 2;
+        routing_begin_field_edit(&mut draft);
+        for ch in "http://127.0.0.1:8080".chars() {
+            routing_insert_char(&mut draft, ch);
+        }
+        draft.selected = 3;
+        routing_begin_field_edit(&mut draft);
+        for ch in "classifier-test".chars() {
+            routing_insert_char(&mut draft, ch);
+        }
+        assert!(draft.settings.validate().is_ok());
+        assert_eq!(
+            draft.settings.classifier.as_ref().unwrap().base_url,
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            draft.settings.classifier.as_ref().unwrap().model,
+            "classifier-test"
+        );
+        let public_json = serde_json::to_string(&draft.settings).unwrap();
+        assert!(!public_json.contains("key_input"));
+        assert!(!public_json.contains("classifier-test-secret"));
+    }
+
+    #[test]
+    fn main_editor_forward_delete_removes_one_korean_scalar_and_is_noop_at_end() {
+        let mut app = App::new("test/model");
+        app.input_buffer = "가나다".into();
+        app.cursor_pos = 1;
+        app.delete_forward();
+        assert_eq!(app.input_buffer, "가다");
+        assert_eq!(app.cursor_pos, 1);
+        app.cursor_pos = app.input_buffer.chars().count();
+        app.delete_forward();
+        assert_eq!(app.input_buffer, "가다");
+    }
+
+    #[test]
+    fn routing_key_origin_uses_backend_store_and_never_returns_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = dume_provider::CredentialStore::new(&path);
+        store.save_credential("opencode", "fixture-secret").unwrap();
+        store
+            .save_credential("jev-local-system-one", "local-secret")
+            .unwrap();
+        assert_eq!(
+            routing_key_origin(dume_provider::ClassifierBackend::OpenCodeZen, &path, true),
+            "환경변수"
+        );
+        assert_eq!(
+            routing_key_origin(dume_provider::ClassifierBackend::OpenCodeZen, &path, false),
+            "저장됨"
+        );
+        assert_eq!(
+            routing_key_origin(
+                dume_provider::ClassifierBackend::LocalSystemOne,
+                &path,
+                true
+            ),
+            "저장됨"
+        );
+        let origin = routing_key_origin(
+            dume_provider::ClassifierBackend::LocalSystemOne,
+            &path,
+            false,
+        );
+        assert_eq!(origin, "저장됨");
+        assert!(!origin.contains("local-secret"));
+    }
+
+    #[test]
+    fn stale_routing_probe_completion_does_not_modify_a_new_draft() {
+        let mut app = App::new("test/model");
+        let mut draft = RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.probe_id = 2;
+        app.modal = ModalState::RoutingSettings(draft);
+        app.receive(ConversationEvent::RoutingProbeFinished {
+            probe_id: 1,
+            message: "오래된 결과".into(),
+        });
+        let ModalState::RoutingSettings(draft) = &app.modal else {
+            panic!("라우팅 편집기가 유지되어야 합니다")
+        };
+        assert_ne!(draft.message, "오래된 결과");
+    }
+
+    async fn routing_probe_fixture(
+        body: &'static str,
+        status: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            let body_start = loop {
+                let count = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.read(&mut chunk),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(count > 0, "client closed before request completed");
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..index]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= index + 4 + length {
+                        break index + 4;
+                    }
+                }
+            };
+            let captured = String::from_utf8_lossy(&request).into_owned();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            assert!(body_start <= request.len());
+            captured
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn routing_probe_helper_sends_only_fixed_prompt_with_local_scoped_saved_credential() {
+        let (url, task) = routing_probe_fixture(r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":0.8,"complex":0.2},"confidence":0.8}},"usage":{"input_tokens":3,"output_tokens":1}}"#, "200 OK").await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        store
+            .save_credential("jev-local-system-one", "fixture-local-key")
+            .unwrap();
+        store.save_credential("opencode", "different-key").unwrap();
+        let config = dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: url,
+            model: "fixture-classifier".into(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            routing_probe_request(config, store, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        let request = task.await.unwrap();
+        assert!(result.contains("토큰 3+1"));
+        assert!(request.contains("Bearer fixture-local-key"));
+        assert!(!request.contains("different-key"));
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["state"]["prompt"], ROUTING_PROBE_PROMPT);
+        assert_eq!(
+            ROUTING_PROBE_PROMPT,
+            "두 수를 더하는 간단한 함수 작성 요청의 복잡도를 분류하세요."
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_probe_reuses_saved_opencode_zen_login() {
+        let (url, task) = routing_probe_fixture(r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":0.8,"complex":0.2},"confidence":0.8}},"usage":{"input_tokens":3,"output_tokens":1}}"#, "200 OK").await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        store.save_credential("opencode", "saved-zen-key").unwrap();
+        store
+            .save_credential("jev-local-system-one", "local-key")
+            .unwrap();
+        let config = dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::OpenCodeZen,
+            base_url: url,
+            model: "jev-1.13-free".into(),
+        };
+        let result = routing_probe_request(config, store, CancellationToken::new()).await;
+        let request = task.await.unwrap();
+        assert!(result.contains("연결 확인 완료"));
+        assert!(request.contains("Bearer saved-zen-key"));
+        assert!(!request.contains("Bearer local-key"));
+        assert!(request.contains("jev-1.13-free"));
+    }
+
+    #[tokio::test]
+    async fn routing_probe_helper_hides_http_and_malformed_response_bodies() {
+        for (body, status) in [
+            (r#"{"secret":"fake-secret"}"#, "500 Internal Server Error"),
+            ("not-json", "200 OK"),
+            (
+                r#"{"answers":{"complexity":{"type":"choice","choice":"standard"}}}"#,
+                "200 OK",
+            ),
+        ] {
+            let (url, task) = routing_probe_fixture(body, status).await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+            let config = dume_provider::ClassifierConfig {
+                backend: dume_provider::ClassifierBackend::LocalSystemOne,
+                base_url: url,
+                model: "fixture".into(),
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(7),
+                routing_probe_request(config, store, CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+            let request = task.await.unwrap();
+            assert!(!result.contains("fake-secret"));
+            assert!(!result.contains("not-json"));
+            assert!(result.contains("실패") || result.contains("응답"));
+            assert!(!request.contains("Authorization: Bearer"));
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_probe_helper_precancel_performs_no_loopback_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        let config = dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: format!("http://{address}"),
+            model: "fixture".into(),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            routing_probe_request(config, store, cancellation)
+                .await
+                .contains("취소")
+        );
+        assert!(accept.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn routing_probe_draft_drop_cancels_abort_joins_owner_and_ignores_stale_result() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let count = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.read(&mut chunk),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(boundary) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..boundary]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= boundary + 4 + length {
+                        accepted_tx.send(request).unwrap();
+                        break;
+                    }
+                }
+            }
+            // Keep the connection open until the probe task is aborted, then observe client EOF.
+            let mut eof = false;
+            while !eof {
+                let count = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.read(&mut chunk),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                eof = count == 0;
+            }
+            assert!(eof);
+            let extra_accept =
+                tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                    .await;
+            assert!(
+                extra_accept.is_err(),
+                "no second request should be accepted"
+            );
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        credentials
+            .save_credential("jev-local-system-one", "saved-local")
+            .unwrap();
+        let config = dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: format!("http://{address}"),
+            model: "fixture".into(),
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut draft = RoutingDraft::new(
+            dume_worker::RoutingSettings {
+                classifier: Some(config.clone()),
+                ..Default::default()
+            },
+            "저장됨".into(),
+        );
+        let cancellation = CancellationToken::new();
+        spawn_routing_probe(
+            &mut tasks,
+            &mut draft,
+            config.clone(),
+            credentials,
+            cancellation,
+        );
+        assert_eq!(tasks.len(), 1);
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&request).contains("Bearer saved-local"));
+        let old_id = draft.probe_id;
+        drop(draft);
+        assert_eq!(tasks.len(), 1);
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(joined.unwrap_err().is_cancelled());
+        assert_eq!(tasks.len(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut app = App::new("original/model");
+        let mut reopened = RoutingDraft::new(
+            dume_worker::RoutingSettings {
+                classifier: Some(config),
+                ..Default::default()
+            },
+            "저장됨".into(),
+        );
+        reopened.probe_id =
+            NEXT_ROUTING_PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let original_message = reopened.message.clone();
+        app.modal = ModalState::RoutingSettings(reopened);
+        app.receive(ConversationEvent::RoutingProbeFinished {
+            probe_id: old_id,
+            message: "오래된 결과".into(),
+        });
+        let ModalState::RoutingSettings(reopened) = &app.modal else {
+            panic!("새 편집기가 유지되어야 합니다")
+        };
+        assert_eq!(reopened.message, original_message);
+        assert_ne!(reopened.message, "오래된 결과");
+        assert_eq!(reopened.key_state, "저장됨");
+        assert_eq!(
+            reopened.settings.classifier.as_ref().unwrap().backend,
+            dume_provider::ClassifierBackend::LocalSystemOne
+        );
+    }
 
     fn delta(index: usize, id: Option<&str>, name: Option<&str>, args: &str) -> StreamEvent {
         StreamEvent::ToolCallDelta {
@@ -3500,6 +4683,160 @@ mod tests {
         StreamEvent::Completed {
             finish_reason: reason.to_string(),
         }
+    }
+
+    #[test]
+    fn routing_decision_is_visible_controlplane_and_excluded_from_model_history() {
+        let mut app = App::new("original/model");
+        app.messages.push(ChatMessage::user("실제 요청"));
+        let history_before = model_messages(&app.messages);
+        app.receive(ConversationEvent::RoutingDecision(
+            dume_worker::routing::RoutingDecision {
+                original_model: "original/model".into(),
+                effective_model: "effective/model".into(),
+                phase: dume_store::RoutingPhase::Planning,
+                epoch: Some("epoch".into()),
+                reason: "complexity_complex".into(),
+                classifier_usage: Some(dume_provider::classifier::ClassifierUsage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                }),
+            },
+        ));
+        assert_eq!(model_messages(&app.messages), history_before);
+        assert!(
+            app.messages
+                .last()
+                .unwrap()
+                .content
+                .contains("original/model → effective/model")
+        );
+        assert!(
+            app.messages
+                .last()
+                .unwrap()
+                .content
+                .contains("분류 토큰 7+2 (가격 미확인)")
+        );
+        assert_eq!(
+            app.last_routing_decision.as_ref().unwrap().effective_model,
+            "effective/model"
+        );
+    }
+
+    #[test]
+    fn routing_snapshot_preserves_epochs_only_for_actual_resumable_run_statuses() {
+        let settings = dume_worker::RoutingSettings::default();
+        for status in [Some("interrupted"), Some("needs_attention")] {
+            let snapshot =
+                dume_worker::routing::RoutingSnapshot::from_settings(settings.clone(), false);
+            let snapshot = routing_snapshot_for_run(snapshot, status);
+            assert!(format!("{snapshot:?}").contains("preserve_saved_epoch: true"));
+        }
+        for status in [
+            None,
+            Some("queued"),
+            Some("running"),
+            Some("succeeded"),
+            Some("failed"),
+        ] {
+            let snapshot =
+                dume_worker::routing::RoutingSnapshot::from_settings(settings.clone(), true);
+            let snapshot = routing_snapshot_for_run(snapshot, status);
+            assert!(format!("{snapshot:?}").contains("preserve_saved_epoch: false"));
+        }
+    }
+
+    #[test]
+    fn finished_keeps_latest_routing_controlplane_notice_without_changing_model_history() {
+        let mut app = App::new("original/model");
+        app.current_run_id = Some("run-routing".into());
+        app.is_busy = true;
+        let user = ChatMessage::user("request");
+        let history_before = model_messages(std::slice::from_ref(&user));
+        app.receive(ConversationEvent::RoutingDecision(
+            dume_worker::routing::RoutingDecision {
+                original_model: "original/model".into(),
+                effective_model: "opencode/qa-implementation".into(),
+                phase: dume_store::RoutingPhase::Implementation,
+                epoch: Some("epoch-current".into()),
+                reason: "complexity_complex".into(),
+                classifier_usage: Some(dume_provider::classifier::ClassifierUsage {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                }),
+            },
+        ));
+        for error in [None, Some("provider failed".to_string())] {
+            app.receive(ConversationEvent::Finished {
+                run_id: Some("run-routing".into()),
+                messages: vec![user.clone()],
+                error: error.clone(),
+                session_id: Some("session".into()),
+            });
+            assert!(
+                app.messages
+                    .iter()
+                    .any(|message| message.content.contains("opencode/qa-implementation"))
+            );
+            assert_eq!(
+                app.messages
+                    .iter()
+                    .filter(|message| message.content.contains("opencode/qa-implementation"))
+                    .count(),
+                1
+            );
+            assert_eq!(model_messages(&app.messages), history_before);
+            if error.is_some() {
+                assert!(
+                    app.messages
+                        .iter()
+                        .any(|message| message.content.contains("Error: provider failed"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn newer_fixed_routing_decision_replaces_old_controlplane_notice_and_stale_finish_cannot_reverse_it()
+     {
+        let mut app = App::new("original/model");
+        app.current_run_id = Some("run-current".into());
+        app.is_busy = true;
+        let decision =
+            |effective: &str, epoch: Option<&str>| dume_worker::routing::RoutingDecision {
+                original_model: "original/model".into(),
+                effective_model: effective.into(),
+                phase: dume_store::RoutingPhase::Fixed,
+                epoch: epoch.map(str::to_string),
+                reason: "disabled".into(),
+                classifier_usage: None,
+            };
+        app.receive(ConversationEvent::RoutingDecision(decision(
+            "old/model",
+            Some("old"),
+        )));
+        app.receive(ConversationEvent::RoutingDecision(decision(
+            "original/model",
+            None,
+        )));
+        app.receive(ConversationEvent::Finished {
+            run_id: Some("run-stale".into()),
+            messages: vec![ChatMessage::user("stale")],
+            error: None,
+            session_id: None,
+        });
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("original/model"))
+        );
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| message.content.contains("old/model"))
+        );
+        assert_eq!(app.last_routing_decision.as_ref().unwrap().epoch, None);
     }
 
     #[tokio::test]
@@ -3803,7 +5140,9 @@ mod tests {
                 &CancellationToken::new(),
                 Some(&session),
                 3,
-                |history, _, context, events| {
+                None,
+                "test",
+                |history, _, context, effective_model, events| {
                     requests.push(history.clone());
                     let first = requests.len() == 1;
                     let context = dume_provider::types::StreamRequestContext::for_session(context);
@@ -3839,7 +5178,10 @@ mod tests {
                             })
                             .await
                             .unwrap();
-                        Ok(history)
+                        Ok(PreparedRequest {
+                            messages: history,
+                            effective_model,
+                        })
                     }
                 },
             )
@@ -3895,7 +5237,9 @@ mod tests {
             &CancellationToken::new(),
             None,
             max_turns,
-            |history, _, _, tx| {
+            None,
+            "test",
+            |history, _, _, effective_model, tx| {
                 requests.push(history.clone());
                 let (events, fail) = scripts.pop_front().expect("unexpected model request");
                 async move {
@@ -3905,7 +5249,10 @@ mod tests {
                         }
                     }
                     anyhow::ensure!(!fail, "provider request failed");
-                    Ok(history)
+                    Ok(PreparedRequest {
+                        messages: history,
+                        effective_model,
+                    })
                 }
             },
         )
@@ -4242,7 +5589,9 @@ mod tests {
             &cancellation,
             None,
             10,
-            |_, _, _, tx| {
+            None,
+            "test",
+            |_, _, _, _, tx| {
                 let token = cancellation.clone();
                 let dropped = dropped.clone();
                 async move {
@@ -4256,7 +5605,7 @@ mod tests {
                     .await
                     .unwrap();
                     token.cancel();
-                    std::future::pending::<Result<Vec<ChatMessage>>>().await
+                    std::future::pending::<Result<PreparedRequest>>().await
                 }
             },
         )
@@ -4468,14 +5817,26 @@ mod tests {
             store.clone(),
             "pipeline-test".to_string(),
             run_id.clone(),
+            dume_worker::routing::RoutingSnapshot::load_default(false),
         )
         .await;
-        let Some(ConversationEvent::Finished {
+        let finished = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("conversation event receive timed out")
+            {
+                Some(event @ ConversationEvent::Finished { .. }) => break event,
+                Some(ConversationEvent::RoutingDecision(_)) => continue,
+                Some(_) => continue,
+                None => panic!("conversation event channel closed before completion"),
+            }
+        };
+        let ConversationEvent::Finished {
             run_id: Some(_),
             mut messages,
             error: Some(error),
             session_id: Some(session_id),
-        }) = rx.recv().await
+        } = finished
         else {
             panic!("expected a failed conversation with a recoverable session");
         };
