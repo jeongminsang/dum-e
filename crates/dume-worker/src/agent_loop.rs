@@ -74,6 +74,11 @@ pub struct AgentLoop {
     artifact_store: Option<std::sync::Arc<dume_store::ArtifactStore>>,
     pub request_context: Option<dume_provider::types::StreamRequestContext>,
     pub descendant_usage: std::sync::Arc<tokio::sync::Mutex<dume_provider::types::TokenUsage>>,
+    routing_snapshot: Option<crate::routing::RoutingSnapshot>,
+    #[cfg(test)]
+    routing_credentials: Option<dume_provider::CredentialStore>,
+    #[cfg(test)]
+    subagent_model_overrides: std::collections::HashMap<String, Option<String>>,
 }
 
 #[derive(Clone)]
@@ -96,12 +101,45 @@ impl AgentLoop {
             descendant_usage: std::sync::Arc::new(tokio::sync::Mutex::new(
                 dume_provider::types::TokenUsage::default(),
             )),
+            routing_snapshot: None,
+            #[cfg(test)]
+            routing_credentials: None,
+            #[cfg(test)]
+            subagent_model_overrides: std::collections::HashMap::new(),
         }
     }
 
     pub fn with_store(mut self, store: std::sync::Arc<dume_store::HarnessStore>) -> Self {
         self.artifact_store = Some(std::sync::Arc::new(store.artifacts.clone()));
         self.store = Some(store);
+        self
+    }
+
+    pub fn with_routing_snapshot(mut self, snapshot: crate::routing::RoutingSnapshot) -> Self {
+        self.routing_snapshot = Some(snapshot);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_routing_credentials(mut self, credentials: dume_provider::CredentialStore) -> Self {
+        self.routing_credentials = Some(credentials);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_subagent_model_override(
+        mut self,
+        child_id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.subagent_model_overrides
+            .insert(child_id.into(), Some(model.into()));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_inherited_subagent_model(mut self, child_id: impl Into<String>) -> Self {
+        self.subagent_model_overrides.insert(child_id.into(), None);
         self
     }
 
@@ -567,7 +605,20 @@ impl AgentLoop {
                         tc.id,
                     ));
                 }
-                let settings = match crate::subagent_settings::SubagentSettings::load() {
+                let settings = match {
+                    #[cfg(test)]
+                    if let Some(model) = self.subagent_model_overrides.get(&sub_id) {
+                        Ok(crate::subagent_settings::SubagentSettings {
+                            model: model.clone(),
+                        })
+                    } else {
+                        crate::subagent_settings::SubagentSettings::load()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        crate::subagent_settings::SubagentSettings::load()
+                    }
+                } {
                     Ok(settings) => settings,
                     Err(error) => {
                         return Ok(ChatMessage::tool(
@@ -576,6 +627,8 @@ impl AgentLoop {
                         ));
                     }
                 };
+                // Subagent model: explicit child settings take priority; inherited setting
+                // resolves using the parent's actual effective response model (self.model on dispatcher.agent).
                 let model_name = match settings.model_for(&self.model) {
                     Ok(model) => model,
                     Err(error) => {
@@ -591,6 +644,8 @@ impl AgentLoop {
                 let child_prompt = bounded_prompt.clone();
                 let child_wt_clone = child_wt.clone();
                 let store_clone = self.store.clone();
+                #[cfg(test)]
+                let routing_credentials_clone = self.routing_credentials.clone();
                 let ctx_clone = self
                     .request_context
                     .as_ref()
@@ -609,6 +664,8 @@ impl AgentLoop {
                             store_clone,
                             ctx_clone,
                             descendant_usage_clone,
+                            #[cfg(test)]
+                            routing_credentials_clone,
                         )
                         .await
                     })
@@ -716,6 +773,10 @@ impl AgentLoop {
             .request_context
             .clone()
             .unwrap_or_else(dume_provider::types::StreamRequestContext::new);
+        let is_child = session_ctx.parent_agent_id.is_some();
+        if is_child {
+            anyhow::ensure!(session_ctx.agent_id.as_deref().is_some_and(|id| !id.trim().is_empty()), "Child agent context requires a non-empty agent ID");
+        }
         let runtime_store = match &self.store {
             Some(store) => store.clone(),
             None => {
@@ -725,9 +786,13 @@ impl AgentLoop {
                 )?)
             }
         };
-        let journal_id = session_ctx.agent_id.as_deref().map(|id| format!("child:{id}")).unwrap_or_else(|| session_ctx.attempt_id.clone().unwrap_or_else(|| session_ctx.request_id.clone()));
+        let journal_id = if is_child {
+            format!("child:{}", session_ctx.agent_id.as_deref().expect("validated child ID"))
+        } else {
+            session_ctx.attempt_id.clone().unwrap_or_else(|| session_ctx.request_id.clone())
+        };
         let conversation_id = format!("worker:{journal_id}");
-        let scope = if session_ctx.agent_id.is_some() {
+        let scope = if is_child {
             dume_store::RuntimeScope::Conversation(conversation_id.clone())
         } else {
             session_ctx.attempt_id.as_deref()
@@ -763,6 +828,18 @@ impl AgentLoop {
                 (id, false, session)
             }
         };
+        let mut routing_snapshot = self.routing_snapshot.clone()
+            .unwrap_or_else(|| crate::routing::RoutingSnapshot::load_default(resuming))
+            .with_epoch_preservation(resuming);
+        if !resuming {
+            routing_snapshot.reload_for_new_input();
+        }
+        let routing_credentials = {
+            #[cfg(test)]
+            { self.routing_credentials.clone().unwrap_or_else(|| dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path())) }
+            #[cfg(not(test))]
+            { dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path()) }
+        };
         if let Err(error) = run_session.with_checkpoints(&cancellation, async {
             dispatcher.initialize_mcp(&conversation_id).await
         }).await {
@@ -797,6 +874,22 @@ impl AgentLoop {
         for _turn in 0..self.max_turns {
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
 
+            let routing = if is_child {
+                crate::routing::RoutingDecision {
+                    original_model: self.model.clone(),
+                    effective_model: self.model.clone(),
+                    phase: dume_store::RoutingPhase::Fixed,
+                    epoch: None,
+                    reason: "child_model_fixed".into(),
+                    classifier_usage: None,
+                }
+            } else {
+                run_session.with_checkpoints(&cancellation, crate::routing::select_model(
+                    &routing_snapshot, &run_session, &self.model, &messages, &routing_credentials, &cancellation,
+                )).await?
+            };
+            dispatcher.set_model(routing.effective_model.clone());
+
             dispatcher.refresh_mcp().await?;
             let mut provider_session_id = session_ctx.session_id.clone();
             let tools = dispatcher.tool_definitions_for_session(&mut provider_session_id);
@@ -805,7 +898,7 @@ impl AgentLoop {
             }
 
             if crate::context::prepare_request_context(crate::context::RequestContext {
-                model: &self.model,
+                model: &routing.effective_model,
                 session_id: &session_ctx.session_id,
                 messages: &mut messages,
                 tools: &tools,
@@ -814,13 +907,17 @@ impl AgentLoop {
                 session_ctx = session_ctx.reset_session();
             }
 
+            anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
+
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(50);
-            let model_name = self.model.clone();
+            let model_name = routing.effective_model.clone();
             let msgs = messages.clone();
             let tools_clone = tools.clone();
             let turn_ctx = session_ctx.next_request();
 
             let endpoint = self.endpoint.clone();
+            #[cfg(test)]
+            let injected_credentials = self.routing_credentials.clone();
             let mut turn_usage = dume_provider::types::TokenUsage::default();
             let mut had_usage_event = false;
 
@@ -839,7 +936,12 @@ impl AgentLoop {
                     return p.stream(&model_name, &msgs, &tools_clone, tx).await;
                 }
 
-                let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+                let cred_store = {
+                    #[cfg(test)]
+                    { injected_credentials.unwrap_or_else(|| dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path())) }
+                    #[cfg(not(test))]
+                    { dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path()) }
+                };
 
                 let mut provider = resolve_provider(&model_name, &cred_store).await?;
                 if let Some(Endpoint::Authenticated(base_url)) = endpoint {
@@ -856,6 +958,7 @@ impl AgentLoop {
             let mut ordered_calls: Vec<(String, String, String)> = Vec::new();
             let mut stream_completed_normally = false;
             let mut stream_finish_reason = String::new();
+            let mut actual_response_model: Option<String> = None;
             let mut checkpoint = tokio::time::interval(std::time::Duration::from_secs(1));
             checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -901,6 +1004,14 @@ impl AgentLoop {
                         attempt_usage.is_complete = false;
                         total_usage.accumulate(&attempt_usage);
                     }
+                }
+                if let StreamEvent::AttemptFinished {
+                    outcome: dume_provider::AttemptOutcome::Succeeded,
+                    model: finished_model,
+                    ..
+                } = &evt
+                {
+                    actual_response_model = Some(finished_model.clone());
                 }
                 if matches!(evt, StreamEvent::Retrying { .. }) {
                     total_usage.accumulate(&turn_usage);
@@ -996,6 +1107,10 @@ impl AgentLoop {
             }
 
             last_assistant_reply = Some(assistant_reply.clone());
+            let effective_response_model = actual_response_model
+                .as_deref()
+                .unwrap_or(&routing.effective_model);
+            dispatcher.set_model(effective_response_model);
 
             // Filter out empty slots if any
             let complete_tool_calls: Vec<dume_provider::types::ToolCall> = ordered_calls
@@ -1028,6 +1143,7 @@ impl AgentLoop {
                 }
                 match run_session.boundary()? {
                     dume_store::BoundaryResult::Continue(inputs) => {
+                        if !inputs.is_empty() { routing_snapshot.reload_for_new_input(); }
                         for input in inputs { messages.push(ChatMessage::user(input.payload)); }
                         final_outcome = None;
                         run_session.with_checkpoints(&cancellation, async {
@@ -1036,6 +1152,7 @@ impl AgentLoop {
                         continue;
                     }
                     dume_store::BoundaryResult::NextRun(token) => {
+                        routing_snapshot.reload_for_new_input();
                         run_session.advance(&token.run_id)?;
                         messages = runtime_store.conversation_history(&conversation_id)?.into_iter()
                             .map(|record| serde_json::from_str(&record.message_json).map_err(anyhow::Error::from))
@@ -1090,7 +1207,9 @@ impl AgentLoop {
                     }
                 }
             }
-            for input in run_session.consume_steer()? {
+            let steer = run_session.consume_steer()?;
+            if !steer.is_empty() { routing_snapshot.reload_for_new_input(); }
+            for input in steer {
                 messages.push(ChatMessage::user(input.payload));
             }
             continue;
@@ -1267,6 +1386,15 @@ impl ToolDispatcher {
     pub async fn replay_pending_tools(&mut self, session: &RunSession) -> Result<Vec<ChatMessage>> {
         let store = session.store();
         let executions = store.tool_executions_for_run(&session.token().run_id)?;
+        if executions
+            .iter()
+            .any(|execution| execution.state == "prepared")
+        {
+            // A completed write may have advanced the phase after this response prepared its tools.
+            if let Some(model) = store.latest_successful_model_for_run(&session.token().run_id)? {
+                self.set_model(model);
+            }
+        }
         let mut messages = Vec::new();
         for execution in executions
             .into_iter()
@@ -1459,6 +1587,7 @@ async fn run_isolated_child(
     store: Option<std::sync::Arc<dume_store::HarnessStore>>,
     request_context: Option<dume_provider::types::StreamRequestContext>,
     descendant_usage: std::sync::Arc<tokio::sync::Mutex<dume_provider::types::TokenUsage>>,
+    #[cfg(test)] routing_credentials: Option<dume_provider::CredentialStore>,
 ) -> Result<String> {
     anyhow::ensure!(
         !cancellation.is_cancelled(),
@@ -1487,6 +1616,10 @@ async fn run_isolated_child(
         agent = agent.with_store(store);
     }
     agent.request_context = request_context;
+    #[cfg(test)]
+    {
+        agent.routing_credentials = routing_credentials;
+    }
     agent.descendant_usage = std::sync::Arc::clone(&descendant_usage);
     let result = agent.run_task_with_cancellation(prompt, cancellation).await;
     if let Ok(ref outcome) = result {
@@ -1603,6 +1736,72 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    async fn read_http_json(socket: &mut tokio::net::TcpStream) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 4096];
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while bytes.len() < header_end + length {
+            let mut chunk = [0; 4096];
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before request body");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+    }
+
+    fn routing_test_credentials(path: &Path) -> dume_provider::CredentialStore {
+        let credentials = dume_provider::CredentialStore::new(path);
+        for provider in ["openai", "jev-local-system-one"] {
+            credentials
+                .save(
+                    provider,
+                    &dume_provider::auth::Credential {
+                        cred_type: "api_key".into(),
+                        key: Some("fixture-token".into()),
+                        access_token: None,
+                        refresh_token: None,
+                        expires_at: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        credentials
+    }
+
+    fn routing_test_snapshot(classifier_url: String) -> crate::routing::RoutingSnapshot {
+        let mut settings = crate::routing_settings::RoutingSettings::default();
+        settings.enabled = true;
+        settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: classifier_url,
+            model: "local-test".into(),
+        });
+        settings.models = crate::routing_settings::RoutingModels {
+            standard: Some("openai/gpt-4o-mini".into()),
+            complex: Some("openai/gpt-4o".into()),
+            implementation: Some("openai/gpt-4.1-mini".into()),
+        };
+        crate::routing::RoutingSnapshot::from_settings(settings, false)
+    }
+
     #[test]
     fn durable_tool_result_is_reused_without_second_execution() {
         let dir = tempdir().unwrap();
@@ -1653,6 +1852,213 @@ mod tests {
             serde_json::from_str::<ChatMessage>(&history[0].message_json).unwrap(),
             ChatMessage::user("do tool")
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_spawn_inherits_persisted_response_model_before_routing_resumes() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        for (phase, response_model, completed_write) in [
+            (
+                dume_store::RoutingPhase::Planning,
+                "openai/gpt-4o-mini",
+                false,
+            ),
+            (
+                dume_store::RoutingPhase::Implementation,
+                "openai/gpt-4.1-mini",
+                false,
+            ),
+            (
+                dume_store::RoutingPhase::Planning,
+                "openai/gpt-4o-mini",
+                true,
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            for args in [
+                vec!["init"],
+                vec![
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            ] {
+                assert!(
+                    tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(dir.path())
+                        .args(args)
+                        .output()
+                        .await
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+            let store = std::sync::Arc::new(
+                dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+            );
+            let conversation = "worker:replay-spawn";
+            store
+                .create_conversation(
+                    conversation,
+                    dir.path().to_str().unwrap(),
+                    "openai/gpt-4o",
+                    "session",
+                )
+                .unwrap();
+            let scope = dume_store::RuntimeScope::Conversation(conversation.into());
+            let run = store
+                .admit_input(
+                    scope.clone(),
+                    "input",
+                    dume_store::InputKind::Submit,
+                    "delegate",
+                )
+                .unwrap()
+                .run_id
+                .unwrap();
+            let session = RunSession::start(store.clone(), scope, &run, conversation).unwrap();
+            store
+                .save_conversation_routing_state(
+                    session.token(),
+                    &dume_store::ConversationRoutingState {
+                        conversation_id: conversation.into(),
+                        epoch: "epoch".into(),
+                        phase,
+                        original_model: "openai/gpt-4o".into(),
+                        planning_model: "openai/gpt-4o-mini".into(),
+                        implementation_model: "openai/gpt-4.1-mini".into(),
+                        reason: "complexity_complex".into(),
+                        revision: 0,
+                        classifier_input_tokens: None,
+                        classifier_output_tokens: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            session.set_routing_epoch(
+                (phase == dume_store::RoutingPhase::Planning).then_some("epoch"),
+            );
+            let context = dume_provider::types::StreamRequestContext::new();
+            session
+                .record_model_event(&StreamEvent::AttemptStarted {
+                    context: context.clone(),
+                    model: response_model.into(),
+                })
+                .unwrap();
+            session
+                .record_model_event(&StreamEvent::AttemptFinished {
+                    context,
+                    model: response_model.into(),
+                    outcome: dume_provider::AttemptOutcome::Succeeded,
+                    duration_ms: 0,
+                    usage: None,
+                    error: None,
+                })
+                .unwrap();
+            let mut calls = vec![
+                dume_provider::ToolCall {
+                    id: "spawn".into(),
+                    name: "spawn_subagent".into(),
+                    arguments: r#"{"id":"child","prompt":"child work","sub_dir":"child"}"#.into(),
+                },
+                dume_provider::ToolCall {
+                    id: "wait".into(),
+                    name: "wait_subagent".into(),
+                    arguments: r#"{"id":"child","timeout_ms":5000}"#.into(),
+                },
+            ];
+            if completed_write {
+                calls.insert(
+                    0,
+                    dume_provider::ToolCall {
+                        id: "write".into(),
+                        name: "write_file".into(),
+                        arguments: r#"{"path":"plan.txt","content":"plan"}"#.into(),
+                    },
+                );
+            }
+            let executions = session
+                .prepare_tools(&ChatMessage::assistant_with_tool_calls("", calls))
+                .unwrap();
+            if completed_write {
+                let ToolStart::Execute { attempt_id } = session.begin_tool(&executions[0]).unwrap()
+                else {
+                    panic!("fresh write expected")
+                };
+                session
+                    .finish_tool(
+                        &executions[0],
+                        &attempt_id,
+                        &ChatMessage::tool("written", "write"),
+                        0,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .conversation_routing_state(conversation)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    dume_store::RoutingPhase::Implementation
+                );
+            }
+            drop(session);
+            let resumed = RunSession::resume(store.clone(), &run, conversation).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request = timeout(Duration::from_secs(5), read_http_json(&mut socket))
+                    .await
+                    .unwrap();
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request["model"].as_str().unwrap().to_owned()
+            });
+            let agent = AgentLoop::new(dir.path(), "openai/gpt-4o")
+                .with_store(store.clone())
+                .with_routing_credentials(routing_test_credentials(&dir.path().join("auth.json")))
+                .with_inherited_subagent_model("child")
+                .with_base_url(format!("http://{address}"));
+            let mut dispatcher = ToolDispatcher::from_agent(agent, CancellationToken::new());
+            let results = timeout(
+                Duration::from_secs(8),
+                dispatcher.replay_pending_tools(&resumed),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(dispatcher.agent.model, response_model);
+            assert_eq!(results.len(), 2);
+            assert!(
+                results[1].content.contains("done"),
+                "{}",
+                results[1].content
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                response_model.split_once('/').unwrap().1
+            );
+            assert!(
+                dispatcher
+                    .replay_pending_tools(&resumed)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            dispatcher.cancel_all().await;
+        }
     }
 
     #[tokio::test]
@@ -2073,6 +2479,948 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn routing_changes_actual_generation_model_after_successful_tool_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_url = format!("http://{}/v1/", classifier_listener.local_addr().unwrap());
+        let classifier = tokio::spawn(async move {
+            let (mut socket, _) = classifier_listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 2048];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + length {
+                let mut chunk = [0; 2048];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert_eq!(body["state"]["prompt"], "write the file");
+            let reply = r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":0.9,"complex":0.1},"confidence":0.9}},"usage":{"input_tokens":3,"output_tokens":1}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).as_bytes()).await.unwrap();
+            1usize
+        });
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_url = format!("http://{}", generation_listener.local_addr().unwrap());
+        let generations = tokio::spawn(async move {
+            let mut models = Vec::new();
+            for turn in 0..2 {
+                let (mut socket, _) = generation_listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                models.push(request["model"].as_str().unwrap().to_owned());
+                let event = if turn == 0 {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"routing-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"routed.txt\",\"content\":\"written\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).as_bytes()).await.unwrap();
+            }
+            models
+        });
+        let credentials = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        for provider in ["openai", "jev-local-system-one"] {
+            credentials
+                .save(
+                    provider,
+                    &dume_provider::auth::Credential {
+                        cred_type: "api_key".into(),
+                        key: Some("fake-token".into()),
+                        access_token: None,
+                        refresh_token: None,
+                        expires_at: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut settings = crate::routing_settings::RoutingSettings::default();
+        settings.enabled = true;
+        settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: classifier_url,
+            model: "local-test".into(),
+        });
+        settings.models = crate::routing_settings::RoutingModels {
+            standard: Some("openai/gpt-4o-mini".into()),
+            complex: Some("openai/gpt-4o".into()),
+            implementation: Some("openai/gpt-4.1-mini".into()),
+        };
+        let snapshot = crate::routing::RoutingSnapshot::from_settings(settings, false);
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o-mini")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_request_context(context)
+            .with_mock_base_url(generation_url)
+            .with_routing_snapshot(snapshot);
+        let agent_model = agent.model.clone();
+        let mut agent_task = tokio::spawn(async move { agent.run_task("write the file").await });
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(8), &mut agent_task).await {
+                Ok(result) => result.unwrap().unwrap(),
+                Err(_) => {
+                    agent_task.abort();
+                    classifier.abort();
+                    generations.abort();
+                    let _ = agent_task.await;
+                    let _ = classifier.await;
+                    let _ = generations.await;
+                    panic!("AgentLoop routing integration timed out");
+                }
+            };
+        assert!(result.is_success());
+        assert_eq!(agent_model, "openai/gpt-4o-mini");
+        assert_eq!(classifier.await.unwrap(), 1);
+        assert_eq!(
+            generations.await.unwrap(),
+            ["openai/gpt-4o-mini", "openai/gpt-4.1-mini"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("routed.txt")).unwrap(),
+            "written"
+        );
+        let routing = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.phase, dume_store::RoutingPhase::Implementation);
+        assert_eq!(routing.implementation_model, "openai/gpt-4.1-mini");
+    }
+
+    #[tokio::test]
+    async fn routing_preclassification_cancel_sends_no_classifier_or_generation_request() {
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o-mini")
+            .with_routing_credentials(credentials)
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_mock_base_url(format!("http://{generation_addr}"));
+        let result = timeout(
+            Duration::from_secs(3),
+            agent.run_task_with_cancellation("요청", token),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), classifier_listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(50), generation_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_midclassification_cancel_never_starts_generation() {
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let classifier_server = tokio::spawn(async move {
+            let (mut socket, _) = classifier_listener.accept().await.unwrap();
+            let _ = read_http_json(&mut socket).await;
+            let _ = received_tx.send(());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o-mini")
+            .with_routing_credentials(routing_test_credentials(&dir.path().join("auth.json")))
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_mock_base_url(format!("http://{generation_addr}"));
+        let cancel = token.clone();
+        let mut task =
+            tokio::spawn(async move { agent.run_task_with_cancellation("요청", token).await });
+        timeout(Duration::from_secs(3), received_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(3), &mut task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), generation_listener.accept())
+                .await
+                .is_err()
+        );
+        classifier_server.abort();
+        let _ = classifier_server.await;
+    }
+
+    #[tokio::test]
+    async fn classifier_http_failure_pins_original_without_retry_across_turns() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let classifier_server = tokio::spawn(async move {
+            let (mut socket, _) = classifier_listener.accept().await.unwrap();
+            let _ = read_http_json(&mut socket).await;
+            let body = "private classifier failure";
+            socket.write_all(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            1usize
+        });
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let generation_server = tokio::spawn(async move {
+            let mut models = Vec::new();
+            for turn in 0..2 {
+                let (mut socket, _) = generation_listener.accept().await.unwrap();
+                let request = read_http_json(&mut socket).await;
+                models.push(request["model"].as_str().unwrap().to_owned());
+                let event = if turn == 0 {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"failure-pin","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"after-failure.txt\",\"content\":\"ok\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).as_bytes()).await.unwrap();
+            }
+            models
+        });
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o-mini")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_request_context(context.clone())
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_mock_base_url(format!("http://{generation_addr}"));
+        let mut task = tokio::spawn(async move { agent.run_task("요청").await });
+        let result = match timeout(Duration::from_secs(8), &mut task).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                classifier_server.abort();
+                generation_server.abort();
+                let _ = task.await;
+                let _ = classifier_server.await;
+                let _ = generation_server.await;
+                panic!("classifier failure integration timed out");
+            }
+        };
+        assert!(result.is_success());
+        assert_eq!(classifier_server.await.unwrap(), 1);
+        assert_eq!(
+            generation_server.await.unwrap(),
+            ["openai/gpt-4o-mini", "openai/gpt-4o-mini"]
+        );
+        let routing = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.phase, dume_store::RoutingPhase::Fixed);
+        assert_eq!(routing.reason, "http_status");
+        let notice = crate::routing::RoutingDecision {
+            original_model: "openai/gpt-4o-mini".into(),
+            effective_model: "openai/gpt-4o-mini".into(),
+            phase: dume_store::RoutingPhase::Fixed,
+            epoch: Some(routing.epoch),
+            reason: routing.reason,
+            classifier_usage: None,
+        }
+        .notice_text();
+        assert!(!notice.contains("private classifier failure"));
+        assert!(!notice.contains("fixture-token"));
+    }
+
+    #[tokio::test]
+    async fn generation_unauthorized_does_not_fallback_from_selected_planning_model() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let classifier_server = tokio::spawn(async move {
+            let (mut socket, _) = classifier_listener.accept().await.unwrap();
+            let _ = read_http_json(&mut socket).await;
+            let body = r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":0.9,"complex":0.1},"confidence":0.9}}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            1usize
+        });
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let generation_server = tokio::spawn(async move {
+            let (mut socket, _) = timeout(Duration::from_secs(5), generation_listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = read_http_json(&mut socket).await;
+            let model = request["model"].as_str().unwrap().to_owned();
+            let body = "private generation auth error";
+            socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            assert!(
+                timeout(Duration::from_millis(150), generation_listener.accept())
+                    .await
+                    .is_err(),
+                "selected model was retried or fallback model was requested"
+            );
+            model
+        });
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_request_context(context.clone())
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_base_url(format!("http://{generation_addr}"));
+        let mut task = tokio::spawn(async move { agent.run_task("요청").await });
+        let result = match timeout(Duration::from_secs(8), &mut task).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                task.abort();
+                classifier_server.abort();
+                generation_server.abort();
+                let _ = task.await;
+                let _ = classifier_server.await;
+                let _ = generation_server.await;
+                panic!("generation auth integration timed out");
+            }
+        };
+        assert!(result.is_err());
+        assert_eq!(classifier_server.await.unwrap(), 1);
+        assert_eq!(generation_server.await.unwrap(), "gpt-4o-mini");
+        let routing = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.phase, dume_store::RoutingPhase::Planning);
+        assert_eq!(routing.original_model, "openai/gpt-4o");
+        assert_eq!(routing.planning_model, "openai/gpt-4o-mini");
+        let metrics = store
+            .conversation_runtime_metrics(&conversation_id)
+            .unwrap();
+        assert_eq!(metrics.model_attempts.len(), 1);
+        assert_eq!(metrics.model_attempts[0].model, "openai/gpt-4o-mini");
+        assert_eq!(metrics.model_attempts[0].state, "failed");
+    }
+
+    #[tokio::test]
+    async fn failed_write_keeps_planning_model_and_does_not_advance_routing_phase() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let classifier_server = tokio::spawn(async move {
+            let (mut socket, _) = classifier_listener.accept().await.unwrap();
+            let _ = read_http_json(&mut socket).await;
+            let body = r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":1,"complex":0},"confidence":0.9}}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            1usize
+        });
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let generation_server = tokio::spawn(async move {
+            let mut models = Vec::new();
+            for turn in 0..2 {
+                let (mut socket, _) = generation_listener.accept().await.unwrap();
+                let request = read_http_json(&mut socket).await;
+                models.push(request["model"].as_str().unwrap().to_owned());
+                let event = if turn == 0 {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"bad-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"failure.txt\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+                };
+                let sse = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).as_bytes()).await.unwrap();
+            }
+            models
+        });
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o-mini")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_request_context(context)
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_mock_base_url(format!("http://{generation_addr}"));
+        let mut task = tokio::spawn(async move { agent.run_task("요청").await });
+        let result = match timeout(Duration::from_secs(8), &mut task).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                classifier_server.abort();
+                generation_server.abort();
+                let _ = task.await;
+                let _ = classifier_server.await;
+                let _ = generation_server.await;
+                panic!("failed write integration timed out");
+            }
+        };
+        assert!(result.is_success());
+        assert_eq!(classifier_server.await.unwrap(), 1);
+        assert_eq!(
+            generation_server.await.unwrap(),
+            ["openai/gpt-4o-mini", "openai/gpt-4o-mini"]
+        );
+        let routing = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.phase, dume_store::RoutingPhase::Planning);
+        let executions = store
+            .tool_executions_for_run(
+                &store
+                    .latest_run(&dume_store::RuntimeScope::Conversation(
+                        conversation_id.clone(),
+                    ))
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+            )
+            .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].state, "failed");
+        assert!(!dir.path().join("failure.txt").exists());
+        let history = store.conversation_history(&conversation_id).unwrap();
+        assert!(history.iter().any(|entry| {
+            serde_json::from_str::<ChatMessage>(&entry.message_json)
+                .ok()
+                .is_some_and(|message| {
+                    message.role == dume_provider::types::Role::Tool
+                        && message.content.contains("Missing required field 'content'")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn routed_root_dispatches_inherited_and_explicit_child_models_without_rerouting_parent() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                "-A",
+            ],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let mut command = tokio::process::Command::new("git");
+            command.arg("-C").arg(dir.path()).args(args);
+            let result = command.output().await.unwrap();
+            assert!(result.status.success());
+        }
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        let mut classifier = tokio::spawn(async move {
+            let (mut socket, _) = timeout(Duration::from_secs(5), classifier_listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = timeout(Duration::from_secs(5), read_http_json(&mut socket))
+                .await
+                .unwrap();
+            let body = r#"{"answers":{"complexity":{"type":"choice","choice":"standard","probabilities":{"standard":0.9,"complex":0.1},"confidence":0.9}}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(150), classifier_listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let generation_store = store.clone();
+        let generation_conversation = conversation_id.clone();
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let mut generation = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            let mut parent_turn = 0;
+            let mut parent_route_before_children = None;
+            let mut child_turns = std::collections::HashMap::<String, usize>::new();
+            for _ in 0..8 {
+                let (mut socket, _) = timeout(Duration::from_secs(5), generation_listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request = timeout(Duration::from_secs(5), read_http_json(&mut socket))
+                    .await
+                    .unwrap();
+                let model = request["model"].as_str().unwrap().to_owned();
+                let messages = request["messages"].as_array().unwrap();
+                let child_id = ["상속자 작업", "명시자 작업"].into_iter().find(|needle| {
+                    messages.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"].as_str().is_some_and(|s| s.contains(needle))
+                    })
+                });
+                let output = if let Some(child_id) = child_id {
+                    let turn = child_turns.entry(child_id.to_owned()).or_default();
+                    observed.push((format!("{child_id}-{turn}"), model));
+                    let output = if *turn == 0 {
+                        let file = if child_id == "상속자 작업" {
+                            "inherited.txt"
+                        } else {
+                            "explicit.txt"
+                        };
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("child-write-{child_id}"),"type":"function","function":{"name":"write_file","arguments":format!("{{\"path\":\"{file}\",\"content\":\"ok\"}}")}}]},"finish_reason":"tool_calls"}]})
+                    } else {
+                        json!({"choices":[{"delta":{"content":"자식 작업 완료"},"finish_reason":"stop"}]})
+                    };
+                    *turn += 1;
+                    output
+                } else {
+                    observed.push((format!("parent-{parent_turn}"), model));
+                    let turn = parent_turn;
+                    if turn == 0 {
+                        parent_route_before_children = generation_store
+                            .conversation_routing_state(&generation_conversation)
+                            .unwrap();
+                    }
+                    parent_turn += 1;
+                    match turn {
+                        0 => json!({"choices":[{"delta":{"tool_calls":[
+                            {"index":0,"id":"spawn-inherited","type":"function","function":{"name":"spawn_subagent","arguments":"{\"id\":\"inherited\",\"prompt\":\"상속자 작업\",\"sub_dir\":\"child-inherited\"}"}},
+                            {"index":1,"id":"spawn-explicit","type":"function","function":{"name":"spawn_subagent","arguments":"{\"id\":\"explicit\",\"prompt\":\"명시자 작업\",\"sub_dir\":\"child-explicit\"}"}}
+                        ]},"finish_reason":"tool_calls"}]}),
+                        1 => {
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"wait-inherited","type":"function","function":{"name":"wait_subagent","arguments":"{\"id\":\"inherited\",\"timeout_ms\":5000}"}}]},"finish_reason":"tool_calls"}]})
+                        }
+                        2 => {
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"wait-explicit","type":"function","function":{"name":"wait_subagent","arguments":"{\"id\":\"explicit\",\"timeout_ms\":5000}"}}]},"finish_reason":"tool_calls"}]})
+                        }
+                        _ => {
+                            json!({"choices":[{"delta":{"content":"부모 작업 완료"},"finish_reason":"stop"}]})
+                        }
+                    }
+                };
+                let sse = format!("data: {output}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", sse.len(), sse).as_bytes()).await.unwrap();
+            }
+            assert!(
+                timeout(Duration::from_millis(150), generation_listener.accept())
+                    .await
+                    .is_err()
+            );
+            (observed, parent_route_before_children.unwrap())
+        });
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_inherited_subagent_model("inherited")
+            .with_subagent_model_override("explicit", "openai/gpt-4.1-mini")
+            .with_request_context(context)
+            .with_routing_snapshot(routing_test_snapshot(format!(
+                "http://{classifier_addr}/v1"
+            )))
+            .with_base_url(format!("http://{generation_addr}"));
+        let mut task =
+            tokio::spawn(async move { agent.run_task("자식 작업을 시작하세요").await });
+        let outcome = match timeout(Duration::from_secs(8), &mut task).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                classifier.abort();
+                generation.abort();
+                let _ = task.await;
+                let _ = classifier.await;
+                let _ = generation.await;
+                panic!("root/child routing dispatch timed out");
+            }
+        };
+        let classifier_result = match timeout(Duration::from_secs(8), &mut classifier).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                classifier.abort();
+                let _ = classifier.await;
+                generation.abort();
+                let _ = generation.await;
+                panic!("classifier fixture did not finish");
+            }
+        };
+        let (observed, before_children) =
+            match timeout(Duration::from_secs(8), &mut generation).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    generation.abort();
+                    let _ = generation.await;
+                    panic!("generation fixture did not finish");
+                }
+            };
+        assert_eq!(classifier_result, ());
+        assert!(outcome.is_success());
+        assert_eq!(observed.len(), 8);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(tag, _)| tag.starts_with("parent-"))
+                .count(),
+            4
+        );
+        assert!(observed.contains(&("parent-0".into(), "gpt-4o-mini".into())));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(tag, model)| tag.starts_with("상속자 작업-") && model == "gpt-4o-mini")
+                .count(),
+            2
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(tag, model)| tag.starts_with("명시자 작업-") && model == "gpt-4.1-mini")
+                .count(),
+            2
+        );
+        let parent = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.phase, dume_store::RoutingPhase::Planning);
+        assert_eq!(before_children.phase, dume_store::RoutingPhase::Planning);
+        assert_eq!(parent.phase, before_children.phase);
+        assert_eq!(parent.epoch, before_children.epoch);
+        assert_eq!(parent.revision, before_children.revision);
+        assert!(
+            store
+                .conversation_routing_state("worker:child:inherited")
+                .unwrap()
+                .is_none()
+        );
+        let inherited = store
+            .conversation_runtime_metrics("worker:child:inherited")
+            .unwrap();
+        assert_eq!(inherited.model_attempts.len(), 2);
+        assert_eq!(inherited.model_attempts[0].model, "openai/gpt-4o-mini");
+        assert_eq!(inherited.model_attempts[1].model, "openai/gpt-4o-mini");
+        let explicit = store
+            .conversation_runtime_metrics("worker:child:explicit")
+            .unwrap();
+        assert_eq!(explicit.model_attempts.len(), 2);
+        assert_eq!(explicit.model_attempts[0].model, "openai/gpt-4.1-mini");
+        assert_eq!(explicit.model_attempts[1].model, "openai/gpt-4.1-mini");
+        assert!(dir.path().join("child-inherited/inherited.txt").is_file());
+        assert!(dir.path().join("child-explicit/explicit.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn routed_root_in_implementation_phase_dispatches_inherited_child_with_implementation_model()
+     {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration, timeout};
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                "-A",
+            ],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let mut command = tokio::process::Command::new("git");
+            command.arg("-C").arg(dir.path()).args(args);
+            let result = command.output().await.unwrap();
+            assert!(result.status.success());
+        }
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(dir.path().join("artifacts")).unwrap(),
+        );
+        let generation_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generation_addr = generation_listener.local_addr().unwrap();
+        let generation = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            let mut parent_turn = 0;
+            let mut child_turn = 0;
+            for _ in 0..5 {
+                let (mut socket, _) = generation_listener.accept().await.unwrap();
+                let request = read_http_json(&mut socket).await;
+                let model = request["model"].as_str().unwrap().to_owned();
+                let is_child = request["messages"].as_array().unwrap().iter().any(|m| {
+                    m["role"] == "user"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("하위 작업 수행"))
+                });
+                let output = if is_child {
+                    observed.push((format!("child-{child_turn}"), model));
+                    let out = if child_turn == 0 {
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write_call","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"child_impl.txt\",\"content\":\"implemented\"}"}}]},"finish_reason":"tool_calls"}]})
+                    } else {
+                        json!({"choices":[{"delta":{"content":"자식 완료"},"finish_reason":"stop"}]})
+                    };
+                    child_turn += 1;
+                    out
+                } else {
+                    observed.push((format!("parent-{parent_turn}"), model));
+                    let out = match parent_turn {
+                        0 => {
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"spawn_call","type":"function","function":{"name":"spawn_subagent","arguments":"{\"id\":\"inherited\",\"prompt\":\"하위 작업 수행\",\"sub_dir\":\"child-inherited\"}"}}]},"finish_reason":"tool_calls"}]})
+                        }
+                        1 => {
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"wait_call","type":"function","function":{"name":"wait_subagent","arguments":"{\"id\":\"inherited\",\"timeout_ms\":5000}"}}]},"finish_reason":"tool_calls"}]})
+                        }
+                        _ => {
+                            json!({"choices":[{"delta":{"content":"부모 완료"},"finish_reason":"stop"}]})
+                        }
+                    };
+                    parent_turn += 1;
+                    out
+                };
+                let sse = format!("data: {output}\n\ndata: [DONE]\n\n");
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                timeout(Duration::from_millis(150), generation_listener.accept())
+                    .await
+                    .is_err()
+            );
+            observed
+        });
+        let credentials = routing_test_credentials(&dir.path().join("auth.json"));
+        let mut settings = crate::routing_settings::RoutingSettings::default();
+        settings.enabled = true;
+        settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::LocalSystemOne,
+            base_url: "http://127.0.0.1:1/v1/".into(),
+            model: "local-classifier".into(),
+        });
+        settings.models = crate::routing_settings::RoutingModels {
+            standard: Some("openai/gpt-4o-mini".into()),
+            complex: Some("openai/gpt-4o".into()),
+            implementation: Some("openai/gpt-4.1-mini".into()),
+        };
+        let epoch = settings.fingerprint("openai/gpt-4o").unwrap();
+        let context = dume_provider::types::StreamRequestContext::new();
+        let conversation_id = format!("worker:{}", context.request_id);
+        let saved_state = dume_store::ConversationRoutingState {
+            conversation_id: conversation_id.clone(),
+            epoch: epoch.clone(),
+            phase: dume_store::RoutingPhase::Implementation,
+            original_model: "openai/gpt-4o".into(),
+            planning_model: "openai/gpt-4o-mini".into(),
+            implementation_model: "openai/gpt-4.1-mini".into(),
+            reason: "standard".into(),
+            classifier_input_tokens: Some(3),
+            classifier_output_tokens: Some(1),
+            revision: 2,
+        };
+        store
+            .create_conversation(&conversation_id, "/tmp", "openai/gpt-4o", "seed_sess")
+            .unwrap();
+        let scope = dume_store::RuntimeScope::Conversation(conversation_id.clone());
+        let receipt = store
+            .admit_input(
+                scope.clone(),
+                "seed-request",
+                dume_store::InputKind::Submit,
+                "seed-prompt",
+            )
+            .unwrap();
+        let seed_session = crate::runtime::RunSession::start(
+            store.clone(),
+            scope,
+            receipt.run_id.as_deref().unwrap(),
+            &conversation_id,
+        )
+        .unwrap();
+        seed_session.save_routing_state(&saved_state, None).unwrap();
+        drop(seed_session);
+        let snapshot = crate::routing::RoutingSnapshot::from_settings(settings, true);
+        let agent = AgentLoop::new(dir.path(), "openai/gpt-4o")
+            .with_store(store.clone())
+            .with_routing_credentials(credentials)
+            .with_inherited_subagent_model("inherited")
+            .with_request_context(context)
+            .with_routing_snapshot(snapshot)
+            .with_base_url(format!("http://{generation_addr}"));
+        let mut task =
+            tokio::spawn(async move { agent.run_task("구현 단계 자식 작업 시작").await });
+        let outcome = match timeout(Duration::from_secs(8), &mut task).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                generation.abort();
+                let _ = task.await;
+                let _ = generation.await;
+                panic!("implementation child routing dispatch timed out");
+            }
+        };
+        let observed = match timeout(Duration::from_secs(8), generation).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => panic!("generation fixture timed out"),
+        };
+        assert!(outcome.is_success());
+        assert_eq!(observed.len(), 5);
+        assert!(observed.iter().all(|(_, model)| model == "gpt-4.1-mini"));
+        let parent = store
+            .conversation_routing_state(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.phase, dume_store::RoutingPhase::Implementation);
+        assert_eq!(parent.original_model, "openai/gpt-4o");
+        assert_eq!(parent.implementation_model, "openai/gpt-4.1-mini");
+        let inherited = store
+            .conversation_runtime_metrics("worker:child:inherited")
+            .unwrap();
+        assert_eq!(inherited.model_attempts.len(), 2);
+        assert_eq!(inherited.model_attempts[0].model, "openai/gpt-4.1-mini");
+        assert_eq!(inherited.model_attempts[1].model, "openai/gpt-4.1-mini");
+        assert!(dir.path().join("child-inherited/child_impl.txt").is_file());
+    }
+
     #[test]
     fn child_paths_reject_escape_aliases_and_existing_ownership() {
         let dir = tempdir().unwrap();
@@ -2117,6 +3465,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 dume_provider::types::TokenUsage::default(),
             )),
+            None,
         )
         .await
         .unwrap_err();
@@ -2180,6 +3529,7 @@ mod tests {
                 std::sync::Arc::new(tokio::sync::Mutex::new(
                     dume_provider::types::TokenUsage::default(),
                 )),
+                None,
             )
             .await
         });
@@ -2425,6 +3775,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 dume_provider::types::TokenUsage::default(),
             )),
+            None,
         )
         .await
         .unwrap();
@@ -3227,6 +4578,7 @@ mod tests {
                 std::sync::Arc::new(tokio::sync::Mutex::new(
                     dume_provider::types::TokenUsage::default(),
                 )),
+                None,
             ),
         )
         .await

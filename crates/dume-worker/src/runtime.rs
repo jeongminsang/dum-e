@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use dume_provider::types::TokenUsage;
 use dume_provider::{AttemptOutcome, ChatMessage, StreamEvent};
 use dume_store::{
-    BoundaryResult, HarnessStore, ModelAttemptOutcome, RunToken, RuntimeScope, ToolExecution,
-    ToolSpec,
+    BoundaryResult, ConversationRoutingState, HarnessStore, ModelAttemptOutcome,
+    RoutingToolContext, RunToken, RuntimeScope, ToolExecution, ToolSpec,
 };
 use std::fs::File;
 use std::future::Future;
@@ -26,6 +26,8 @@ pub struct RunSession {
     elapsed_base_ms: i64,
     active_since: Option<Instant>,
     active_attempt: std::sync::Mutex<Option<ActiveModelAttempt>>,
+    routing_epoch: std::sync::Mutex<Option<RoutingToolContext>>,
+    bound_cancellation: std::sync::Mutex<Option<CancellationToken>>,
     _scope_lock: Option<File>,
 }
 
@@ -55,6 +57,8 @@ impl RunSession {
             elapsed_base_ms: 0,
             active_since: Some(Instant::now()),
             active_attempt: std::sync::Mutex::new(None),
+            routing_epoch: std::sync::Mutex::new(None),
+            bound_cancellation: std::sync::Mutex::new(None),
             _scope_lock: lock,
         };
         session
@@ -81,6 +85,8 @@ impl RunSession {
             elapsed_base_ms,
             active_since: Some(Instant::now()),
             active_attempt: std::sync::Mutex::new(None),
+            routing_epoch: std::sync::Mutex::new(None),
+            bound_cancellation: std::sync::Mutex::new(None),
             _scope_lock: lock,
         };
         session
@@ -113,6 +119,39 @@ impl RunSession {
 
     pub fn conversation_id(&self) -> &str {
         &self.conversation_id
+    }
+
+    pub fn set_routing_epoch(&self, epoch: Option<&str>) {
+        *self.routing_epoch.lock().unwrap() = epoch.map(|epoch| RoutingToolContext {
+            epoch: epoch.to_owned(),
+        });
+    }
+
+    pub fn routing_state(&self) -> Result<Option<ConversationRoutingState>> {
+        Ok(self
+            .store
+            .conversation_routing_state(&self.conversation_id)?)
+    }
+
+    pub fn save_routing_state(
+        &self,
+        state: &ConversationRoutingState,
+        expected_revision: Option<i64>,
+    ) -> Result<ConversationRoutingState> {
+        if state.conversation_id != self.conversation_id {
+            return Err(anyhow!("routing state conversation differs from session"));
+        }
+        Ok(self
+            .store
+            .save_conversation_routing_state(&self.token, state, expected_revision)?)
+    }
+
+    fn record_cancellation_if_requested(&self) -> Result<()> {
+        let cancellation = self.bound_cancellation.lock().unwrap().clone();
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            self.store.cancel_run(&self.token)?;
+        }
+        Ok(())
     }
 
     pub fn elapsed_ms(&self) -> i64 {
@@ -155,6 +194,7 @@ impl RunSession {
     where
         F: Future<Output = Result<T>>,
     {
+        *self.bound_cancellation.lock().unwrap() = Some(cancellation.clone());
         tokio::pin!(future);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -271,6 +311,7 @@ impl RunSession {
             &self.conversation_id,
             &serialized,
             &specs,
+            self.routing_epoch.lock().unwrap().as_ref(),
         )?)
     }
 
@@ -298,6 +339,7 @@ impl RunSession {
         reason: &str,
         duration_ms: i64,
     ) -> Result<()> {
+        self.record_cancellation_if_requested()?;
         self.store.mark_tool_unknown(
             &self.token,
             &execution.execution_id,
@@ -343,6 +385,7 @@ impl RunSession {
         message: &ChatMessage,
         duration_ms: i64,
     ) -> Result<()> {
+        self.record_cancellation_if_requested()?;
         let serialized = serde_json::to_string(message)?;
         self.store.commit_tool_result_and_message(
             &self.token,
@@ -362,6 +405,7 @@ impl RunSession {
         message: &ChatMessage,
         duration_ms: i64,
     ) -> Result<()> {
+        self.record_cancellation_if_requested()?;
         let error = message.content.clone();
         let serialized = serde_json::to_string(message)?;
         self.store.commit_tool_failure_and_message(
@@ -402,6 +446,8 @@ impl RunSession {
         self.elapsed_base_ms = 0;
         self.active_since = Some(Instant::now());
         *self.active_attempt.lock().unwrap() = None;
+        *self.routing_epoch.lock().unwrap() = None;
+        *self.bound_cancellation.lock().unwrap() = None;
         self.store
             .attach_run_conversation(&self.token, &self.conversation_id)?;
         Ok(())
@@ -469,6 +515,102 @@ mod tests {
         let run_id = receipt.run_id.unwrap();
         let session = RunSession::start(store.clone(), scope, &run_id, "conversation").unwrap();
         (dir, store, session)
+    }
+
+    #[test]
+    fn run_session_routing_state_is_durable_and_epoch_is_session_local() {
+        let (_dir, store, session) = running_session();
+        let state = ConversationRoutingState {
+            conversation_id: "conversation".into(),
+            epoch: "epoch-1".into(),
+            phase: dume_store::RoutingPhase::Planning,
+            original_model: "original".into(),
+            planning_model: "planning".into(),
+            implementation_model: "implementation".into(),
+            reason: "classified".into(),
+            revision: 99,
+            classifier_input_tokens: Some(1),
+            classifier_output_tokens: Some(1),
+        };
+        let saved = session.save_routing_state(&state, None).unwrap();
+        assert_eq!(saved.revision, 0);
+        assert_eq!(session.routing_state().unwrap(), Some(saved));
+        session.set_routing_epoch(Some("epoch-1"));
+        session.set_routing_epoch(None);
+        assert_eq!(session.routing_state().unwrap().unwrap().epoch, "epoch-1");
+        assert_eq!(
+            store
+                .load_conversation("conversation")
+                .unwrap()
+                .0
+                .provider_session_id,
+            "session"
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_cancelled_provider_tool_records_success_without_route_transition() {
+        let (_dir, store, session) = running_session();
+        let state = ConversationRoutingState {
+            conversation_id: "conversation".into(),
+            epoch: "cancel-epoch".into(),
+            phase: dume_store::RoutingPhase::Planning,
+            original_model: "original".into(),
+            planning_model: "planning".into(),
+            implementation_model: "implementation".into(),
+            reason: "classified".into(),
+            revision: 0,
+            classifier_input_tokens: None,
+            classifier_output_tokens: None,
+        };
+        session.save_routing_state(&state, None).unwrap();
+        session.set_routing_epoch(Some("cancel-epoch"));
+        let execution = store
+            .prepare_assistant_turn_and_tools(
+                session.token(),
+                "conversation",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "write".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false,
+                }],
+                Some(&RoutingToolContext {
+                    epoch: "cancel-epoch".into(),
+                }),
+            )
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .begin_tool(session.token(), &execution.execution_id, "attempt")
+                .unwrap()
+        );
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            signal.cancel();
+        });
+        session
+            .with_checkpoints(&cancellation, async {
+                cancellation.cancelled().await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        cancel_task.await.unwrap();
+        session
+            .finish_tool(&execution, "attempt", &ChatMessage::assistant("written"), 1)
+            .unwrap();
+        let journal = store.tool_journal(&execution.execution_id).unwrap();
+        assert_eq!(journal.execution.state, "succeeded");
+        assert_eq!(journal.attempts[0].state, "succeeded");
+        assert_eq!(
+            session.routing_state().unwrap().unwrap().phase,
+            dume_store::RoutingPhase::Planning
+        );
     }
 
     #[test]
