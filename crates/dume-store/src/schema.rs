@@ -267,6 +267,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             name TEXT NOT NULL, arguments TEXT NOT NULL, arguments_hash TEXT NOT NULL,
             replay_policy TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
             active_attempt_id TEXT, result TEXT, error TEXT, result_source TEXT,
+            routing_epoch TEXT,
+            routing_cancelled INTEGER NOT NULL DEFAULT 0 CHECK(routing_cancelled IN (0,1)),
             UNIQUE(run_id,tool_call_id)
         );
         CREATE TABLE IF NOT EXISTS tool_execution_attempts (
@@ -288,6 +290,19 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             model TEXT NOT NULL, state TEXT NOT NULL, reason TEXT, started_at INTEGER NOT NULL,
             ended_at INTEGER, duration_ms INTEGER, timing_complete INTEGER NOT NULL DEFAULT 1,
             usage_json TEXT, owner_generation INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS conversation_routing_state (
+            conversation_id TEXT PRIMARY KEY,
+            epoch TEXT NOT NULL CHECK(length(epoch)>0),
+            phase TEXT NOT NULL CHECK(phase IN ('fixed','planning','implementation')),
+            original_model TEXT NOT NULL CHECK(length(original_model)>0),
+            planning_model TEXT NOT NULL CHECK(length(planning_model)>0),
+            implementation_model TEXT NOT NULL CHECK(length(implementation_model)>0),
+            reason TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            classifier_input_tokens INTEGER CHECK(classifier_input_tokens IS NULL OR classifier_input_tokens>=0),
+            classifier_output_tokens INTEGER CHECK(classifier_output_tokens IS NULL OR classifier_output_tokens>=0),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         );
         "#,
     )?;
@@ -311,6 +326,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     apply_column_migration(
         conn,
         "ALTER TABLE agent_runs ADD COLUMN fencing_attempt_id TEXT;",
+    )?;
+    apply_column_migration(
+        conn,
+        "ALTER TABLE tool_executions ADD COLUMN routing_epoch TEXT;",
+    )?;
+    apply_column_migration(
+        conn,
+        "ALTER TABLE tool_executions ADD COLUMN routing_cancelled INTEGER NOT NULL DEFAULT 0 CHECK(routing_cancelled IN (0,1));",
     )?;
 
     Ok(())

@@ -66,6 +66,30 @@ pub struct ToolSpec {
     pub arguments: String,
     pub replay_safe: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingPhase {
+    Fixed,
+    Planning,
+    Implementation,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRoutingState {
+    pub conversation_id: String,
+    pub epoch: String,
+    pub phase: RoutingPhase,
+    pub original_model: String,
+    pub planning_model: String,
+    pub implementation_model: String,
+    pub reason: String,
+    pub revision: i64,
+    pub classifier_input_tokens: Option<i64>,
+    pub classifier_output_tokens: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingToolContext {
+    pub epoch: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecution {
     pub execution_id: String,
@@ -284,6 +308,70 @@ fn finalize_abandoned_model_attempts(
 }
 
 impl HarnessStore {
+    pub fn conversation_routing_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRoutingState>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT conversation_id,epoch,phase,original_model,planning_model,implementation_model,reason,revision,classifier_input_tokens,classifier_output_tokens FROM conversation_routing_state WHERE conversation_id=?1",params![conversation_id],|r| {
+            let phase: String = r.get(2)?;
+            let phase = match phase.as_str() { "fixed" => RoutingPhase::Fixed, "planning" => RoutingPhase::Planning, "implementation" => RoutingPhase::Implementation, _ => return Err(rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid routing phase").into())) };
+            Ok(ConversationRoutingState { conversation_id:r.get(0)?, epoch:r.get(1)?, phase, original_model:r.get(3)?, planning_model:r.get(4)?, implementation_model:r.get(5)?, reason:r.get(6)?, revision:r.get(7)?, classifier_input_tokens:r.get(8)?, classifier_output_tokens:r.get(9)? })
+        }).optional().map_err(Into::into)
+    }
+
+    pub fn save_conversation_routing_state(
+        &self,
+        token: &RunToken,
+        state: &ConversationRoutingState,
+        expected_revision: Option<i64>,
+    ) -> Result<ConversationRoutingState, StoreError> {
+        if [
+            &state.conversation_id,
+            &state.epoch,
+            &state.original_model,
+            &state.planning_model,
+            &state.implementation_model,
+        ]
+        .iter()
+        .any(|v| v.is_empty())
+            || state.classifier_input_tokens.is_some_and(|v| v < 0)
+            || state.classifier_output_tokens.is_some_and(|v| v < 0)
+        {
+            return Err(StoreError::InvalidSessionState(
+                "invalid routing state".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        Self::check_owner(&tx, token)?;
+        if linked_conversation(&tx, &token.run_id)?.as_deref()
+            != Some(state.conversation_id.as_str())
+        {
+            return Err(StoreError::InvalidSessionState(
+                "routing state conversation differs from run link".into(),
+            ));
+        }
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM conversation_routing_state WHERE conversation_id=?1",
+                params![state.conversation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current != expected_revision {
+            return Err(StoreError::InvalidSessionState(
+                "routing state revision mismatch".into(),
+            ));
+        }
+        let revision = current.map_or(0, |v| v + 1);
+        tx.execute("INSERT INTO conversation_routing_state VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(conversation_id) DO UPDATE SET epoch=excluded.epoch,phase=excluded.phase,original_model=excluded.original_model,planning_model=excluded.planning_model,implementation_model=excluded.implementation_model,reason=excluded.reason,revision=excluded.revision,classifier_input_tokens=excluded.classifier_input_tokens,classifier_output_tokens=excluded.classifier_output_tokens",params![state.conversation_id,state.epoch,match state.phase{RoutingPhase::Fixed=>"fixed",RoutingPhase::Planning=>"planning",RoutingPhase::Implementation=>"implementation"},state.original_model,state.planning_model,state.implementation_model,state.reason,revision,state.classifier_input_tokens,state.classifier_output_tokens])?;
+        tx.commit()?;
+        let mut saved = state.clone();
+        saved.revision = revision;
+        Ok(saved)
+    }
+
     pub fn attach_run_conversation(
         &self,
         token: &RunToken,
@@ -595,13 +683,18 @@ impl HarnessStore {
         Ok(true)
     }
     pub fn cancel_run(&self, token: &RunToken) -> Result<(), StoreError> {
-        let c = self.conn.lock().unwrap();
-        let n=c.execute("UPDATE agent_runs SET status='cancelling' WHERE run_id=?1 AND owner_generation=?2 AND status='running'",params![token.run_id,token.owner_generation])?;
-        if n == 0 {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (_, status, _, _) = Self::check_owner(&tx, token)?;
+        if status == "running" {
+            tx.execute("UPDATE agent_runs SET status='cancelling' WHERE run_id=?1 AND owner_generation=?2 AND status='running'", params![token.run_id, token.owner_generation])?;
+        } else if status != "cancelling" && status != "needs_attention" {
             return Err(StoreError::InvalidSessionState(
                 "run cannot be cancelled".into(),
             ));
         }
+        tx.execute("UPDATE tool_executions SET routing_cancelled=1 WHERE run_id=?1 AND state IN ('prepared','running','outcome_unknown')", params![token.run_id])?;
+        tx.commit()?;
         Ok(())
     }
     pub fn resume_run(&self, run_id: &str) -> Result<RunToken, StoreError> {
@@ -739,6 +832,7 @@ impl HarnessStore {
         conversation_id: &str,
         assistant_json: &str,
         tools: &[ToolSpec],
+        routing: Option<&RoutingToolContext>,
     ) -> Result<Vec<ToolExecution>, StoreError> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
@@ -750,12 +844,27 @@ impl HarnessStore {
                 "assistant transcript conversation differs from run link".into(),
             ));
         }
+        if routing.is_some_and(|context| context.epoch.is_empty()) {
+            return Err(StoreError::InvalidSessionState(
+                "tool routing epoch is empty".into(),
+            ));
+        }
         let mut out = Vec::new();
         let mut fresh = 0;
         for t in tools {
             let hash = digest(&t.arguments);
             let existing:Option<ToolExecution>=tx.query_row("SELECT execution_id,tool_call_id,name,arguments,state,revision,result,active_attempt_id FROM tool_executions WHERE run_id=?1 AND tool_call_id=?2",params![token.run_id,t.tool_call_id],|r|Ok(ToolExecution{execution_id:r.get(0)?,tool_call_id:r.get(1)?,name:r.get(2)?,arguments:r.get(3)?,state:r.get(4)?,revision:r.get(5)?,result:r.get(6)?,active_attempt_id:r.get(7)?})).optional()?;
             if let Some(e) = existing {
+                let old_epoch: Option<String> = tx.query_row(
+                    "SELECT routing_epoch FROM tool_executions WHERE execution_id=?1",
+                    params![e.execution_id],
+                    |r| r.get(0),
+                )?;
+                if old_epoch.as_deref() != routing.map(|v| v.epoch.as_str()) {
+                    return Err(StoreError::InvalidSessionState(
+                        "tool call ID belongs to a different routing epoch".into(),
+                    ));
+                }
                 if e.name != t.name || digest(&e.arguments) != hash {
                     return Err(StoreError::InvalidSessionState(
                         "tool call ID reused with different request".into(),
@@ -764,8 +873,16 @@ impl HarnessStore {
                 out.push(e);
                 continue;
             }
+            if let Some(context) = routing {
+                let route: Option<(String,String)> = tx.query_row("SELECT epoch,phase FROM conversation_routing_state WHERE conversation_id=?1", params![cid], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if route.as_ref() != Some(&(context.epoch.clone(), "planning".to_owned())) {
+                    return Err(StoreError::InvalidSessionState(
+                        "tool routing epoch is not the current planning epoch".into(),
+                    ));
+                }
+            }
             let eid = format!("{}:{}", token.run_id, t.tool_call_id);
-            tx.execute("INSERT INTO tool_executions(execution_id,run_id,tool_call_id,name,arguments,arguments_hash,replay_policy,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'prepared')",params![eid,token.run_id,t.tool_call_id,t.name,t.arguments,hash,if t.replay_safe{"replay_safe"}else{"never"}])?;
+            tx.execute("INSERT INTO tool_executions(execution_id,run_id,tool_call_id,name,arguments,arguments_hash,replay_policy,state,routing_epoch) VALUES(?1,?2,?3,?4,?5,?6,?7,'prepared',?8)",params![eid,token.run_id,t.tool_call_id,t.name,t.arguments,hash,if t.replay_safe{"replay_safe"}else{"never"},routing.map(|v|v.epoch.as_str())])?;
             fresh += 1;
             out.push(ToolExecution {
                 execution_id: eid,
@@ -883,16 +1000,31 @@ impl HarnessStore {
     ) -> Result<(), StoreError> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        Self::check_owner(&tx, token)?;
+        let (_, run_status, _, _) = Self::check_owner(&tx, token)?;
+        let route_transition_allowed = run_status == "running";
+        let (tool_name, tool_epoch, routing_cancelled):(String,Option<String>,bool)=tx.query_row("SELECT name,routing_epoch,routing_cancelled FROM tool_executions WHERE execution_id=?1 AND run_id=?2",params![execution_id,token.run_id],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,i64>(2)? != 0))).optional()?.ok_or_else(||StoreError::NotFound(execution_id.into()))?;
         let n=tx.execute("UPDATE tool_executions SET state='succeeded',result=?1,revision=revision+1 WHERE execution_id=?2 AND run_id=?3 AND active_attempt_id=?4 AND state='running'",params![result,execution_id,token.run_id,attempt_id])?;
         if n == 0 {
             return Err(StoreError::InvalidSessionState(
                 "tool attempt is stale or not running".into(),
             ));
         }
-        tx.execute("UPDATE tool_execution_attempts SET state='succeeded',ended_at=?1,duration_ms=?2 WHERE attempt_id=?3",params![now(),duration_ms.max(0),attempt_id])?;
+        let updated = tx.execute("UPDATE tool_execution_attempts SET state='succeeded',ended_at=?1,duration_ms=?2 WHERE attempt_id=?3 AND execution_id=?4 AND state='running'",params![now(),duration_ms.max(0),attempt_id,execution_id])?;
+        if updated != 1 {
+            return Err(StoreError::InvalidSessionState(
+                "tool attempt record is stale or not running".into(),
+            ));
+        }
         if let Some(cid) = linked_conversation(&tx, &token.run_id)? {
             append_runtime_message(&tx, &cid, tool_message_json)?;
+            if route_transition_allowed
+                && !routing_cancelled
+                && matches!(tool_name.as_str(), "write_file" | "replace_file_content")
+            {
+                if let Some(epoch) = tool_epoch {
+                    tx.execute("UPDATE conversation_routing_state SET phase='implementation',revision=revision+1 WHERE conversation_id=?1 AND epoch=?2 AND phase='planning'",params![cid,epoch])?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -945,7 +1077,8 @@ impl HarnessStore {
     ) -> Result<(), StoreError> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        Self::check_owner(&tx, token)?;
+        let (_, run_status, _, _) = Self::check_owner(&tx, token)?;
+        let route_transition_allowed = matches!(run_status.as_str(), "running" | "needs_attention");
         let (state,rev,attempt):(String,i64,String)=tx.query_row("SELECT state,revision,active_attempt_id FROM tool_executions WHERE execution_id=?1 AND run_id=?2",params![execution_id,token.run_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(||StoreError::NotFound(execution_id.into()))?;
         if state != "outcome_unknown" || rev != expected_revision {
             return Err(StoreError::InvalidSessionState(
@@ -997,6 +1130,12 @@ impl HarnessStore {
             ],
         )?;
         if resolution.kind == "observed_succeeded" {
+            let attempt_updated = tx.execute("UPDATE tool_execution_attempts SET state='succeeded',ended_at=COALESCE(ended_at,?1) WHERE attempt_id=?2 AND execution_id=?3 AND state='outcome_unknown'", params![now(),attempt,execution_id])?;
+            if attempt_updated != 1 {
+                return Err(StoreError::InvalidSessionState(
+                    "unknown tool attempt is missing or stale".into(),
+                ));
+            }
             let result = resolution.result.as_deref().unwrap();
             let call: String = tx.query_row(
                 "SELECT tool_call_id FROM tool_executions WHERE execution_id=?1",
@@ -1005,8 +1144,17 @@ impl HarnessStore {
             )?;
             let message=serde_json::json!({"role":"tool","tool_call_id":call,"content":result,"source":"operator_observed"}).to_string();
             tx.execute("UPDATE tool_executions SET state='succeeded',result=?1,result_source='operator_observed',revision=revision+1 WHERE execution_id=?2",params![message,execution_id])?;
+            let (name,epoch,routing_cancelled):(String,Option<String>,bool)=tx.query_row("SELECT name,routing_epoch,routing_cancelled FROM tool_executions WHERE execution_id=?1",params![execution_id],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,i64>(2)? != 0)))?;
             let conv = linked_conversation(&tx, &token.run_id)?;
             if let Some(cid) = conv.as_ref() {
+                if route_transition_allowed
+                    && !routing_cancelled
+                    && matches!(name.as_str(), "write_file" | "replace_file_content")
+                {
+                    if let Some(epoch) = epoch {
+                        tx.execute("UPDATE conversation_routing_state SET phase='implementation',revision=revision+1 WHERE conversation_id=?1 AND epoch=?2 AND phase='planning'",params![cid,epoch])?;
+                    }
+                }
                 let g: i64 = tx.query_row(
                     "SELECT generation FROM conversations WHERE id=?1",
                     params![cid],
@@ -1027,6 +1175,18 @@ impl HarnessStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn latest_successful_model_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT model FROM runtime_model_attempts WHERE run_id=?1 AND state='succeeded' ORDER BY rowid DESC LIMIT 1",
+            params![run_id],
+            |row| row.get(0),
+        ).optional()?)
+    }
+
     pub fn start_model_attempt(
         &self,
         token: &RunToken,
@@ -1604,6 +1764,555 @@ mod tests {
         s.create_conversation(id, "/tmp", "m", "session").unwrap();
     }
 
+    fn routing_state(
+        conversation_id: &str,
+        epoch: &str,
+        phase: RoutingPhase,
+    ) -> ConversationRoutingState {
+        ConversationRoutingState {
+            conversation_id: conversation_id.into(),
+            epoch: epoch.into(),
+            phase,
+            original_model: "original".into(),
+            planning_model: "planning".into(),
+            implementation_model: "implementation".into(),
+            reason: "classified".into(),
+            revision: 100,
+            classifier_input_tokens: Some(4),
+            classifier_output_tokens: Some(2),
+        }
+    }
+
+    fn routed_run(s: &HarnessStore, id: &str) -> RunToken {
+        conversation(s, id);
+        let scope = RuntimeScope::Conversation(id.into());
+        let receipt = s
+            .admit_input(scope.clone(), "submit", InputKind::Submit, "request")
+            .unwrap();
+        let token = s
+            .start_run(scope, receipt.run_id.as_deref().unwrap())
+            .unwrap();
+        s.attach_run_conversation(&token, id).unwrap();
+        token
+    }
+
+    #[test]
+    fn routing_state_cas_is_owner_and_conversation_fenced() {
+        let s = store();
+        let token = routed_run(&s, "route-cas");
+        let initial = s
+            .save_conversation_routing_state(
+                &token,
+                &routing_state("route-cas", "e1", RoutingPhase::Planning),
+                None,
+            )
+            .unwrap();
+        assert_eq!(initial.revision, 0);
+        assert!(
+            s.save_conversation_routing_state(
+                &token,
+                &routing_state("route-cas", "e2", RoutingPhase::Planning),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            s.save_conversation_routing_state(
+                &token,
+                &routing_state("elsewhere", "e2", RoutingPhase::Planning),
+                Some(0)
+            )
+            .is_err()
+        );
+        let updated = s
+            .save_conversation_routing_state(
+                &token,
+                &routing_state("route-cas", "e2", RoutingPhase::Planning),
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(updated.revision, 1);
+        let mut stale = token.clone();
+        stale.owner_generation += 1;
+        assert!(
+            s.save_conversation_routing_state(
+                &stale,
+                &routing_state("route-cas", "e3", RoutingPhase::Fixed),
+                Some(1)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            s.conversation_routing_state("route-cas")
+                .unwrap()
+                .unwrap()
+                .epoch,
+            "e2"
+        );
+    }
+
+    #[test]
+    fn routed_write_commits_attempt_message_and_phase_atomically() {
+        let s = store();
+        let token = routed_run(&s, "route-write");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-write", "epoch", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let spec = ToolSpec {
+            tool_call_id: "write".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+            replay_safe: false,
+        };
+        let execution = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-write",
+                "{}",
+                &[spec],
+                Some(&RoutingToolContext {
+                    epoch: "epoch".into(),
+                }),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &execution.execution_id, "attempt")
+            .unwrap();
+        s.commit_tool_result_and_message(
+            &token,
+            &execution.execution_id,
+            "attempt",
+            "done",
+            r#"{"role":"tool"}"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_tool_execution(&execution.execution_id).unwrap().state,
+            "succeeded"
+        );
+        assert_eq!(
+            s.tool_journal(&execution.execution_id).unwrap().attempts[0].state,
+            "succeeded"
+        );
+        assert_eq!(s.conversation_history("route-write").unwrap().len(), 3);
+        let state = s
+            .conversation_routing_state("route-write")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.phase, RoutingPhase::Implementation);
+        assert_eq!(state.revision, 1);
+        assert_eq!(
+            s.prepare_assistant_turn_and_tools(
+                &token,
+                "route-write",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "next".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: true
+                }],
+                None
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unbound_read_failed_unknown_and_stale_epoch_never_advance_route() {
+        let s = store();
+        let token = routed_run(&s, "route-nonwrite");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-nonwrite", "current", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let read = ToolSpec {
+            tool_call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+            replay_safe: true,
+        };
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-nonwrite",
+                "{}",
+                &[read],
+                Some(&RoutingToolContext {
+                    epoch: "current".into(),
+                }),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &e.execution_id, "r").unwrap();
+        s.commit_tool_result_and_message(&token, &e.execution_id, "r", "ok", "{}", 1)
+            .unwrap();
+        let stale = ToolSpec {
+            tool_call_id: "stale".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+            replay_safe: false,
+        };
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-nonwrite",
+                "{}",
+                &[stale],
+                Some(&RoutingToolContext {
+                    epoch: "current".into(),
+                }),
+            )
+            .unwrap()
+            .remove(0);
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-nonwrite", "new", RoutingPhase::Planning),
+            Some(0),
+        )
+        .unwrap();
+        s.begin_tool(&token, &e.execution_id, "w").unwrap();
+        s.commit_tool_result_and_message(&token, &e.execution_id, "w", "ok", "{}", 1)
+            .unwrap();
+        let state = s
+            .conversation_routing_state("route-nonwrite")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (state.phase, state.epoch.as_str(), state.revision),
+            (RoutingPhase::Planning, "new", 1)
+        );
+        assert!(
+            s.prepare_assistant_turn_and_tools(
+                &token,
+                "route-nonwrite",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "bad".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false
+                }],
+                Some(&RoutingToolContext {
+                    epoch: "old".into()
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn observed_success_records_unknown_attempt_and_advances_only_current_write_epoch() {
+        let s = store();
+        let token = routed_run(&s, "route-observed");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-observed", "e", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-observed",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "write".into(),
+                    name: "replace_file_content".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false,
+                }],
+                Some(&RoutingToolContext { epoch: "e".into() }),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &e.execution_id, "attempt").unwrap();
+        s.mark_tool_unknown(&token, &e.execution_id, "attempt", "unknown", 1)
+            .unwrap();
+        let journal = s.tool_journal(&e.execution_id).unwrap();
+        s.resolve_unknown(
+            &token,
+            &e.execution_id,
+            journal.execution.revision,
+            ToolResolution {
+                operator: "operator".into(),
+                kind: "observed_succeeded".into(),
+                evidence: "verified".into(),
+                result: Some("done".into()),
+                duplicate_effect_warning: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.tool_journal(&e.execution_id).unwrap().attempts[0].state,
+            "succeeded"
+        );
+        assert_eq!(
+            s.conversation_routing_state("route-observed")
+                .unwrap()
+                .unwrap()
+                .phase,
+            RoutingPhase::Implementation
+        );
+    }
+
+    #[test]
+    fn cancelled_unknown_remains_non_transitioning_after_owner_resume() {
+        let s = store();
+        let token = routed_run(&s, "route-cancel-unknown");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-cancel-unknown", "e", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-cancel-unknown",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "write".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false,
+                }],
+                Some(&RoutingToolContext { epoch: "e".into() }),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &e.execution_id, "attempt").unwrap();
+        s.mark_tool_unknown(&token, &e.execution_id, "attempt", "unknown", 1)
+            .unwrap();
+        s.cancel_run(&token).unwrap();
+        s.cancel_run(&token).unwrap();
+        let resumed = s.resume_run(&token.run_id).unwrap();
+        let journal = s.tool_journal(&e.execution_id).unwrap();
+        s.resolve_unknown(
+            &resumed,
+            &e.execution_id,
+            journal.execution.revision,
+            ToolResolution {
+                operator: "operator".into(),
+                kind: "observed_succeeded".into(),
+                evidence: "verified".into(),
+                result: Some("done".into()),
+                duplicate_effect_warning: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.tool_journal(&e.execution_id).unwrap().attempts[0].state,
+            "succeeded"
+        );
+        let state = s
+            .conversation_routing_state("route-cancel-unknown")
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.phase, state.revision), (RoutingPhase::Planning, 0));
+        assert_eq!(
+            s.conversation_history("route-cancel-unknown")
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn routing_state_survives_file_database_reopen_without_changing_provider_session() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("routing.sqlite");
+        let artifacts = dir.path().join("artifacts");
+        {
+            let s = HarnessStore::open(&database, &artifacts).unwrap();
+            s.create_conversation("durable", "/tmp", "model", "mcp-session")
+                .unwrap();
+            let scope = RuntimeScope::Conversation("durable".into());
+            let receipt = s
+                .admit_input(scope.clone(), "submit", InputKind::Submit, "request")
+                .unwrap();
+            let token = s
+                .start_run(scope, receipt.run_id.as_deref().unwrap())
+                .unwrap();
+            s.attach_run_conversation(&token, "durable").unwrap();
+            s.save_conversation_routing_state(
+                &token,
+                &routing_state("durable", "persistent", RoutingPhase::Implementation),
+                None,
+            )
+            .unwrap();
+        }
+        let s = HarnessStore::open(&database, &artifacts).unwrap();
+        let saved = s.conversation_routing_state("durable").unwrap().unwrap();
+        assert_eq!(
+            (saved.epoch.as_str(), saved.phase, saved.revision),
+            ("persistent", RoutingPhase::Implementation, 0)
+        );
+        assert_eq!(
+            s.load_conversation("durable")
+                .unwrap()
+                .0
+                .provider_session_id,
+            "mcp-session"
+        );
+    }
+
+    #[test]
+    fn routing_commit_rollback_and_cancel_preserve_tool_success_without_transition() {
+        let s = store();
+        let token = routed_run(&s, "route-rollback");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-rollback", "e", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-rollback",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "write".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false,
+                }],
+                Some(&RoutingToolContext { epoch: "e".into() }),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &e.execution_id, "attempt").unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_route_message BEFORE INSERT ON conversation_messages BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+        }
+        assert!(
+            s.commit_tool_result_and_message(&token, &e.execution_id, "attempt", "done", "{}", 1)
+                .is_err()
+        );
+        let journal = s.tool_journal(&e.execution_id).unwrap();
+        assert_eq!(journal.execution.state, "running");
+        assert_eq!(journal.attempts[0].state, "running");
+        assert_eq!(
+            s.conversation_routing_state("route-rollback")
+                .unwrap()
+                .unwrap()
+                .phase,
+            RoutingPhase::Planning
+        );
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute_batch("DROP TRIGGER reject_route_message;")
+                .unwrap();
+        }
+        s.cancel_run(&token).unwrap();
+        s.commit_tool_result_and_message(&token, &e.execution_id, "attempt", "done", "{}", 1)
+            .unwrap();
+        let journal = s.tool_journal(&e.execution_id).unwrap();
+        assert_eq!(journal.execution.state, "succeeded");
+        assert_eq!(journal.attempts[0].state, "succeeded");
+        assert_eq!(
+            s.conversation_routing_state("route-rollback")
+                .unwrap()
+                .unwrap()
+                .phase,
+            RoutingPhase::Planning
+        );
+    }
+
+    #[test]
+    fn cached_duplicate_does_not_reappend_or_readvance() {
+        let s = store();
+        let token = routed_run(&s, "route-cache");
+        s.save_conversation_routing_state(
+            &token,
+            &routing_state("route-cache", "e", RoutingPhase::Planning),
+            None,
+        )
+        .unwrap();
+        let spec = ToolSpec {
+            tool_call_id: "write".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+            replay_safe: false,
+        };
+        let ctx = RoutingToolContext { epoch: "e".into() };
+        let e = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-cache",
+                "{}",
+                &[spec.clone()],
+                Some(&ctx),
+            )
+            .unwrap()
+            .remove(0);
+        s.begin_tool(&token, &e.execution_id, "a").unwrap();
+        s.commit_tool_result_and_message(&token, &e.execution_id, "a", "ok", "{}", 1)
+            .unwrap();
+        let count = s.conversation_history("route-cache").unwrap().len();
+        let revision = s
+            .conversation_routing_state("route-cache")
+            .unwrap()
+            .unwrap()
+            .revision;
+        let cached = s
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "route-cache",
+                "{}",
+                &[spec.clone()],
+                Some(&ctx),
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(cached.state, "succeeded");
+        assert_eq!(s.conversation_history("route-cache").unwrap().len(), count);
+        assert_eq!(
+            s.conversation_routing_state("route-cache")
+                .unwrap()
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert!(
+            s.prepare_assistant_turn_and_tools(
+                &token,
+                "route-cache",
+                "{}",
+                &[ToolSpec {
+                    tool_call_id: "write".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                    replay_safe: false
+                }],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            s.prepare_assistant_turn_and_tools(
+                &token,
+                "route-cache",
+                "{}",
+                &[spec.clone()],
+                Some(&RoutingToolContext {
+                    epoch: "new-epoch".into()
+                })
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn admission_and_settlement_are_serialized_and_followup_starts_once() {
         let s = store();
@@ -1686,6 +2395,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: false,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -1751,6 +2461,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: true,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -1775,6 +2486,60 @@ mod tests {
             vec![("read".into(), "schema1".into())]
         );
     }
+    #[test]
+    fn latest_successful_model_is_run_scoped_and_ordered_without_timestamp_ties() {
+        let s = store();
+        let token = routed_run(&s, "response-model");
+        assert_eq!(
+            s.latest_successful_model_for_run(&token.run_id).unwrap(),
+            None
+        );
+        for (id, model, state) in [
+            ("planning", "openai/gpt-4o-mini", "succeeded"),
+            ("implementation", "openai/gpt-4.1-mini", "succeeded"),
+            ("failure", "openai/gpt-4o", "failed"),
+        ] {
+            s.start_model_attempt(&token, id, "session", model).unwrap();
+            s.finish_model_attempt(
+                id,
+                ModelAttemptOutcome {
+                    state: state.into(),
+                    reason: None,
+                    usage: None,
+                    timing_complete: true,
+                },
+                0,
+            )
+            .unwrap();
+        }
+        let other = routed_run(&s, "other-response-model");
+        s.start_model_attempt(&other, "other", "session", "openai/gpt-4o")
+            .unwrap();
+        s.finish_model_attempt(
+            "other",
+            ModelAttemptOutcome {
+                state: "succeeded".into(),
+                reason: None,
+                usage: None,
+                timing_complete: true,
+            },
+            0,
+        )
+        .unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE runtime_model_attempts SET started_at=0", [])
+            .unwrap();
+        assert_eq!(
+            s.latest_successful_model_for_run(&token.run_id)
+                .unwrap()
+                .as_deref(),
+            Some("openai/gpt-4.1-mini")
+        );
+        assert_eq!(s.latest_successful_model_for_run("missing").unwrap(), None);
+    }
+
     #[test]
     fn model_finalize_records_known_usage_and_aggregates_once() {
         let s = store();
@@ -1891,6 +2656,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: false,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -2040,6 +2806,7 @@ mod tests {
                 arguments: "{}".into(),
                 replay_safe: true,
             }],
+            None,
         )
         .unwrap();
         let execution = s.tool_executions_for_run(&token.run_id).unwrap().remove(0);
@@ -2141,6 +2908,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: true,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -2162,6 +2930,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: true,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -2204,6 +2973,7 @@ mod tests {
                     arguments: "{}".into(),
                     replay_safe: true,
                 }],
+                None,
             )
             .unwrap()
             .remove(0);
@@ -2384,6 +3154,7 @@ mod tests {
                 "tool-idempotence",
                 r#"{"role":"assistant","tool_calls":[]}"#,
                 &specs,
+                None,
             )
             .unwrap();
         assert!(s.begin_tool(&t, &first[0].execution_id, "once").unwrap());
@@ -2403,6 +3174,7 @@ mod tests {
                 "tool-idempotence",
                 r#"{"role":"assistant","tool_calls":[]}"#,
                 &specs,
+                None,
             )
             .unwrap();
         assert_eq!(completed, again);
@@ -2417,7 +3189,8 @@ mod tests {
                 &t,
                 "tool-idempotence",
                 r#"{"role":"assistant","tool_calls":[]}"#,
-                &mismatch
+                &mismatch,
+                None
             )
             .is_err()
         );
@@ -2443,7 +3216,13 @@ mod tests {
         };
         let assistant = r#"{"role":"assistant","tool_calls":[]}"#;
         let saved = s
-            .prepare_assistant_turn_and_tools(&token, "mixed-plan", assistant, &[original.clone()])
+            .prepare_assistant_turn_and_tools(
+                &token,
+                "mixed-plan",
+                assistant,
+                &[original.clone()],
+                None,
+            )
             .unwrap();
         let mixed = [
             ToolSpec {
@@ -2453,13 +3232,13 @@ mod tests {
             original.clone(),
         ];
         assert!(
-            s.prepare_assistant_turn_and_tools(&token, "mixed-plan", assistant, &mixed)
+            s.prepare_assistant_turn_and_tools(&token, "mixed-plan", assistant, &mixed, None)
                 .is_err()
         );
         assert_eq!(s.tool_executions_for_run(&token.run_id).unwrap(), saved);
         assert_eq!(s.conversation_history("mixed-plan").unwrap().len(), 2);
         assert_eq!(
-            s.prepare_assistant_turn_and_tools(&token, "mixed-plan", assistant, &[original])
+            s.prepare_assistant_turn_and_tools(&token, "mixed-plan", assistant, &[original], None)
                 .unwrap(),
             saved
         );
