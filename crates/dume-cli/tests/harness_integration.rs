@@ -1456,6 +1456,7 @@ fn isolated_cli_command(program: &str, home: &std::path::Path) -> std::process::
 async fn cli_http_fixture(
     listener: tokio::net::TcpListener,
     reject: bool,
+    routed: bool,
 ) -> Vec<serde_json::Value> {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1498,7 +1499,16 @@ async fn cli_http_fixture(
         }
         let request: serde_json::Value =
             serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-        assert_eq!(request["model"], "gpt-5.4");
+        let expected_model = if routed {
+            if turn == 0 {
+                "gpt-4o-mini"
+            } else {
+                "gpt-4.1-mini"
+            }
+        } else {
+            "gpt-5.4"
+        };
+        assert_eq!(request["model"], expected_model);
         assert_eq!(request["stream"], true);
         assert_eq!(request["messages"][1]["content"], "Initialize feature");
         requests.push(request);
@@ -1538,7 +1548,7 @@ async fn cli_http_fixture(
     requests
 }
 
-async fn run_binary_cli_lifecycle(reject: bool) {
+async fn run_binary_cli_lifecycle(reject: bool, routed: bool) {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -1597,16 +1607,90 @@ async fn run_binary_cli_lifecycle(reject: bool) {
     // 2. Run worker attempt command directly via CLI
     let wt = repo_path.join("worker_e2e_wt");
     run_git(&["worktree", "add", "--detach", wt.to_str().unwrap(), "main"]);
+    let store = HarnessStore::open(&db_path, &artifacts_dir).unwrap();
+    store
+        .create_goal("goal_cli_1", "CLI lifecycle fixture")
+        .unwrap();
+    store
+        .create_task(&Task {
+            id: "task_cli_1".to_string(),
+            goal_id: "goal_cli_1".to_string(),
+            title: "CLI lifecycle fixture".to_string(),
+            description: String::new(),
+            status: TaskStatus::InProgress,
+            dependencies: vec![],
+            acceptance_criteria: vec![],
+            allowed_paths: None,
+            target_branch: "main".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    store
+        .create_attempt(
+            "att_cli_1",
+            "task_cli_1",
+            1,
+            "worker_cli_fixture",
+            wt.to_str().unwrap(),
+            60_000,
+        )
+        .unwrap();
+    let classifier_listener = if routed {
+        use dume_provider::CredentialStore;
+        let auth = CredentialStore::new(home.join(".dume/agent/auth.json"));
+        auth.save_credential("jev-local-system-one", "classifier-fixture-key")
+            .unwrap();
+        auth.save_credential("openai", "openai-fixture-key")
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = serde_json::json!({
+            "version": 1,
+            "enabled": true,
+            "classifier": {
+                "backend": "local_system_one",
+                "base_url": format!("http://{}", listener.local_addr().unwrap()),
+                "model": "fixture-classifier"
+            },
+            "models": {
+                "standard": "openai/gpt-4o-mini",
+                "complex": "openai/gpt-4o",
+                "implementation": "openai/gpt-4.1-mini"
+            }
+        });
+        let path = home.join(".dume/agent/routing.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        Some(listener)
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            cli_http_fixture(listener, reject),
+            std::time::Duration::from_secs(15),
+            cli_http_fixture(listener, reject, routed),
         )
         .await
         .expect("CLI mock server timed out")
     });
+    let classifier_server = classifier_listener.map(|listener| tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(12), listener.accept())
+            .await.expect("classifier listener timed out").unwrap();
+        let mut bytes = vec![0; 4096];
+        let size = tokio::time::timeout(std::time::Duration::from_secs(8), socket.read(&mut bytes))
+            .await.expect("classifier read timed out").unwrap();
+        let request = String::from_utf8_lossy(&bytes[..size]);
+        assert!(request.starts_with("POST /systemone "), "unexpected classifier endpoint: {request}");
+        assert!(request.to_ascii_lowercase().contains("authorization: bearer classifier-fixture-key"));
+        assert!(request.contains("Initialize feature"), "classifier did not receive the latest user prompt");
+        let body = r#"{"answers":{"complexity":{"type":"choice","choice":"standard","confidence":0.99,"probabilities":{"standard":0.99,"complex":0.01}}}}"#;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        tokio::time::timeout(std::time::Duration::from_secs(8), socket.write_all(response.as_bytes()))
+            .await.expect("classifier write timed out").unwrap();
+    }));
 
     let test_cmd = if cfg!(windows) {
         "powershell -NoProfile -Command \"if ((Get-Content feature.txt) -eq 'fixture feature') { exit 0 } else { exit 1 }\""
@@ -1629,9 +1713,13 @@ async fn run_binary_cli_lifecycle(reject: bool) {
         "openai/gpt-5.4",
         "--base-url",
         &base_url,
+        "--db-path",
+        db_path.to_str().unwrap(),
+        "--artifacts-dir",
+        artifacts_dir.to_str().unwrap(),
     ]);
     let worker_out = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
         tokio::process::Command::from(worker)
             .kill_on_drop(true)
             .output(),
@@ -1639,7 +1727,18 @@ async fn run_binary_cli_lifecycle(reject: bool) {
     .await
     .expect("Worker timed out")
     .expect("Failed to execute dume worker");
+    let worker_stderr = String::from_utf8_lossy(&worker_out.stderr);
+    assert!(
+        !worker_stderr.contains("NotFound") && !worker_stderr.contains("no such attempt"),
+        "Worker failed before reaching the fixture request: {worker_stderr}"
+    );
     let requests = server.await.unwrap();
+    if let Some(server) = classifier_server {
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("classifier task did not drain")
+            .unwrap();
+    }
     let worker_stdout = String::from_utf8_lossy(&worker_out.stdout);
     let messages: Vec<serde_json::Value> = worker_stdout
         .lines()
@@ -1663,6 +1762,10 @@ async fn run_binary_cli_lifecycle(reject: bool) {
             "Failed inference must not emit a completed manifest"
         );
         assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["model"],
+            if routed { "gpt-4o-mini" } else { "gpt-5.4" }
+        );
         assert!(!wt.join("feature.txt").exists());
         let head = run_git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]);
         assert_eq!(String::from_utf8(head.stdout).unwrap(), initial_commit);
@@ -1718,12 +1821,22 @@ async fn run_binary_cli_lifecycle(reject: bool) {
 
 #[tokio::test]
 async fn test_binary_cli_lifecycle_end_to_end() {
-    run_binary_cli_lifecycle(false).await;
+    run_binary_cli_lifecycle(false, false).await;
 }
 
 #[tokio::test]
 async fn test_binary_cli_http_failure_does_not_complete_attempt() {
-    run_binary_cli_lifecycle(true).await;
+    run_binary_cli_lifecycle(true, false).await;
+}
+
+#[tokio::test]
+async fn test_binary_cli_routing_selects_standard_then_implementation() {
+    run_binary_cli_lifecycle(false, true).await;
+}
+
+#[tokio::test]
+async fn test_binary_cli_routing_generation_unauthorized_does_not_fallback() {
+    run_binary_cli_lifecycle(true, true).await;
 }
 
 #[test]

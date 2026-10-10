@@ -398,6 +398,7 @@ fn unknown_resolution_requires_auditable_evidence_and_is_revision_fenced() {
                 arguments: "{}".into(),
                 replay_safe: false,
             }],
+            None,
         )
         .unwrap()
         .remove(0);

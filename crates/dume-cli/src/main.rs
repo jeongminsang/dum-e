@@ -351,7 +351,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             all,
         }) => {
             let target = resolve_resume_target(continue_session, resume, all);
-            dume_tui::run_tui_with_target(&model, target).await?;
+            let preserve_saved_epoch = !matches!(&target, dume_tui::ResumeTarget::None);
+            let routing = dume_worker::routing::RoutingSnapshot::load_default(preserve_saved_epoch);
+            dume_tui::run_tui_with_target(&model, target, routing).await?;
         }
         Some(Commands::Export {
             id,
@@ -575,7 +577,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Some(Commands::Mcp { command }) => run_mcp(command).await?,
         None => {
             let target = resolve_resume_target(cli.continue_session, cli.resume, cli.all);
-            dume_tui::run_tui_with_target("", target).await?;
+            let preserve_saved_epoch = !matches!(&target, dume_tui::ResumeTarget::None);
+            let routing = dume_worker::routing::RoutingSnapshot::load_default(preserve_saved_epoch);
+            dume_tui::run_tui_with_target("", target, routing).await?;
         }
     }
 
@@ -1035,7 +1039,8 @@ async fn run_worker_child(
 
     // 1. Run actual Agent Loop if task prompt is present
     let agent_outcome = if let Some(prompt) = task_prompt {
-        let mut agent = dume_worker::AgentLoop::new(path, model);
+        let routing = dume_worker::routing::RoutingSnapshot::load_default(false);
+        let mut agent = dume_worker::AgentLoop::new(path, model).with_routing_snapshot(routing);
         if let Some(base_url) = base_url {
             agent = agent.with_base_url(base_url);
         }
