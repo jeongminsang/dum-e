@@ -50,3 +50,4 @@ target/
 .dume/rust/
 .dume/build/
 .dume/cache/
+.dume/
