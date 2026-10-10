@@ -73,7 +73,11 @@ pub fn build_transcript_lines(
     let mut lines = Vec::new();
     let mut is_user_logical_line = Vec::new();
 
-    if messages.is_empty() && streaming_text.is_empty() {
+    let has_conversation = messages
+        .iter()
+        .any(|m| m.role == Role::User || m.role == Role::Assistant);
+
+    if !has_conversation && streaming_text.is_empty() {
         lines.push(Line::from(""));
         is_user_logical_line.push(false);
         lines.push(Line::from(vec![
@@ -212,7 +216,9 @@ pub fn build_transcript_lines(
             lines.push(Line::from(""));
             is_user_logical_line.push(false);
         }
-    } else {
+    }
+
+    if has_conversation || !messages.is_empty() {
         for msg in messages {
             match msg.role {
                 Role::User => {
@@ -303,31 +309,31 @@ pub fn build_transcript_lines(
                 }
             }
         }
+    }
 
-        // Streaming text (in progress)
-        if !streaming_text.is_empty() {
-            for line in streaming_text.lines() {
-                let wrapped = wrap_text_line("  ", line, effective_width);
-                for w in wrapped {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(w, Style::default().fg(theme.foreground)),
-                    ]));
-                    is_user_logical_line.push(false);
-                }
+    // Streaming text (in progress)
+    if !streaming_text.is_empty() {
+        for line in streaming_text.lines() {
+            let wrapped = wrap_text_line("  ", line, effective_width);
+            for w in wrapped {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(w, Style::default().fg(theme.foreground)),
+                ]));
+                is_user_logical_line.push(false);
             }
-            // Streaming cursor indicator
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "▍",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::RAPID_BLINK),
-                ),
-            ]));
-            is_user_logical_line.push(false);
         }
+        // Streaming cursor indicator
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "▍",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::RAPID_BLINK),
+            ),
+        ]));
+        is_user_logical_line.push(false);
     }
 
     (lines, is_user_logical_line)

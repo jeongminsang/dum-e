@@ -1,17 +1,19 @@
 use crate::component::{
-    AutocompleteItem, LoginProviderChoice, ThinkingLevel, commit_messages_to_scrollback,
-    commit_welcome_banner_to_scrollback, render_api_key_modal, render_autocomplete_dropdown,
-    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
-    render_oauth_waiting_modal, render_resume_picker_modal, render_routing_probe_confirm_modal,
-    render_routing_settings_modal, render_status_bar, render_streaming_viewport,
-    render_update_modal,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
+    render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
+    render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
+    render_resume_picker_modal, render_routing_probe_confirm_modal, render_routing_settings_modal,
+    render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
 use crate::theme::Theme;
 use anyhow::Result;
-use crossterm::event::{Event, MouseEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use dume_core::skills::SkillRegistry;
 use dume_core::updater::UpdateInfo;
 use dume_provider::ModelInfo;
@@ -1412,33 +1414,19 @@ pub async fn run_tui_with_target(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    let term_size = crossterm::terminal::size().unwrap_or((80, 24));
-    let viewport_height = term_size.1.saturating_sub(2).min(18).max(10);
-
-    // Position cursor so that Ratatui's inline viewport initialization
-    // anchors the viewport and prompt bar directly at the bottom of the screen.
-    let cur_pos = crossterm::cursor::position().unwrap_or((0, 0));
-    let target_row = term_size.1.saturating_sub(viewport_height);
-    let rows_to_target = target_row.saturating_sub(cur_pos.1);
-    if rows_to_target > 0 {
-        for _ in 0..rows_to_target {
-            let _ = write!(stdout, "\r\n");
-        }
-        let _ = stdout.flush();
-    }
-
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(viewport_height),
-        },
-    )?;
+    let mut terminal = Terminal::new(backend)?;
 
     let default_hook = Arc::new(std::panic::take_hook());
     let hook_clone = default_hook.clone();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         hook_clone(panic_info);
     }));
 
@@ -1446,6 +1434,11 @@ pub async fn run_tui_with_target(
 
     // Restore terminal
     let _ = disable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
 
     std::panic::set_hook(Box::new(move |panic_info| default_hook(panic_info)));
@@ -1758,39 +1751,42 @@ async fn run_app<B: ratatui::backend::Backend>(
     });
     spawn_codex_catalog_refresh(stream_tx.clone());
 
-    let mut committed_messages_count = 0;
-    let initial_width = terminal.size()?.width.max(1) as usize;
-    if !app.messages.is_empty() {
-        commit_messages_to_scrollback(terminal, &app.messages, initial_width, &app.theme)?;
-        committed_messages_count = app.messages.len();
-    } else {
-        commit_welcome_banner_to_scrollback(terminal, &app.recent_sessions, initial_width, &app.theme)?;
-    }
-
     let result: Result<()> = async {
-      loop {
-        let term_width = terminal.size()?.width.max(1) as usize;
-        if app.messages.len() < committed_messages_count {
-            committed_messages_count = 0;
-        }
-        if app.messages.len() > committed_messages_count {
-            let uncommitted = &app.messages[committed_messages_count..];
-            commit_messages_to_scrollback(terminal, uncommitted, term_width, &app.theme)?;
-            committed_messages_count = app.messages.len();
-        }
-
+      'app_loop: loop {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(4),    // Streaming / active area
+                    Constraint::Min(0),    // Transcript area
                     Constraint::Length(5), // Input bar
                     Constraint::Length(1), // Status bar
                 ])
                 .split(f.area());
 
-            let stream_area = chunks[0];
-            render_streaming_viewport(f, stream_area, &app.streaming_text, &app.theme);
+            let transcript_area = chunks[0];
+            let total_lines = calculate_transcript_height(
+                transcript_area.width,
+                &app.messages,
+                &app.streaming_text,
+                app.recent_sessions.len(),
+            );
+            let max_scroll = total_lines.saturating_sub(transcript_area.height);
+            if app.auto_scroll {
+                app.scroll_offset = max_scroll;
+            } else if app.scroll_offset >= max_scroll {
+                app.scroll_offset = max_scroll;
+                app.auto_scroll = true;
+            }
+
+            render_transcript(
+                f,
+                transcript_area,
+                &app.messages,
+                &app.streaming_text,
+                app.scroll_offset,
+                &app.recent_sessions,
+                &app.theme,
+            );
 
             let is_exit_warned = app.last_ctrl_c.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2));
             render_input_bar(
@@ -2011,7 +2007,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
             Some(event) = event_rx.recv() => {
-                match event {
+                let mut events = vec![event];
+                while let Ok(next) = event_rx.try_recv() {
+                    events.push(next);
+                }
+                for event in events {
+                    match event {
                     Event::Key(key) => {
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
@@ -2647,7 +2648,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     let now = std::time::Instant::now();
                                     if let Some(last_time) = app.last_ctrl_c {
                                         if now.duration_since(last_time) < std::time::Duration::from_secs(2) {
-                                            break;
+                                            break 'app_loop;
                                         }
                                     }
                                     app.last_ctrl_c = Some(now);
@@ -2730,8 +2731,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.thinking = app.thinking.next();
                                     }
                                 }
-                                Action::PageUp => {}
-                                Action::PageDown => {}
+                                Action::PageUp => {
+                                    app.auto_scroll = false;
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                                }
+                                Action::PageDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(10);
+                                }
                                 Action::SubmitInput => {
                                     if is_autocomplete_active && !autocomplete_items.is_empty() {
                                         let selected = &autocomplete_items[app.autocomplete_index];
@@ -3387,6 +3393,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 draft.selected = draft.selected.saturating_sub(1);
                                             }
                                         }
+                                        ModalState::None => {
+                                            app.auto_scroll = false;
+                                            app.scroll_offset = app.scroll_offset.saturating_sub(2);
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -3426,6 +3436,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 draft.selected = (draft.selected + 1).min(12);
                                             }
                                         }
+                                        ModalState::None => {
+                                            app.scroll_offset = app.scroll_offset.saturating_add(2);
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -3438,6 +3451,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         _ => {}
                     }
                 }
+            }
             Some(stream_event) = stream_rx.recv() => {
                 let finished_run_id = match &stream_event {
                     ConversationEvent::Finished { run_id: Some(run_id), .. }
@@ -3513,7 +3527,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     conv_id: app.conversation_id.clone(),
                     status: "interrupted".to_string(),
                 });
-                break;
+                break 'app_loop;
             }
             _ = ticker.tick() => {
                 if app.is_busy {
