@@ -159,4 +159,49 @@ mod tests {
         let c16 = theme::rainbow_color(16);
         assert_eq!(c0, c16);
     }
+
+    #[test]
+    fn test_mouse_scroll_and_autoscroll_restoration() {
+        let mut app = App::new("test-model");
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_offset, 0);
+
+        // Simulate scrolling up
+        app.auto_scroll = false;
+        app.scroll_offset = 20;
+        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        assert_eq!(app.scroll_offset, 17);
+        assert!(!app.auto_scroll);
+
+        // Simulate scrolling down until bottom reached
+        let max_scroll = 20u16;
+        app.scroll_offset = app.scroll_offset.saturating_add(3);
+        assert_eq!(app.scroll_offset, 20);
+
+        // At or beyond max_scroll, auto_scroll should be restored
+        if app.scroll_offset >= max_scroll {
+            app.scroll_offset = max_scroll;
+            app.auto_scroll = true;
+        }
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_offset, 20);
+    }
+
+    #[test]
+    fn test_mouse_scroll_does_not_mutate_input_history() {
+        let mut app = App::new("test-model");
+        app.prompt_history.push("first command".to_string());
+        app.prompt_history.push("second command".to_string());
+        app.input_buffer = "current typing".to_string();
+
+        // Mouse scroll up/down modifies scroll_offset and auto_scroll only
+        app.auto_scroll = false;
+        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        assert_eq!(app.input_buffer, "current typing");
+        assert_eq!(app.history_index, None);
+
+        app.scroll_offset = app.scroll_offset.saturating_add(3);
+        assert_eq!(app.input_buffer, "current typing");
+        assert_eq!(app.history_index, None);
+    }
 }

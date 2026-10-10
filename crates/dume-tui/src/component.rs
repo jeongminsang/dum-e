@@ -5,7 +5,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn wrap_text_line(prefix: &str, text: &str, width: usize) -> Vec<String> {
@@ -375,6 +376,78 @@ pub fn render_transcript(
             }
         }
     }
+}
+
+pub fn commit_messages_to_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    messages: &[ChatMessage],
+    width: usize,
+    theme: &Theme,
+) -> std::io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let (lines, is_user) = build_transcript_lines(messages, "", &[], width, theme);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let p = Paragraph::new(lines);
+        p.render(area, buf);
+        for (row_offset, &is_u) in is_user.iter().enumerate() {
+            if is_u && (row_offset as u16) < area.height {
+                let y = area.y + row_offset as u16;
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_style(cell.style().bg(theme.user_msg_bg));
+                    }
+                }
+            }
+        }
+    })?;
+    Ok(())
+}
+
+pub fn commit_welcome_banner_to_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    recent_sessions: &[RecentSessionSummary],
+    width: usize,
+    theme: &Theme,
+) -> std::io::Result<()> {
+    let (lines, _) = build_transcript_lines(&[], "", recent_sessions, width, theme);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let p = Paragraph::new(lines);
+        p.render(area, buf);
+    })?;
+    Ok(())
+}
+
+pub fn render_streaming_viewport(
+    f: &mut Frame,
+    area: Rect,
+    streaming_text: &str,
+    theme: &Theme,
+) {
+    if streaming_text.is_empty() || area.height == 0 {
+        return;
+    }
+    let effective_width = area.width.max(1) as usize;
+    let (lines, _) = build_transcript_lines(&[], streaming_text, &[], effective_width, theme);
+    let h = area.height as usize;
+    let visible: Vec<Line<'static>> = if lines.len() > h {
+        lines[lines.len() - h..].to_vec()
+    } else {
+        lines
+    };
+    let paragraph = Paragraph::new(visible);
+    f.render_widget(paragraph, area);
 }
 
 /// Calculate the total wrapped line count for the transcript given an inner area width.
@@ -1862,5 +1935,37 @@ mod status_bar_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_commit_messages_and_welcome_banner_to_scrollback() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let banner_res = commit_welcome_banner_to_scrollback(&mut terminal, &[], 80, &Theme::default());
+        assert!(banner_res.is_ok());
+
+        let messages = vec![
+            ChatMessage::user("hello world"),
+            ChatMessage::assistant("hi there!"),
+        ];
+        let msg_res = commit_messages_to_scrollback(&mut terminal, &messages, 80, &Theme::default());
+        assert!(msg_res.is_ok());
+    }
+
+    #[test]
+    fn test_render_streaming_viewport() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                render_streaming_viewport(f, f.area(), "Streaming output line 1\nLine 2", &Theme::default());
+            })
+            .unwrap();
+
+        let rows = rendered_rows(&terminal);
+        assert!(rows.iter().any(|r| r.contains("Streaming output line 1")));
+        assert!(rows.iter().any(|r| r.contains("Line 2")));
     }
 }
