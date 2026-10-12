@@ -2,6 +2,60 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command;
 
+/// Paths in the patch that cherry-pick will apply, including both sides of renames.
+pub async fn get_commit_modified_files(repo: &Path, commit: &str) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Candidate must be an immutable commit hash"
+    );
+    let parents = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--parents", "-n", "1", commit, "--"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        parents.status.success(),
+        "Failed to resolve candidate parents"
+    );
+    anyhow::ensure!(
+        String::from_utf8_lossy(&parents.stdout)
+            .split_whitespace()
+            .count()
+            <= 2
+            && !parents.stdout.is_empty(),
+        "Candidate must not be a merge commit"
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "--root",
+            "-r",
+            "-z",
+            commit,
+            "--",
+        ])
+        .output()
+        .await
+        .context("Failed to inspect candidate patch")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git diff-tree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| Ok(std::str::from_utf8(path)?.to_owned()))
+        .collect()
+}
+
 pub async fn get_worktree_modified_files(worktree_dir: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args([

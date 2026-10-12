@@ -31,7 +31,8 @@ pub async fn integrate_candidate_commit(
         .output()
         .await?;
 
-    if !cat_check.status.success() || String::from_utf8_lossy(&cat_check.stdout).trim() != "commit" {
+    if !cat_check.status.success() || String::from_utf8_lossy(&cat_check.stdout).trim() != "commit"
+    {
         return Ok(IntegrationResult::Failed {
             error: format!("Invalid commit object: {}", candidate_commit),
         });
@@ -39,7 +40,8 @@ pub async fn integrate_candidate_commit(
 
     // 2. Prepare clean integration worktree on target_branch
     let _ = crate::worktree::remove_git_worktree(repo_path, integration_worktree_dir).await;
-    crate::worktree::create_git_worktree(repo_path, integration_worktree_dir, target_branch).await?;
+    crate::worktree::create_git_worktree(repo_path, integration_worktree_dir, target_branch)
+        .await?;
 
     let wt_str = integration_worktree_dir.to_str().unwrap();
 
@@ -126,14 +128,16 @@ pub async fn prepare_candidate_cherry_pick(
         .output()
         .await?;
 
-    if !cat_check.status.success() || String::from_utf8_lossy(&cat_check.stdout).trim() != "commit" {
+    if !cat_check.status.success() || String::from_utf8_lossy(&cat_check.stdout).trim() != "commit"
+    {
         return Ok(IntegrationResult::Failed {
             error: format!("Invalid commit object: {}", candidate_commit),
         });
     }
 
     let _ = crate::worktree::remove_git_worktree(repo_path, integration_worktree_dir).await;
-    crate::worktree::create_git_worktree(repo_path, integration_worktree_dir, target_branch).await?;
+    crate::worktree::create_git_worktree(repo_path, integration_worktree_dir, target_branch)
+        .await?;
 
     let wt_str = integration_worktree_dir.to_str().unwrap();
 
@@ -184,7 +188,12 @@ pub async fn prepare_candidate_cherry_pick(
 pub async fn resolve_ref(repo_path: &Path, branch: &str) -> Result<String> {
     let repo_str = repo_path.to_str().unwrap();
     let out = Command::new("git")
-        .args(["-C", repo_str, "rev-parse", &format!("refs/heads/{}", branch)])
+        .args([
+            "-C",
+            repo_str,
+            "rev-parse",
+            &format!("refs/heads/{}", branch),
+        ])
         .output()
         .await?;
     if !out.status.success() {
@@ -200,8 +209,23 @@ pub async fn apply_branch_update(
     new_commit: &str,
     expected_old_commit: &str,
 ) -> Result<()> {
+    let repo = repo_path.to_path_buf();
+    let branch = target_branch.to_owned();
+    let new = new_commit.to_owned();
+    let old = expected_old_commit.to_owned();
+    tokio::task::spawn_blocking(move || apply_branch_update_sync(&repo, &branch, &new, &old))
+        .await?
+}
+
+/// Synchronous publication for callers holding a short coordinator fencing transaction.
+pub fn apply_branch_update_sync(
+    repo_path: &Path,
+    target_branch: &str,
+    new_commit: &str,
+    expected_old_commit: &str,
+) -> Result<()> {
     let repo_str = repo_path.to_str().unwrap();
-    let update_ref = Command::new("git")
+    let update_ref = std::process::Command::new("git")
         .args([
             "-C",
             repo_str,
@@ -210,8 +234,7 @@ pub async fn apply_branch_update(
             new_commit,
             expected_old_commit,
         ])
-        .output()
-        .await?;
+        .output()?;
 
     if !update_ref.status.success() {
         let stderr = String::from_utf8_lossy(&update_ref.stderr);
@@ -223,7 +246,14 @@ pub async fn apply_branch_update(
 pub async fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     let repo_str = repo_path.to_str().unwrap();
     let out = Command::new("git")
-        .args(["-C", repo_str, "merge-base", "--is-ancestor", ancestor, descendant])
+        .args([
+            "-C",
+            repo_str,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
         .output()
         .await?;
     Ok(out.status.success())

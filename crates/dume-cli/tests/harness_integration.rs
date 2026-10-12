@@ -748,11 +748,13 @@ async fn test_r4_clean_merge_but_acceptance_criteria_failure_rejects() {
         .unwrap();
 
     // Coordinator runs real production verify_and_integrate_attempt directly
+    let lock = store.acquire_coordinator_lock("default_coordinator", "test", 30_000).unwrap();
     let res = dume_cli::verify_and_integrate_attempt(
         &store,
         repo_str,
         &store.get_attempt("att_r4_fail").unwrap(),
-        1,
+        &lock,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
     assert!(res.is_ok());
@@ -865,11 +867,13 @@ async fn test_r7_tampered_manifest_artifact_blocks_verification() {
     std::fs::write(&artifact_file, b"corrupted payload").unwrap();
 
     // Verify should catch tampering via InvalidData and REJECT integration
+    let lock = store.acquire_coordinator_lock("default_coordinator", "test", 30_000).unwrap();
     let res = dume_cli::verify_and_integrate_attempt(
         &store,
         repo_str,
         &store.get_attempt("att_r7").unwrap(),
-        1,
+        &lock,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
     assert!(res.is_ok());

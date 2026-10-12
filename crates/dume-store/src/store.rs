@@ -99,11 +99,12 @@ impl HarnessStore {
         owner_id: &str,
         ttl_ms: i64,
     ) -> Result<CoordinatorLock, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_millis();
         let expires_at = now + ttl_ms;
 
-        let existing: Option<(Option<String>, i64, i64)> = conn
+        let existing: Option<(Option<String>, i64, i64)> = tx
             .query_row(
                 "SELECT owner_id, epoch, lease_expires_at FROM coordinator_locks WHERE coordinator_id = ?1",
                 params![coordinator_id],
@@ -111,19 +112,19 @@ impl HarnessStore {
             )
             .optional()?;
 
-        match existing {
+        let lock = match existing {
             None => {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO coordinator_locks (coordinator_id, owner_id, epoch, lease_expires_at, heartbeat_at) VALUES (?1, ?2, 1, ?3, ?4)",
                     params![coordinator_id, owner_id, expires_at, now],
                 )?;
-                Ok(CoordinatorLock {
+                CoordinatorLock {
                     coordinator_id: coordinator_id.to_string(),
                     owner_id: Some(owner_id.to_string()),
                     epoch: 1,
                     lease_expires_at: expires_at,
                     heartbeat_at: now,
-                })
+                }
             }
             Some((current_owner, epoch, lease_expires_at)) => {
                 let can_acquire = match &current_owner {
@@ -145,20 +146,84 @@ impl HarnessStore {
                     epoch + 1 // Monotonically increment when taking over
                 };
 
-                conn.execute(
+                tx.execute(
                     "UPDATE coordinator_locks SET owner_id = ?1, epoch = ?2, lease_expires_at = ?3, heartbeat_at = ?4 WHERE coordinator_id = ?5",
                     params![owner_id, new_epoch, expires_at, now, coordinator_id],
                 )?;
 
-                Ok(CoordinatorLock {
+                CoordinatorLock {
                     coordinator_id: coordinator_id.to_string(),
                     owner_id: Some(owner_id.to_string()),
                     epoch: new_epoch,
                     lease_expires_at: expires_at,
                     heartbeat_at: now,
-                })
+                }
             }
+        };
+        tx.commit()?;
+        Ok(lock)
+    }
+
+    /// Keep takeover and short publication operations in the same write transaction.
+    /// The callback must not call methods on this store or perform long-running validation.
+    pub fn with_coordinator_fence<T, E>(
+        &self,
+        lock: &CoordinatorLock,
+        action: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
+        let current: Option<(Option<String>, i64, i64)> = tx
+            .query_row(
+                "SELECT owner_id, epoch, lease_expires_at FROM coordinator_locks WHERE coordinator_id = ?1",
+                params![lock.coordinator_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)?;
+        let Some((owner, epoch, expires)) = current else {
+            return Err(StoreError::NotFound(format!("coordinator {}", lock.coordinator_id)).into());
+        };
+        if epoch != lock.epoch {
+            return Err(StoreError::FencingViolation { expected: epoch, actual: lock.epoch }.into());
         }
+        if owner.is_none() || owner != lock.owner_id || expires <= now_millis() {
+            return Err(StoreError::LockHeld { coordinator_id: lock.coordinator_id.clone(), owner_id: owner }.into());
+        }
+        let result = action(&tx)?;
+        tx.commit().map_err(StoreError::from)?;
+        Ok(result)
+    }
+
+    pub fn check_coordinator_fence(&self, lock: &CoordinatorLock) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |_| Ok(()))
+    }
+
+    pub fn update_attempt_task_status_fenced(
+        &self,
+        lock: &CoordinatorLock,
+        attempt_id: &str,
+        task_id: &str,
+        attempt_status: AttemptStatus,
+        task_status: TaskStatus,
+    ) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |conn| {
+            let now = now_millis();
+            conn.execute(
+                "UPDATE attempts SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![serde_json::to_value(attempt_status)?.as_str(), now, attempt_id],
+            )?;
+            conn.execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![serde_json::to_value(task_status)?.as_str(), now, task_id],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn heartbeat_coordinator(
@@ -172,7 +237,7 @@ impl HarnessStore {
         let expires_at = now + ttl_ms;
 
         let rows = conn.execute(
-            "UPDATE coordinator_locks SET lease_expires_at = ?1, heartbeat_at = ?2 WHERE coordinator_id = ?3 AND owner_id = ?4",
+            "UPDATE coordinator_locks SET lease_expires_at = ?1, heartbeat_at = ?2 WHERE coordinator_id = ?3 AND owner_id = ?4 AND lease_expires_at > ?2",
             params![expires_at, now, coordinator_id, owner_id],
         )?;
 
@@ -307,6 +372,14 @@ impl HarnessStore {
             params![status_str, now, id],
         )?;
         Ok(())
+    }
+
+    pub fn update_goal_status_fenced(&self, lock: &CoordinatorLock, id: &str, status: GoalStatus) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |conn| {
+            conn.execute("UPDATE goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![serde_json::to_value(status)?.as_str(), now_millis(), id])?;
+            Ok(())
+        })
     }
 
     pub fn create_task(&self, task: &Task) -> Result<(), StoreError> {
@@ -445,6 +518,27 @@ impl HarnessStore {
         ttl_ms: i64,
     ) -> Result<Attempt, StoreError> {
         let conn = self.conn.lock().unwrap();
+        Self::insert_attempt(&conn, attempt_id, task_id, coordinator_epoch, worker_id, worktree_path, ttl_ms)
+    }
+
+    pub fn create_attempt_fenced(
+        &self,
+        lock: &CoordinatorLock,
+        attempt_id: &str,
+        task_id: &str,
+        worker_id: &str,
+        worktree_path: &str,
+        ttl_ms: i64,
+    ) -> Result<Attempt, StoreError> {
+        self.with_coordinator_fence(lock, |conn| {
+            let attempt = Self::insert_attempt(conn, attempt_id, task_id, lock.epoch, worker_id, worktree_path, ttl_ms)?;
+            conn.execute("UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2", params![now_millis(), task_id])?;
+            Ok(attempt)
+        })
+    }
+
+    fn insert_attempt(conn: &Connection, attempt_id: &str, task_id: &str, coordinator_epoch: i64,
+        worker_id: &str, worktree_path: &str, ttl_ms: i64) -> Result<Attempt, StoreError> {
         let now = now_millis();
         let expires_at = now + ttl_ms;
 
@@ -477,7 +571,20 @@ impl HarnessStore {
         candidate_commit: &str,
         manifest_hash: &str,
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::submit_result(&tx, attempt_id, epoch, candidate_commit, manifest_hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn submit_attempt_result_fenced(&self, lock: &CoordinatorLock, attempt_id: &str,
+        candidate_commit: &str, manifest_hash: &str) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |conn| Self::submit_result(conn, attempt_id, lock.epoch, candidate_commit, manifest_hash))
+    }
+
+    fn submit_result(conn: &Connection, attempt_id: &str, epoch: i64,
+        candidate_commit: &str, manifest_hash: &str) -> Result<(), StoreError> {
         let now = now_millis();
 
         // Strict epoch fencing guard:
@@ -565,6 +672,14 @@ impl HarnessStore {
 
     pub fn record_verification(&self, v: &Verification) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
+        Self::insert_verification(&conn, v)
+    }
+
+    pub fn record_verification_fenced(&self, lock: &CoordinatorLock, v: &Verification) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |conn| Self::insert_verification(conn, v))
+    }
+
+    fn insert_verification(conn: &Connection, v: &Verification) -> Result<(), StoreError> {
         conn.execute(
             "INSERT OR REPLACE INTO verifications (attempt_id, epoch, passed, allowed_paths_passed, acceptance_command_passed, manifest_hash, details, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -584,6 +699,14 @@ impl HarnessStore {
 
     pub fn record_integration(&self, i: &Integration) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
+        Self::insert_integration(&conn, i)
+    }
+
+    pub fn record_integration_fenced(&self, lock: &CoordinatorLock, i: &Integration) -> Result<(), StoreError> {
+        self.with_coordinator_fence(lock, |conn| Self::insert_integration(conn, i))
+    }
+
+    fn insert_integration(conn: &Connection, i: &Integration) -> Result<(), StoreError> {
         let status_str = serde_json::to_string(&i.status)?
             .trim_matches('"')
             .to_string();
@@ -763,6 +886,10 @@ impl HarnessStore {
         conn.execute(
             "UPDATE attempts SET status = 'needs_attention' WHERE status = 'running' AND coordinator_epoch < ?1",
             params![current_epoch],
+        )?;
+        conn.execute(
+            "UPDATE tasks SET status = 'needs_attention' WHERE status NOT IN ('completed','failed','cancelled') AND EXISTS (SELECT 1 FROM attempts WHERE attempts.task_id = tasks.id AND attempts.status = 'needs_attention')",
+            [],
         )?;
 
         // 2. R3: Dispatched external operations without confirmed receipt transition to outcome_unknown

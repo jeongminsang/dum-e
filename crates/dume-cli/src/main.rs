@@ -6,7 +6,6 @@ use dume_worker::executor::WorkerExecutor;
 use dume_worker::ipc::{WorkerToHostMessage, serialize_message};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -1029,6 +1028,23 @@ async fn run_worker_child(
     variant: Option<&str>,
 ) -> Result<()> {
     let path = Path::new(worktree_path);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let signal_token = cancellation.clone();
+    #[cfg(unix)]
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let _signal_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        signal_token.cancel();
+    }));
 
     // Send initial progress
     let progress_msg = WorkerToHostMessage::Progress {
@@ -1072,25 +1088,7 @@ async fn run_worker_child(
             message: format!("Agent loop executing prompt: {}", prompt),
         };
         print!("{}", serialize_message(&progress_exec)?);
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let signal_token = cancellation.clone();
-        let signal_task = tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("register SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = terminate.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = tokio::signal::ctrl_c().await;
-            signal_token.cancel();
-        });
-        let outcome = agent.run_task_with_cancellation(prompt, cancellation).await;
-        signal_task.abort();
+        let outcome = agent.run_task_with_cancellation(prompt, cancellation.clone()).await;
         Some(outcome?)
     } else {
         None
@@ -1099,7 +1097,7 @@ async fn run_worker_child(
     // 2. Run test command if provided
     let mut test_results = Vec::new();
     if let Some(cmd) = test_command {
-        let result = WorkerExecutor::run_test_command(path, cmd).await?;
+        let result = WorkerExecutor::run_test_command_with_cancellation(path, cmd, cancellation.clone()).await?;
         test_results.push(result);
     }
 
@@ -1130,6 +1128,7 @@ async fn run_worker_child(
         }
     }
 
+    anyhow::ensure!(!cancellation.is_cancelled(), "Worker cancelled before finalization");
     let manifest =
         WorkerExecutor::finalize_manifest(attempt_id, path, test_results, &summary).await?;
 
@@ -1144,321 +1143,14 @@ async fn run_worker_child(
 }
 
 async fn run_coordinator(db_path: &str, artifacts_dir: &str, repo_path: &str) -> Result<()> {
+    let repo = Path::new(repo_path).canonicalize()?;
     let store = Arc::new(HarnessStore::open(db_path, artifacts_dir)?);
-    let coordinator_id = "default_coordinator";
-    let owner_id = format!("pid_{}", std::process::id());
-    let ttl_ms = 15_000;
-
-    // 1. Acquire coordinator lock with monotonic epoch fencing
-    let lock = store
-        .acquire_coordinator_lock(coordinator_id, &owner_id, ttl_ms)
-        .context("Failed to acquire coordinator lock")?;
-    let epoch = lock.epoch;
-    tracing::info!("Acquired coordinator lock with epoch {}", epoch);
-
-    // 2. Crash recovery: inspect previous state
-    let (ready_for_verify, needs_attention, unknown_ops) = store.recover_state(epoch)?;
-    tracing::info!(
-        "Crash recovery complete: {} submitted attempts ready for verification, {} attempts needing attention, {} external operations with unknown outcome",
-        ready_for_verify.len(),
-        needs_attention.len(),
-        unknown_ops.len()
-    );
-
-    // 3. Start background heartbeat task
-    let running = Arc::new(AtomicBool::new(true));
-    let store_hb = Arc::clone(&store);
-    let owner_id_hb = owner_id.clone();
-    let running_hb = Arc::clone(&running);
-    tokio::spawn(async move {
-        while running_hb.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(5_000)).await;
-            if let Err(e) = store_hb.heartbeat_coordinator(coordinator_id, &owner_id_hb, ttl_ms) {
-                tracing::warn!("Coordinator heartbeat error: {}", e);
-                break;
-            }
-        }
-    });
-
-    // 4. Reconcile any in-flight pending integrations from prior crashes (R5 crash-safe transaction)
-    let repo_p = Path::new(repo_path);
-    let pending_integrations = store.list_pending_integrations()?;
-    for pending in pending_integrations {
-        if let Some(target_commit) = &pending.integration_commit {
-            // Check if Git target branch was already advanced to the integration commit before crash
-            if let Ok(current_ref) =
-                dume_git::integrate::resolve_ref(repo_p, &pending.target_branch).await
-            {
-                let is_already_integrated = current_ref == *target_commit
-                    || dume_git::integrate::is_ancestor(repo_p, target_commit, &current_ref)
-                        .await
-                        .unwrap_or(false);
-
-                if is_already_integrated {
-                    // Ref was already updated or further advanced by subsequent normal commits: transition DB status to Applied cleanly
-                    let mut applied = pending.clone();
-                    applied.status = IntegrationStatus::Applied;
-                    store.record_integration(&applied)?;
-                    tracing::info!(
-                        "Reconciled pre-crash pending integration for branch {} (ref: {}) -> Applied",
-                        pending.target_branch,
-                        current_ref
-                    );
-                } else if current_ref == pending.base_commit {
-                    // Ref was not updated: attempt atomic update-ref with CAS
-                    match dume_git::integrate::apply_branch_update(
-                        repo_p,
-                        &pending.target_branch,
-                        target_commit,
-                        &pending.base_commit,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            let mut applied = pending.clone();
-                            applied.status = IntegrationStatus::Applied;
-                            store.record_integration(&applied)?;
-                            tracing::info!(
-                                "Completed pre-crash pending integration for branch {} -> Applied",
-                                pending.target_branch
-                            );
-                        }
-                        Err(cas_err) => {
-                            tracing::warn!(
-                                "Pre-crash pending integration CAS update-ref failed for branch {}: {}",
-                                pending.target_branch,
-                                cas_err
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "Target branch {} moved unexpectedly (current: {}, expected base: {}, candidate: {:?}); CAS update-ref rejected",
-                        pending.target_branch,
-                        current_ref,
-                        pending.base_commit,
-                        pending.integration_commit
-                    );
-                }
-            }
-        }
-    }
-
-    // 5. Recover and verify any pending results from prior crashes
-    for attempt in ready_for_verify {
-        verify_and_integrate_attempt(&store, repo_path, &attempt, epoch).await?;
-    }
-
-    // 5. Continuous Coordinator Dispatch Loop:
-    // Polls active goals, evaluates TaskDag for ready tasks, spawns workers, and verifies results
-    let worker_db_path = store.db_path.canonicalize().with_context(|| {
-        format!(
-            "canonicalize coordinator database {}",
-            store.db_path.display()
-        )
-    })?;
-    let worker_host = dume_worker::WorkerHost::new(
-        std::env::current_exe()?
-            .to_str()
-            .context("Failed to get current executable path")?,
+    let host = dume_worker::WorkerHost::new(
+        std::env::current_exe()?.to_str().context("Invalid executable path")?,
     )
-    .with_db_path(worker_db_path)
-    .with_artifacts_dir(artifacts_dir);
-
-    let repo_p = Path::new(repo_path);
-    let mut idle_iterations = 0;
-
-    while running.load(Ordering::Relaxed) {
-        let active_goals = store.list_active_goals()?;
-        if active_goals.is_empty() {
-            idle_iterations += 1;
-            if idle_iterations >= 3 {
-                tracing::info!("No active goals pending in harness. Coordinator loop exiting.");
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
-        idle_iterations = 0;
-        let mut any_work_done = false;
-
-        for goal in &active_goals {
-            let tasks = store.list_tasks_for_goal(&goal.id)?;
-            if tasks.is_empty() {
-                continue;
-            }
-
-            let all_completed = tasks.iter().all(|t| t.status == TaskStatus::Completed);
-            if all_completed {
-                store.update_goal_status(&goal.id, GoalStatus::Completed)?;
-                tracing::info!("Goal {} all tasks completed successfully", goal.id);
-                continue;
-            }
-
-            let any_failed = tasks
-                .iter()
-                .any(|t| t.status == TaskStatus::Failed || t.status == TaskStatus::NeedsAttention);
-            if any_failed {
-                store.update_goal_status(&goal.id, GoalStatus::Failed)?;
-                tracing::warn!("Goal {} has failed/blocked tasks", goal.id);
-                continue;
-            }
-
-            let dag = match dume_core::dag::TaskDag::new(&tasks) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("DAG error for goal {}: {}", goal.id, e);
-                    store.update_goal_status(&goal.id, GoalStatus::Failed)?;
-                    continue;
-                }
-            };
-
-            let ready_tasks: Vec<Task> = dag.get_ready_tasks().into_iter().cloned().collect();
-            if !ready_tasks.is_empty() {
-                any_work_done = true;
-                let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
-                let integration_lock = Arc::new(tokio::sync::Mutex::new(()));
-                let mut set = tokio::task::JoinSet::new();
-
-                for task in ready_tasks {
-                    let sem = semaphore.clone();
-                    let int_lock = integration_lock.clone();
-                    let store_clone = store.clone();
-                    let repo_p = repo_p.to_path_buf();
-                    let repo_path = repo_path.to_string();
-                    let owner_id = owner_id.clone();
-                    let worker_host = worker_host.clone();
-
-                    set.spawn(async move {
-                        let _permit = sem.acquire().await.expect("Semaphore closed");
-                        let attempt_id = format!(
-                            "att_{}_{}",
-                            task.id,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)?
-                                .as_millis()
-                        );
-                        let worktree_dir =
-                            repo_p.join(format!(".dume/rust/worktrees/{}", attempt_id));
-
-                        // 1. Create isolated worktree for worker
-                        dume_git::worktree::create_git_worktree(
-                            &repo_p,
-                            &worktree_dir,
-                            &task.target_branch,
-                        )
-                        .await?;
-
-                        // 2. Record attempt in store under current coordinator epoch
-                        let attempt = store_clone.create_attempt(
-                            &attempt_id,
-                            &task.id,
-                            epoch,
-                            &owner_id,
-                            worktree_dir.to_str().unwrap(),
-                            30_000,
-                        )?;
-
-                        tracing::info!(
-                            "Dispatched task {} (attempt {}) to worker (parallel)",
-                            task.id,
-                            attempt.id
-                        );
-
-                        // 3. Spawn separate OS worker process
-                        let cancel_token = tokio_util::sync::CancellationToken::new();
-                        let manifest_res = worker_host
-                            .run_attempt(
-                                &attempt.id,
-                                &task.id,
-                                epoch,
-                                &worktree_dir,
-                                task.acceptance_criteria.first().cloned(),
-                                Some(task.description.clone()),
-                                Some("anthropic/claude-sonnet-4-5".to_string()),
-                                cancel_token,
-                            )
-                            .await;
-
-                        match manifest_res {
-                            Ok(manifest) => {
-                                // Save manifest artifact
-                                let manifest_json = serde_json::to_string_pretty(&manifest)?;
-                                let manifest_hash = store_clone
-                                    .artifacts
-                                    .save_artifact(manifest_json.as_bytes())?;
-
-                                // Serialized verification and atomic integration
-                                let _guard = int_lock.lock().await;
-
-                                store_clone.submit_attempt_result(
-                                    &attempt.id,
-                                    epoch,
-                                    &manifest.candidate_commit,
-                                    &manifest_hash,
-                                )?;
-
-                                let updated_attempt = store_clone.get_attempt(&attempt.id)?;
-                                verify_and_integrate_attempt(
-                                    &store_clone,
-                                    &repo_path,
-                                    &updated_attempt,
-                                    epoch,
-                                )
-                                .await?;
-                            }
-                            Err(e) => {
-                                tracing::error!("Worker failed for attempt {}: {}", attempt.id, e);
-                                store_clone
-                                    .update_attempt_status(&attempt.id, AttemptStatus::Rejected)?;
-                                store_clone.update_task_status(&task.id, TaskStatus::Failed)?;
-                            }
-                        }
-
-                        // Applied worktrees are disposable; failed or unresolved evidence is retained.
-                        let completed_attempt = store_clone.get_attempt(&attempt.id)?;
-                        if let Some(candidate) = completed_attempt.candidate_commit.as_deref() {
-                            let integration =
-                                store_clone.get_integration(&task.target_branch, candidate)?;
-                            if integration
-                                .is_some_and(|record| record.status == IntegrationStatus::Applied)
-                            {
-                                if let Err(error) =
-                                    dume_git::worktree::remove_git_worktree(&repo_p, &worktree_dir)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        "Applied worktree retained after cleanup failed: {}: {}",
-                                        worktree_dir.display(),
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    });
-                }
-
-                while let Some(res) = set.join_next().await {
-                    if let Err(e) = res? {
-                        tracing::error!("Parallel task execution failed: {}", e);
-                    }
-                }
-            }
-        }
-
-        if !any_work_done {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    // Stop coordinator gracefully
-    running.store(false, Ordering::Relaxed);
-    store.release_coordinator_lock(coordinator_id, &owner_id)?;
-    tracing::info!("Coordinator released lock successfully");
-
-    Ok(())
+    .with_db_path(store.db_path.canonicalize()?)
+    .with_artifacts_dir(Path::new(artifacts_dir).canonicalize()?);
+    dume_cli::coordinator::run_coordinator(store, repo, host).await
 }
 
 pub use dume_cli::verify_and_integrate_attempt;

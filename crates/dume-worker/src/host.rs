@@ -69,7 +69,8 @@ impl WorkerHost {
             cmd.arg("--artifacts-dir").arg(path);
         }
 
-        cmd.stdin(Stdio::piped())
+        cmd.kill_on_drop(true)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -111,7 +112,7 @@ impl WorkerHost {
 
         let result: Result<()> = tokio::select! {
             _ = cancel_token.cancelled() => {
-                anyhow::bail!("Attempt {} cancelled by host", attempt_id);
+                Err(anyhow::anyhow!("Attempt {} cancelled by host", attempt_id))
             }
             res = async {
                 while let Ok(Some(line)) = reader.next_line().await {
