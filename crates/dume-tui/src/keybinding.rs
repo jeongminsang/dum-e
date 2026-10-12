@@ -11,10 +11,17 @@ pub enum Action {
     SubmitInput,
     SubmitFollowUp,
     InsertChar(char),
+    InsertNewline,
     DeleteChar,
     DeleteForward,
+    DeleteToBeginning,
+    DeleteToEnd,
+    DeleteWordBackward,
+    DeleteWordForward,
     CursorLeft,
     CursorRight,
+    CursorWordLeft,
+    CursorWordRight,
     CursorHome,
     CursorEnd,
     ScrollUp,
@@ -64,7 +71,11 @@ impl KeyBindings {
             .get(&format_key(key))
             .cloned()
             .unwrap_or_else(|| match key.code {
-                KeyCode::Char(c) => Action::InsertChar(c),
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    Action::InsertChar(c)
+                }
                 _ => Action::None,
             })
     }
@@ -94,15 +105,34 @@ fn defaults() -> HashMap<String, Action> {
         ("Tab", Action::Tab),
         ("Esc", Action::Escape),
         ("Backspace", Action::DeleteChar),
+        ("Ctrl+h", Action::DeleteChar),
         ("Delete", Action::DeleteForward),
         ("Left", Action::CursorLeft),
+        ("Ctrl+b", Action::CursorLeft),
         ("Right", Action::CursorRight),
+        ("Ctrl+f", Action::CursorRight),
         ("Home", Action::CursorHome),
+        ("Ctrl+a", Action::CursorHome),
         ("End", Action::CursorEnd),
+        ("Ctrl+e", Action::CursorEnd),
         ("Up", Action::ScrollUp),
         ("Down", Action::ScrollDown),
         ("PageUp", Action::PageUp),
         ("PageDown", Action::PageDown),
+        ("Shift+Enter", Action::InsertNewline),
+        ("Alt+Enter", Action::InsertNewline),
+        ("Ctrl+Enter", Action::InsertNewline),
+        ("Ctrl+j", Action::InsertNewline),
+        ("Ctrl+u", Action::DeleteToBeginning),
+        ("Ctrl+k", Action::DeleteToEnd),
+        ("Ctrl+w", Action::DeleteWordBackward),
+        ("Alt+Backspace", Action::DeleteWordBackward),
+        ("Alt+d", Action::DeleteWordForward),
+        ("Alt+Delete", Action::DeleteWordForward),
+        ("Alt+b", Action::CursorWordLeft),
+        ("Alt+Left", Action::CursorWordLeft),
+        ("Alt+f", Action::CursorWordRight),
+        ("Alt+Right", Action::CursorWordRight),
     ]
     .into_iter()
     .map(|(key, action)| (key.to_ascii_lowercase(), action))
@@ -114,14 +144,21 @@ fn parse_action(name: &str) -> Result<Action> {
         "Quit" => Action::Quit,
         "SubmitInput" => Action::SubmitInput,
         "SubmitFollowUp" => Action::SubmitFollowUp,
+        "InsertNewline" => Action::InsertNewline,
         "Clear" => Action::Clear,
         "OpenRoutingSettings" => Action::OpenRoutingSettings,
         "Tab" => Action::Tab,
         "Escape" => Action::Escape,
         "DeleteChar" => Action::DeleteChar,
         "DeleteForward" => Action::DeleteForward,
+        "DeleteToBeginning" => Action::DeleteToBeginning,
+        "DeleteToEnd" => Action::DeleteToEnd,
+        "DeleteWordBackward" => Action::DeleteWordBackward,
+        "DeleteWordForward" => Action::DeleteWordForward,
         "CursorLeft" => Action::CursorLeft,
         "CursorRight" => Action::CursorRight,
+        "CursorWordLeft" => Action::CursorWordLeft,
+        "CursorWordRight" => Action::CursorWordRight,
         "CursorHome" => Action::CursorHome,
         "CursorEnd" => Action::CursorEnd,
         "ScrollUp" => Action::ScrollUp,
@@ -288,5 +325,72 @@ mod routing_binding_tests {
         .unwrap();
         let mut defaults_copy = defaults();
         assert!(apply_config(&mut defaults_copy, duplicate).is_err());
+    }
+
+    #[test]
+    fn shift_enter_and_newline_combinations_dispatch_insert_newline() {
+        let bindings = KeyBindings {
+            bindings: defaults(),
+        };
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Action::InsertNewline
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Action::InsertNewline
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Action::InsertNewline
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Action::InsertNewline
+        );
+    }
+
+    #[test]
+    fn command_backspace_alias_ctrl_u_and_editing_keys_dispatch_proper_actions() {
+        let bindings = KeyBindings {
+            bindings: defaults(),
+        };
+        // Ctrl+u (Cmd+Backspace on macOS terminal) must delete to beginning, NEVER insert 'u'
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Action::DeleteToBeginning
+        );
+        // Ctrl+w / Alt+Backspace must delete word backward
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Action::DeleteWordBackward
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            Action::DeleteWordBackward
+        );
+        // Ctrl+k must delete to end
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            Action::DeleteToEnd
+        );
+        // Unmapped Ctrl or Alt key must NEVER fall back to inserting characters
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Action::None
+        );
+        // Plain char or Shift+char inserts character
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Action::InsertChar('a')
+        );
+        assert_eq!(
+            bindings.action(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Action::InsertChar('A')
+        );
     }
 }

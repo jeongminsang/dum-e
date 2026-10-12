@@ -204,4 +204,59 @@ mod tests {
         assert_eq!(app.input_buffer, "current typing");
         assert_eq!(app.history_index, None);
     }
+
+    #[test]
+    fn test_multiline_input_and_navigation() {
+        let mut app = App::new("test-model");
+        for c in "line1\nline2".chars() {
+            app.insert_char(c);
+        }
+        assert_eq!(app.input_buffer, "line1\nline2");
+        assert_eq!(app.cursor_pos, 11);
+
+        // Cursor up should move to line 1 at same column
+        assert!(app.cursor_up());
+        assert_eq!(app.cursor_pos, 5); // "line1"
+        // Cursor up at line 0 should return false
+        assert!(!app.cursor_up());
+        assert_eq!(app.cursor_pos, 5);
+
+        // Cursor down should move back to line 2
+        assert!(app.cursor_down());
+        assert_eq!(app.cursor_pos, 11);
+        // Cursor down at bottom line should return false
+        assert!(!app.cursor_down());
+        assert_eq!(app.cursor_pos, 11);
+    }
+
+    #[test]
+    fn test_delete_to_beginning_and_word_deletion() {
+        let mut app = App::new("test-model");
+        for c in "foo bar baz".chars() {
+            app.insert_char(c);
+        }
+        // Word delete backward
+        app.delete_word_backward();
+        assert_eq!(app.input_buffer, "foo bar ");
+        assert_eq!(app.cursor_pos, 8);
+
+        // Delete to beginning
+        app.delete_to_beginning();
+        assert_eq!(app.input_buffer, "");
+        assert_eq!(app.cursor_pos, 0);
+
+        // Multiline delete to beginning
+        for c in "first line\nsecond line".chars() {
+            app.insert_char(c);
+        }
+        // Should delete only the second line up to the newline
+        app.delete_to_beginning();
+        assert_eq!(app.input_buffer, "first line\n");
+        assert_eq!(app.cursor_pos, 11);
+
+        // Calling again at beginning of line deletes preceding newline
+        app.delete_to_beginning();
+        assert_eq!(app.input_buffer, "first line");
+        assert_eq!(app.cursor_pos, 10);
+    }
 }

@@ -512,39 +512,46 @@ pub fn render_input_bar(
         .border_style(Style::default().fg(border_color))
         .title(title);
 
-    let (lines, cursor_y_offset) = if area.height >= 5 {
-        (
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        "> ",
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(input_buffer, Style::default().fg(theme.foreground)),
-                ]),
-                Line::from(""),
-            ],
-            2,
-        )
+    let raw_lines: Vec<&str> = input_buffer.split('\n').collect();
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    for (idx, line) in raw_lines.iter().enumerate() {
+        let prefix = if idx == 0 { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(*line, Style::default().fg(theme.foreground)),
+        ]));
+    }
+
+    let chars: Vec<char> = input_buffer.chars().collect();
+    let pos = cursor_pos.min(chars.len());
+    let mut cursor_line = 0usize;
+    let mut cursor_col_width = 0usize;
+
+    for (i, &c) in chars.iter().enumerate() {
+        if i == pos {
+            break;
+        }
+        if c == '\n' {
+            cursor_line += 1;
+            cursor_col_width = 0;
+        } else {
+            cursor_col_width += UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+    }
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll_y = if cursor_line >= visible_height {
+        (cursor_line + 1 - visible_height) as u16
     } else {
-        (
-            vec![Line::from(vec![
-                Span::styled(
-                    "> ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(input_buffer, Style::default().fg(theme.foreground)),
-            ])],
-            1,
-        )
+        0
     };
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
 
     f.render_widget(paragraph, area);
 
@@ -585,16 +592,9 @@ pub fn render_input_bar(
         }
     }
 
-    // Position cursor based on visual display width of characters before cursor
-    let prefix_width: usize = input_buffer
-        .chars()
-        .take(cursor_pos)
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum();
-
-    let x = area.x + 3 + prefix_width as u16;
-    let y = area.y + cursor_y_offset;
-    if x < area.x + area.width - 1 && y < area.y + area.height {
+    let x = area.x + 3 + cursor_col_width as u16;
+    let y = area.y + 1 + (cursor_line as u16).saturating_sub(scroll_y);
+    if x < area.x + area.width - 1 && y < area.y + area.height - 1 {
         f.set_cursor_position((x, y));
     }
 }

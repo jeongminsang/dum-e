@@ -9,7 +9,11 @@ use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
 use crate::theme::Theme;
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -620,6 +624,32 @@ fn delete_char_at(text: &mut String, cursor: usize) {
     text.replace_range(start..start + ch.len_utf8(), "");
 }
 
+fn routing_delete_to_beginning(draft: &mut RoutingDraft) {
+    draft.cancel_probe_for_config_edit();
+    if draft.cursor == 0 {
+        return;
+    }
+    if draft.selected == 7 {
+        let mut chars = draft.key_input.chars().collect::<Vec<_>>();
+        chars.drain(0..draft.cursor.min(chars.len()));
+        draft.key_input = chars.into_iter().collect();
+        draft.cursor = 0;
+        return;
+    }
+    let Some(config) = draft.settings.classifier.as_mut() else {
+        return;
+    };
+    let text = match draft.selected {
+        2 => &mut config.base_url,
+        3 => &mut config.model,
+        _ => return,
+    };
+    let mut chars = text.chars().collect::<Vec<_>>();
+    chars.drain(0..draft.cursor.min(chars.len()));
+    *text = chars.into_iter().collect();
+    draft.cursor = 0;
+}
+
 fn routing_edit_left(draft: &mut RoutingDraft) {
     draft.cursor = draft.cursor.saturating_sub(1);
 }
@@ -1126,6 +1156,203 @@ impl App {
         }
     }
 
+    pub fn delete_to_beginning(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        if chars.is_empty() || self.cursor_pos == 0 {
+            return;
+        }
+        let pos = self.cursor_pos.min(chars.len());
+        let line_start = chars[..pos]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+
+        if line_start == pos {
+            if pos > 0 && chars[pos - 1] == '\n' {
+                chars.remove(pos - 1);
+                self.cursor_pos = pos - 1;
+            }
+        } else {
+            chars.drain(line_start..pos);
+            self.cursor_pos = line_start;
+        }
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    pub fn delete_to_end(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let pos = self.cursor_pos.min(chars.len());
+        if pos >= chars.len() {
+            return;
+        }
+        let line_end = chars[pos..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|idx| pos + idx)
+            .unwrap_or(chars.len());
+
+        if line_end == pos {
+            chars.remove(pos);
+        } else {
+            chars.drain(pos..line_end);
+        }
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    pub fn delete_word_backward(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let pos = self.cursor_pos.min(chars.len());
+        if pos == 0 {
+            return;
+        }
+        let mut idx = pos;
+        while idx > 0 && chars[idx - 1].is_whitespace() && chars[idx - 1] != '\n' {
+            idx -= 1;
+        }
+        if idx > 0 {
+            if chars[idx - 1].is_alphanumeric() || chars[idx - 1] == '_' {
+                while idx > 0 && (chars[idx - 1].is_alphanumeric() || chars[idx - 1] == '_') {
+                    idx -= 1;
+                }
+            } else if chars[idx - 1] != '\n' {
+                while idx > 0 && !chars[idx - 1].is_alphanumeric() && !chars[idx - 1].is_whitespace() {
+                    idx -= 1;
+                }
+            } else {
+                idx -= 1;
+            }
+        }
+        chars.drain(idx..pos);
+        self.cursor_pos = idx;
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    pub fn delete_word_forward(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let pos = self.cursor_pos.min(chars.len());
+        if pos >= chars.len() {
+            return;
+        }
+        let mut idx = pos;
+        while idx < chars.len() && chars[idx].is_whitespace() && chars[idx] != '\n' {
+            idx += 1;
+        }
+        if idx < chars.len() {
+            if chars[idx].is_alphanumeric() || chars[idx] == '_' {
+                while idx < chars.len() && (chars[idx].is_alphanumeric() || chars[idx] == '_') {
+                    idx += 1;
+                }
+            } else if chars[idx] != '\n' {
+                while idx < chars.len() && !chars[idx].is_alphanumeric() && !chars[idx].is_whitespace() {
+                    idx += 1;
+                }
+            } else {
+                idx += 1;
+            }
+        }
+        chars.drain(pos..idx);
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    pub fn cursor_word_left(&mut self) {
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let mut pos = self.cursor_pos.min(chars.len());
+        if pos == 0 {
+            return;
+        }
+        while pos > 0 && chars[pos - 1].is_whitespace() {
+            pos -= 1;
+        }
+        if pos > 0 {
+            if chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_' {
+                while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
+                    pos -= 1;
+                }
+            } else {
+                while pos > 0 && !chars[pos - 1].is_alphanumeric() && !chars[pos - 1].is_whitespace() {
+                    pos -= 1;
+                }
+            }
+        }
+        self.cursor_pos = pos;
+    }
+
+    pub fn cursor_word_right(&mut self) {
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let mut pos = self.cursor_pos.min(chars.len());
+        if pos >= chars.len() {
+            return;
+        }
+        while pos < chars.len() && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos < chars.len() {
+            if chars[pos].is_alphanumeric() || chars[pos] == '_' {
+                while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+                    pos += 1;
+                }
+            } else {
+                while pos < chars.len() && !chars[pos].is_alphanumeric() && !chars[pos].is_whitespace() {
+                    pos += 1;
+                }
+            }
+        }
+        self.cursor_pos = pos;
+    }
+
+    pub fn cursor_up(&mut self) -> bool {
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let pos = self.cursor_pos.min(chars.len());
+        let line_start = chars[..pos]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+
+        if line_start == 0 {
+            return false;
+        }
+
+        let col = pos - line_start;
+        let prev_line_end = line_start - 1;
+        let prev_line_start = chars[..prev_line_end]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let prev_line_len = prev_line_end - prev_line_start;
+
+        self.cursor_pos = prev_line_start + col.min(prev_line_len);
+        true
+    }
+
+    pub fn cursor_down(&mut self) -> bool {
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let pos = self.cursor_pos.min(chars.len());
+        let line_start = chars[..pos]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let col = pos - line_start;
+
+        let next_line_start = match chars[pos..].iter().position(|&c| c == '\n') {
+            Some(idx) => pos + idx + 1,
+            None => return false,
+        };
+
+        let next_line_end = chars[next_line_start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|idx| next_line_start + idx)
+            .unwrap_or(chars.len());
+        let next_line_len = next_line_end - next_line_start;
+
+        self.cursor_pos = next_line_start + col.min(next_line_len);
+        true
+    }
+
     pub fn navigate_history_up(&mut self) {
         if self.prompt_history.is_empty() {
             return;
@@ -1414,7 +1641,13 @@ pub async fn run_tui_with_target(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _ = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1424,6 +1657,8 @@ pub async fn run_tui_with_target(
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -1436,6 +1671,8 @@ pub async fn run_tui_with_target(
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     );
@@ -1754,12 +1991,16 @@ async fn run_app<B: ratatui::backend::Backend>(
     let result: Result<()> = async {
       'app_loop: loop {
         terminal.draw(|f| {
+            let line_count = app.input_buffer.split('\n').count().max(1);
+            let input_height = (line_count as u16 + 2)
+                .min(10)
+                .min(f.area().height.saturating_sub(4).max(3));
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(0),    // Transcript area
-                    Constraint::Length(5), // Input bar
-                    Constraint::Length(1), // Status bar
+                    Constraint::Min(0),           // Transcript area
+                    Constraint::Length(input_height), // Input bar
+                    Constraint::Length(1),        // Status bar
                 ])
                 .split(f.area());
 
@@ -2014,6 +2255,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 for event in events {
                     match event {
                     Event::Key(key) => {
+                            if key.kind == crossterm::event::KeyEventKind::Release {
+                                continue;
+                            }
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
                                 ModalState::ModelSelector {
@@ -2116,7 +2360,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 .collect();
                                             *selected_idx = 0;
                                         }
-                                        crossterm::event::KeyCode::Char(c) => {
+                                        crossterm::event::KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                            filter.clear();
+                                            let tab = &provider_tabs[*active_tab_idx];
+                                            *filtered = models
+                                                .iter()
+                                                .filter(|m| {
+                                                    tab == "All" || m.provider.eq_ignore_ascii_case(tab)
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            *selected_idx = 0;
+                                        }
+                                        crossterm::event::KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
                                             filter.push(c);
                                             let q = filter.to_lowercase();
                                             let tab = &provider_tabs[*active_tab_idx];
@@ -2293,7 +2552,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                             app.modal = ModalState::None;
                                         }
-                                        crossterm::event::KeyCode::Char(c) => {
+                                        crossterm::event::KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                            input.clear();
+                                        }
+                                        crossterm::event::KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
                                             input.push(c);
                                         }
                                         _ => {}
@@ -2379,8 +2644,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             });
                                             btw_tasks.push((task_cancel, handle));
                                         }
+                                    } else if key.code == crossterm::event::KeyCode::Char('u') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                                        input.clear();
+                                    } else if key.code == crossterm::event::KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                                        app.modal = ModalState::None;
                                     } else if let crossterm::event::KeyCode::Char(c) = key.code {
-                                        input.push(c);
+                                        if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT {
+                                            input.push(c);
+                                        }
                                     }
                                     continue;
                                 }
@@ -2490,6 +2761,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         Action::CursorEnd if draft.field_edit => draft.cursor = routing_selected_text(draft).chars().count(),
                                         Action::DeleteChar if draft.field_edit => routing_delete_char(draft),
                                         Action::DeleteForward if draft.field_edit => routing_delete_forward(draft),
+                                        Action::DeleteToBeginning if draft.field_edit => routing_delete_to_beginning(draft),
                                         Action::InsertChar(c) if draft.field_edit => routing_insert_char(draft, c),
                                         Action::Tab => { draft.field_edit = false; draft.selected = (draft.selected + 1) % 13; }
                                         Action::SubmitInput => {
@@ -2683,6 +2955,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.insert_char(c);
                                     app.autocomplete_index = 0;
                                 }
+                                Action::InsertNewline => {
+                                    app.autocomplete_dismissed = false;
+                                    app.insert_char('\n');
+                                    app.autocomplete_index = 0;
+                                }
                                 Action::DeleteChar => {
                                     app.autocomplete_dismissed = false;
                                     app.delete_char();
@@ -2693,8 +2970,30 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.delete_forward();
                                     app.autocomplete_index = 0;
                                 }
+                                Action::DeleteToBeginning => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_to_beginning();
+                                    app.autocomplete_index = 0;
+                                }
+                                Action::DeleteToEnd => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_to_end();
+                                    app.autocomplete_index = 0;
+                                }
+                                Action::DeleteWordBackward => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_word_backward();
+                                    app.autocomplete_index = 0;
+                                }
+                                Action::DeleteWordForward => {
+                                    app.autocomplete_dismissed = false;
+                                    app.delete_word_forward();
+                                    app.autocomplete_index = 0;
+                                }
                                 Action::CursorLeft => app.cursor_left(),
                                 Action::CursorRight => app.cursor_right(),
+                                Action::CursorWordLeft => app.cursor_word_left(),
+                                Action::CursorWordRight => app.cursor_word_right(),
                                 Action::CursorHome => app.cursor_pos = 0,
                                 Action::CursorEnd => app.cursor_pos = app.input_buffer.chars().count(),
                                 Action::ScrollUp => {
@@ -2704,6 +3003,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else {
                                             app.autocomplete_index -= 1;
                                         }
+                                    } else if app.cursor_up() {
+                                        // Moved cursor up in multiline input buffer
                                     } else if !app.prompt_history.is_empty() {
                                         app.navigate_history_up();
                                     }
@@ -2715,6 +3016,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else {
                                             app.autocomplete_index += 1;
                                         }
+                                    } else if app.cursor_down() {
+                                        // Moved cursor down in multiline input buffer
                                     } else if app.history_index.is_some() {
                                         app.navigate_history_down();
                                     }
@@ -3441,6 +3744,38 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         _ => {}
                                     }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Event::Paste(text) => {
+                            match &mut app.modal {
+                                ModalState::None => {
+                                    app.autocomplete_dismissed = true;
+                                    for c in text.chars() {
+                                        app.insert_char(c);
+                                    }
+                                }
+                                ModalState::ApiKeyInput { input, .. } => {
+                                    input.push_str(text.trim());
+                                }
+                                ModalState::BtwChat { input, .. } => {
+                                    input.push_str(&text);
+                                }
+                                ModalState::ModelSelector { filter, models, filtered, selected_idx, provider_tabs, active_tab_idx, .. } => {
+                                    filter.push_str(text.trim());
+                                    let q = filter.to_lowercase();
+                                    let tab = &provider_tabs[*active_tab_idx];
+                                    *filtered = models
+                                        .iter()
+                                        .filter(|m| {
+                                            (tab == "All" || m.provider.eq_ignore_ascii_case(tab))
+                                                && (m.id.to_lowercase().contains(&q)
+                                                    || m.provider.to_lowercase().contains(&q))
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    *selected_idx = 0;
                                 }
                                 _ => {}
                             }
