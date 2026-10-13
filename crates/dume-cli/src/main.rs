@@ -403,7 +403,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let codex_only = provider
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case("openai-codex"));
-            if !codex_only {
+            let opencodex_only = provider
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("opencodex"));
+            if !codex_only && !opencodex_only {
                 if let Err(error) =
                     dume_provider::ModelCatalog::refresh_remote_cache_if_stale().await
                 {
@@ -425,6 +428,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     dume_provider::ModelCatalog::refresh_codex_cache_if_stale().await
                 {
                     eprintln!("Codex catalog refresh failed; showing local models: {error:#}");
+                }
+            }
+            if opencodex_only || provider.is_none() {
+                if let Err(error) = dume_provider::opencodex::refresh_cache_if_stale().await {
+                    if opencodex_only {
+                        return Err(error).context("Could not load local OpenCodex models");
+                    }
                 }
             }
             let all = dume_provider::ModelCatalog::list_all_models()?;
@@ -931,7 +941,7 @@ fn login_provider(provider: &str) -> Result<&str> {
     anyhow::ensure!(
         matches!(
             provider,
-            "anthropic" | "openai" | "openai-codex" | "google" | "deepseek"
+            "anthropic" | "openai" | "openai-codex" | "google" | "deepseek" | "opencodex"
         ),
         "Unsupported login provider"
     );
@@ -950,7 +960,7 @@ async fn run_login(provider: &str, api_key: bool, device: bool, manual: bool) ->
         "Codex requires OAuth login"
     );
     let store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-    if api_key || matches!(provider, "openai" | "google" | "deepseek") {
+    if api_key || matches!(provider, "openai" | "google" | "deepseek" | "opencodex") {
         anyhow::ensure!(
             !manual,
             "Manual OAuth login is unavailable for API-key providers"
@@ -1190,6 +1200,7 @@ mod login_tests {
         );
         assert_eq!(login_provider("gemini").unwrap(), "google");
         assert_eq!(login_provider("deepseek").unwrap(), "deepseek");
+        assert_eq!(login_provider("opencodex").unwrap(), "opencodex");
         assert!(login_provider("unsupported").is_err());
         assert!(matches!(
             Cli::try_parse_from(["dume", "models"]).unwrap().command,

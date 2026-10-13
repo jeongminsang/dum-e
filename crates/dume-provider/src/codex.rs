@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 pub struct CodexProvider {
     client: LlmClient,
     access_token: String,
-    account_id: String,
+    account_id: Option<String>,
     base_url: String,
 }
 
@@ -327,9 +327,18 @@ impl CodexProvider {
         Self {
             client: LlmClient::new(),
             access_token: access_token.to_string(),
-            account_id: account_id.to_string(),
+            account_id: Some(account_id.to_string()),
             base_url: "https://chatgpt.com/backend-api".to_string(),
         }
+    }
+
+    pub fn new_opencodex(base_url: &str, api_key: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: LlmClient::local()?,
+            access_token: api_key.unwrap_or_default().to_string(),
+            account_id: None,
+            base_url: crate::opencodex::validate_base_url(base_url)?,
+        })
     }
 
     pub fn with_base_url(mut self, base_url: &str) -> Self {
@@ -338,7 +347,9 @@ impl CodexProvider {
     }
 
     fn url(&self) -> String {
-        if self.base_url.ends_with("/codex/responses") {
+        if self.account_id.is_none() {
+            format!("{}/responses", self.base_url)
+        } else if self.base_url.ends_with("/codex/responses") {
             self.base_url.clone()
         } else if self.base_url.ends_with("/codex") {
             format!("{}/responses", self.base_url)
@@ -348,11 +359,22 @@ impl CodexProvider {
     }
 
     fn headers(&self, context: Option<&crate::types::StreamRequestContext>) -> Result<HeaderMap> {
-        let mut headers = LlmClient::build_auth_headers(&self.access_token, false)?;
-        headers.insert(
-            "chatgpt-account-id",
-            HeaderValue::from_str(&self.account_id).context("Invalid account ID header")?,
-        );
+        let mut headers = if self.account_id.is_none() && self.access_token.is_empty() {
+            HeaderMap::new()
+        } else {
+            LlmClient::build_auth_headers(&self.access_token, false)?
+        };
+        if let Some(account_id) = &self.account_id {
+            headers.insert(
+                "chatgpt-account-id",
+                HeaderValue::from_str(account_id).context("Invalid account ID header")?,
+            );
+            headers.insert("originator", HeaderValue::from_static("pi"));
+            headers.insert(
+                "openai-beta",
+                HeaderValue::from_static("responses=experimental"),
+            );
+        }
         if let Some(ctx) = context {
             if let Ok(val) = HeaderValue::from_str(&ctx.session_id) {
                 headers.insert("session-id", val);
@@ -361,14 +383,9 @@ impl CodexProvider {
                 headers.insert("x-client-request-id", val);
             }
         }
-        headers.insert("originator", HeaderValue::from_static("pi"));
         headers.insert(
             "user-agent",
             HeaderValue::from_static(concat!("dume/", env!("CARGO_PKG_VERSION"))),
-        );
-        headers.insert(
-            "openai-beta",
-            HeaderValue::from_static("responses=experimental"),
         );
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
         Ok(headers)
@@ -474,6 +491,9 @@ impl CodexProvider {
         context: Option<&crate::types::StreamRequestContext>,
         tx: &mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
+        if self.account_id.is_none() {
+            crate::opencodex::validate_base_url(&self.base_url)?;
+        }
         let response = self
             .client
             .post_once(

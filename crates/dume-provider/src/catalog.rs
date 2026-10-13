@@ -447,6 +447,14 @@ impl ModelCatalog {
             }
         }
 
+        if let Ok(endpoint) = crate::opencodex::base_url() {
+            if let Some(models) = crate::opencodex::cached_models(root, &endpoint) {
+                for model in models {
+                    model_map.insert((model.provider.clone(), model.id.clone()), model);
+                }
+            }
+        }
+
         // Tier 3: User custom configuration
         let user_file = root.join("models.json");
         if user_file.is_file() {

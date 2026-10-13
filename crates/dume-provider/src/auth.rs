@@ -78,6 +78,7 @@ fn credential_env(provider: &str) -> &'static str {
         "google" => "GEMINI_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         "opencode" | "opencode-go" => "OPENCODE_API_KEY",
+        "opencodex" => "OPENCODEX_API_KEY",
         _ => "",
     }
 }

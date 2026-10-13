@@ -24,6 +24,16 @@ impl Default for LlmClient {
 }
 
 impl LlmClient {
+    pub(crate) fn local() -> Result<Self> {
+        Ok(Self {
+            http: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(60))
+                .build()?,
+        })
+    }
+
     pub fn new() -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(60))

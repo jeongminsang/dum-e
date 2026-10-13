@@ -112,6 +112,28 @@ In the interactive TUI, `/subagents` shows the subagent model setting. Use
 subagents, or `/subagents model inherit` to use the parent model. This setting
 is stored in `~/.dume/agent/subagents.json`.
 
+### Local OpenCodex
+
+With OpenCodex running locally, discover its models and select one directly:
+
+```bash
+dume models --provider opencodex
+dume interactive --model opencodex/gpt-5.6-luna
+```
+
+Use a model ID returned by the first command, including any provider prefix
+inside that ID (for example `opencodex/anthropic/claude-model`). DUM-E fetches
+`/v1/models` and streams through `/v1/responses`; it caches the catalog for five
+minutes. OpenCodex models also appear in the TUI `/model` picker.
+
+The default endpoint is `http://127.0.0.1:10100/v1`. Set `OPENCODEX_BASE_URL`
+for another local port. Only loopback addresses are accepted. Local OpenCodex
+does not require a DUM-E login. If a proxy API key is needed, set
+`OPENCODEX_API_KEY` or save it with `dume login opencodex --api-key`. These
+credentials are separate from OpenAI Codex OAuth and OpenCode Zen credentials.
+OpenCodex pricing is shown as unknown.
+See [OpenCodex's API documentation](https://opencodex.me/reference/proxy-formats/).
+
 ---
 
 ## CLI Usage

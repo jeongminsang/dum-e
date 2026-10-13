@@ -221,9 +221,10 @@ fn selectable_models() -> Vec<ModelInfo> {
         "openai-codex",
         "opencode",
         "opencode-go",
+        "opencodex",
     ]
     .into_iter()
-    .filter(|provider| store.has_credential(provider))
+    .filter(|provider| *provider == "opencodex" || store.has_credential(provider))
     .collect();
     dume_provider::ModelCatalog::list_all_models()
         .unwrap_or_default()
@@ -271,6 +272,19 @@ fn spawn_codex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>) {
         let _ = tx
             .send(ConversationEvent::CatalogRefreshFinished(result))
             .await;
+    });
+}
+
+fn spawn_opencodex_catalog_refresh(tx: mpsc::Sender<ConversationEvent>, report_error: bool) {
+    tokio::spawn(async move {
+        let result = dume_provider::opencodex::refresh_cache_if_stale()
+            .await
+            .map_err(|error| format!("OpenCodex: {error:#}"));
+        if result.is_ok() || report_error {
+            let _ = tx
+                .send(ConversationEvent::CatalogRefreshFinished(result))
+                .await;
+        }
     });
 }
 
@@ -1987,6 +2001,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             .await;
     });
     spawn_codex_catalog_refresh(stream_tx.clone());
+    spawn_opencodex_catalog_refresh(stream_tx.clone(), app.model.starts_with("opencodex/"));
 
     let result: Result<()> = async {
       'app_loop: loop {
@@ -2166,6 +2181,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                             name: "OpenCode Go",
                             auth_type: "API Key",
                             is_authenticated: has_opencode_go,
+                        },
+                        LoginProviderChoice {
+                            id: "opencodex",
+                            name: "OpenCodex Local",
+                            auth_type: "API Key (optional)",
+                            is_authenticated: cred_store.has_credential("opencodex"),
                         },
                     ];
 
@@ -2403,6 +2424,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         "openai-codex",
                                         "opencode",
                                         "opencode-go",
+                                        "opencodex",
                                     ];
                                     let provider_names = [
                                         "Anthropic Claude",
@@ -2412,6 +2434,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         "OpenAI Codex",
                                         "OpenCode Zen",
                                         "OpenCode Go",
+                                        "OpenCodex Local",
                                     ];
 
                                     match key.code {
@@ -3208,7 +3231,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                                             if models.is_empty() {
                                                 app.messages.push(ChatMessage::ui_notice(
-                                                    "No authenticated providers found. Please run /login to authenticate a provider (e.g. Anthropic, OpenAI, Google, DeepSeek, OpenAI Codex, OpenCode Zen, OpenCode Go)."
+                                                    "No available provider models found. Start OpenCodex locally or use /login to authenticate another provider."
                                                 ));
                                                 continue;
                                             }
@@ -3683,7 +3706,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         ModalState::LoginSelector { selected_idx } => {
                                             if *selected_idx == 0 {
-                                                *selected_idx = 6;
+                                                *selected_idx = 7;
                                             } else {
                                                 *selected_idx -= 1;
                                             }
@@ -3724,7 +3747,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
                                         ModalState::LoginSelector { selected_idx } => {
-                                            if *selected_idx + 1 >= 7 {
+                                            if *selected_idx + 1 >= 8 {
                                                 *selected_idx = 0;
                                             } else {
                                                 *selected_idx += 1;

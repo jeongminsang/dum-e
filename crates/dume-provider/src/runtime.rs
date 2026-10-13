@@ -28,6 +28,10 @@ impl ResolvedProvider {
     /// Override the selected transport's API root, retaining its resolved credentials.
     /// Callers must trust this endpoint with those credentials.
     pub fn with_base_url(mut self, base_url: &str) -> Result<Self> {
+        let local_base_url = (self.model.provider == "opencodex")
+            .then(|| crate::opencodex::validate_base_url(base_url))
+            .transpose()?;
+        let base_url = local_base_url.as_deref().unwrap_or(base_url);
         let url = reqwest::Url::parse(base_url).context("Invalid provider base URL")?;
         anyhow::ensure!(
             matches!(url.scheme(), "http" | "https")
@@ -269,6 +273,7 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
         "google" => api == "google-generative-ai" || api.is_empty(),
         "deepseek" => api == "openai-completions" || api.is_empty(),
         "opencode" | "opencode-go" => api == "openai-completions" || api.is_empty(),
+        "opencodex" => api == "openai-responses" || api.is_empty(),
         _ => false,
     }
 }
@@ -288,6 +293,7 @@ fn supported(provider: &str) -> bool {
             | "deepseek"
             | "opencode"
             | "opencode-go"
+            | "opencodex"
     )
 }
 
@@ -360,6 +366,11 @@ pub async fn resolve_provider(
     selection: &str,
     store: &CredentialStore,
 ) -> Result<ResolvedProvider> {
+    if selection.trim().starts_with("opencodex/") && resolve_model(selection).is_err() {
+        crate::opencodex::refresh_cache_if_stale()
+            .await
+            .context("Could not discover local OpenCodex models; check OpenCodex and OPENCODEX_BASE_URL")?;
+    }
     resolve_with(selection, |provider| async move {
         store.resolve_credential(&provider).await
     })
@@ -374,17 +385,23 @@ where
     let model = resolve_model(selection)?;
     let cred = credential(model.provider.clone())
         .await
-        .with_context(|| format!("Authentication failed for {}", model.provider))?
-        .with_context(|| {
-            format!(
-                "No credentials for {}; authenticate via `dume login`",
-                model.provider
-            )
-        })?;
+        .with_context(|| format!("Authentication failed for {}", model.provider))?;
+    if model.provider == "opencodex" {
+        return bind_opencodex(model, cred);
+    }
+    let cred = cred.with_context(|| {
+        format!(
+            "No credentials for {}; authenticate via `dume login`",
+            model.provider
+        )
+    })?;
     bind_credential(model, cred)
 }
 
 fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedProvider> {
+    if model.provider == "opencodex" {
+        return bind_opencodex(model, Some(credential));
+    }
     let required = |value: Option<&str>, field: &str| -> Result<String> {
         value
             .filter(|value| !value.trim().is_empty())
@@ -444,6 +461,36 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             model.provider
         ),
     };
+    Ok(ResolvedProvider { model, transport })
+}
+
+fn bind_opencodex(model: ModelInfo, credential: Option<Credential>) -> Result<ResolvedProvider> {
+    anyhow::ensure!(
+        is_model_supported(&model),
+        "OpenCodex requires openai-responses protocol"
+    );
+    let key = match credential.as_ref() {
+        None => None,
+        Some(credential) => {
+            anyhow::ensure!(
+                credential.cred_type == "api_key",
+                "OpenCodex requires an API key, not OAuth"
+            );
+            Some(
+                credential
+                    .key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .context("OpenCodex API key missing")?,
+            )
+        }
+    };
+    let base_url = model
+        .base_url
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(crate::opencodex::base_url)?;
+    let transport = Transport::Codex(CodexProvider::new_opencodex(&base_url, key)?);
     Ok(ResolvedProvider { model, transport })
 }
 
@@ -531,7 +578,9 @@ pub async fn resolve_role_provider(
     // If role candidates failed, attempt fallback to any authenticated supported model
     let all = ModelCatalog::list_all_models().unwrap_or_default();
     for m in all {
-        if is_model_supported(&m) && store.has_credential(&m.provider) {
+        if is_model_supported(&m)
+            && (m.provider == "opencodex" || store.has_credential(&m.provider))
+        {
             let qualified = format!("{}/{}", m.provider, m.id);
             if let Ok(provider) = resolve_provider(&qualified, store).await {
                 return Ok(provider);
@@ -566,6 +615,110 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             account_id: Some("test-account".into()),
+        }
+    }
+
+    fn local_model(base_url: &str) -> ModelInfo {
+        serde_json::from_value(serde_json::json!({
+            "id":"routed/model", "name":"Local model", "provider":"opencodex",
+            "api":"openai-responses", "baseUrl":base_url,
+            "reasoning":true, "input":["text"]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn opencodex_accepts_optional_proxy_key_and_rejects_oauth_or_remote_urls() {
+        let model = local_model(crate::opencodex::DEFAULT_BASE_URL);
+        assert!(bind_opencodex(model.clone(), None).is_ok());
+        assert!(bind_opencodex(model.clone(), Some(credential("api_key"))).is_ok());
+        assert!(bind_opencodex(model.clone(), Some(credential("oauth"))).is_err());
+        let mut empty = credential("api_key");
+        empty.key = Some(" ".into());
+        assert!(bind_opencodex(model.clone(), Some(empty)).is_err());
+        assert!(bind_opencodex(local_model("https://example.com/v1"), None).is_err());
+        assert!(
+            bind_opencodex(model, None)
+                .unwrap()
+                .with_base_url("https://example.com/v1")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn opencodex_responses_route_streams_tools_and_replays_results_without_oauth_headers() {
+        use crate::types::ToolCall;
+        for with_key in [false, true] {
+            let call = serde_json::json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"read", "arguments":"{}"});
+            let body = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "type":"response.completed", "response":{"status":"completed", "output":[call]}
+                })
+            );
+            let (url, server) = crate::codex::tests::fixture(body);
+            let provider =
+                bind_opencodex(local_model(&url), with_key.then(|| credential("api_key"))).unwrap();
+            let mut history = vec![ChatMessage::user("read")];
+            let context = StreamRequestContext::for_session("local-session");
+            let (tx, mut rx) = mpsc::channel(32);
+            provider
+                .stream_with_context(&history, &[], Some(&context), tx)
+                .await
+                .unwrap();
+            let (headers, request) = server.join().unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("post /v1/responses "));
+            assert_eq!(headers.contains("authorization: bearer test-key"), with_key);
+            assert!(!headers.contains("chatgpt-account-id:"));
+            assert!(!headers.contains("openai-beta:"));
+            assert!(headers.contains("session-id: local-session"));
+            assert_eq!(request["model"], "routed/model");
+            assert_eq!(request["prompt_cache_key"], "local-session");
+            let mut calls = Vec::new();
+            let mut completed = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_delta,
+                        ..
+                    } => calls.push(ToolCall {
+                        id: id.unwrap(),
+                        name: name.unwrap(),
+                        arguments: arguments_delta,
+                    }),
+                    StreamEvent::Completed { .. } => completed = true,
+                    StreamEvent::AttemptFinished { model, outcome, .. } => {
+                        assert_eq!(model, "opencodex/routed/model");
+                        assert_eq!(outcome, AttemptOutcome::Succeeded);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(completed);
+            assert_eq!(calls.len(), 1);
+            history.push(ChatMessage::assistant_with_tool_calls("", calls));
+            history.push(ChatMessage::tool("file contents", "call_1"));
+            let (url, server) = crate::codex::tests::fixture(
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"delta\":\"읽기 완료\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".into()
+            );
+            let provider = provider.with_base_url(&url).unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            provider.stream(&history, &[], tx).await.unwrap();
+            let (_, request) = server.join().unwrap();
+            assert_eq!(request["input"][1]["type"], "function_call");
+            assert_eq!(request["input"][2]["type"], "function_call_output");
+            assert_eq!(request["input"][2]["call_id"], "call_1");
+            assert_eq!(request["input"][2]["output"], "file contents");
+            let mut text = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                }
+            }
+            assert_eq!(text, "읽기 완료");
         }
     }
 
