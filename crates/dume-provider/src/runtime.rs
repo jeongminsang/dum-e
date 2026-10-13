@@ -1,9 +1,12 @@
 use crate::auth::{Credential, CredentialStore};
 use crate::catalog::{ModelCatalog, ModelInfo};
 use crate::codex::CodexProvider;
-use crate::types::{ChatMessage, StreamEvent, ToolDefinition};
+use crate::types::{
+    AttemptOutcome, ChatMessage, ProviderFailureKind, StreamEvent, TokenUsage, ToolDefinition,
+};
 use crate::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// A catalog model bound to exactly one authenticated inference transport.
@@ -25,6 +28,10 @@ impl ResolvedProvider {
     /// Override the selected transport's API root, retaining its resolved credentials.
     /// Callers must trust this endpoint with those credentials.
     pub fn with_base_url(mut self, base_url: &str) -> Result<Self> {
+        let local_base_url = (self.model.provider == "opencodex")
+            .then(|| crate::opencodex::validate_base_url(base_url))
+            .transpose()?;
+        let base_url = local_base_url.as_deref().unwrap_or(base_url);
         let url = reqwest::Url::parse(base_url).context("Invalid provider base URL")?;
         anyhow::ensure!(
             matches!(url.scheme(), "http" | "https")
@@ -61,20 +68,197 @@ impl ResolvedProvider {
         context: Option<&crate::types::StreamRequestContext>,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let model = &self.model.id;
-        match &self.transport {
-            Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
-                p.stream_with_context(model, messages, tools, context, tx).await
+        let seed = context.cloned().unwrap_or_default();
+        let mut attempt_context = seed.clone();
+        let mut delay = Duration::from_millis(500);
+        let retry_started = Instant::now();
+        for attempt in 1..=4 {
+            let started = Instant::now();
+            let (attempt_tx, mut attempt_rx) = mpsc::channel(32);
+            let model = &self.model.id;
+            let transport = &self.transport;
+            let attempt_ctx = attempt_context.clone();
+            let run = async {
+                match transport {
+                    Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => {
+                        p.stream_with_context(
+                            model,
+                            messages,
+                            tools,
+                            Some(&attempt_ctx),
+                            attempt_tx,
+                        )
+                        .await
+                    }
+                    Transport::OpenAi(p) => {
+                        p.stream_with_context(
+                            model,
+                            messages,
+                            tools,
+                            Some(&attempt_ctx),
+                            attempt_tx,
+                        )
+                        .await
+                    }
+                    Transport::Codex(p) => {
+                        p.stream_with_context(
+                            model,
+                            messages,
+                            tools,
+                            Some(&attempt_ctx),
+                            attempt_tx,
+                        )
+                        .await
+                    }
+                    Transport::Google(p) => p.stream(model, messages, tools, attempt_tx).await,
+                }
+            };
+            tokio::pin!(run);
+            let _ = tx
+                .send(StreamEvent::AttemptStarted {
+                    context: attempt_context.clone(),
+                    model: format!("{}/{}", self.model.provider, self.model.id),
+                })
+                .await;
+            let mut usage: Option<TokenUsage> = None;
+            let mut completion = None;
+            let mut provider_error = None;
+            let mut failure_kind = None;
+            let mut event_retry_after = None;
+            let result = loop {
+                tokio::select! {
+                  event = attempt_rx.recv() => {
+                    let Some(event) = event else { break Err(anyhow::anyhow!("Provider stream ended without completion")); };
+                  match event {
+                      StreamEvent::Usage(u) => { usage.get_or_insert_with(TokenUsage::default).merge_cumulative(&u); let _ = tx.send(StreamEvent::Usage(u)).await; }
+                      StreamEvent::Completed { finish_reason } => completion = Some(finish_reason),
+                      StreamEvent::Error(error) => provider_error = Some(error),
+                      StreamEvent::ProviderError { kind, message, retry_after_ms } => { failure_kind = Some(kind); event_retry_after = retry_after_ms.map(Duration::from_millis); provider_error = Some(message); }
+                      other => { let _ = tx.send(other).await; }
+                  }
+                  },
+                  result = &mut run => break result,
+                }
+            };
+            while let Some(event) = attempt_rx.recv().await {
+                match event {
+                    StreamEvent::Error(error) => provider_error = Some(error),
+                    StreamEvent::ProviderError {
+                        kind,
+                        message,
+                        retry_after_ms,
+                    } => {
+                        failure_kind = Some(kind);
+                        event_retry_after = retry_after_ms.map(Duration::from_millis);
+                        provider_error = Some(message);
+                    }
+                    StreamEvent::Completed { finish_reason } => completion = Some(finish_reason),
+                    StreamEvent::Usage(u) => {
+                        usage
+                            .get_or_insert_with(TokenUsage::default)
+                            .merge_cumulative(&u);
+                        let _ = tx.send(StreamEvent::Usage(u)).await;
+                    }
+                    other => {
+                        let _ = tx.send(other).await;
+                    }
+                }
             }
-            Transport::OpenAi(p) => {
-                p.stream_with_context(model, messages, tools, context, tx)
-                    .await
+            let mut server_delay = None;
+            if let Err(error) = &result {
+                if let Some(http) = error.downcast_ref::<crate::client::HttpFailure>() {
+                    server_delay = http.retry_after.map(|d| d.min(Duration::from_secs(30)));
+                    if http.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || http.status.is_server_error()
+                    {
+                        failure_kind = Some(ProviderFailureKind::Transient);
+                    } else if http.status == reqwest::StatusCode::UNAUTHORIZED
+                        || http.status == reqwest::StatusCode::FORBIDDEN
+                    {
+                        failure_kind = Some(ProviderFailureKind::Auth);
+                    } else {
+                        failure_kind = Some(ProviderFailureKind::InvalidRequest);
+                    }
+                }
+                provider_error.get_or_insert_with(|| format!("{error:#}"));
             }
-            Transport::Codex(p) => {
-                p.stream_with_context(model, messages, tools, context, tx).await
+            let error_text = provider_error.unwrap_or_default();
+            if result.is_err() && failure_kind.is_none() {
+                failure_kind = Some(ProviderFailureKind::Protocol);
             }
-            Transport::Google(p) => p.stream(model, messages, tools, tx).await,
+            let retryable = failure_kind == Some(ProviderFailureKind::Transient);
+            let succeeded = result.is_ok() && error_text.is_empty() && completion.is_some();
+            if !succeeded {
+                if let Some(usage) = usage.as_mut() {
+                    usage.is_complete = false;
+                }
+            }
+            let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let _ = tx
+                .send(StreamEvent::AttemptFinished {
+                    context: attempt_context.clone(),
+                    model: format!("{}/{}", self.model.provider, self.model.id),
+                    outcome: if succeeded {
+                        AttemptOutcome::Succeeded
+                    } else {
+                        AttemptOutcome::Failed
+                    },
+                    duration_ms: elapsed,
+                    usage,
+                    error: (!succeeded).then(|| {
+                        if error_text.is_empty() {
+                            "Provider stream ended without completion".to_string()
+                        } else {
+                            error_text.clone()
+                        }
+                    }),
+                })
+                .await;
+            if succeeded {
+                let _ = tx
+                    .send(StreamEvent::Completed {
+                        finish_reason: completion.unwrap(),
+                    })
+                    .await;
+                return Ok(());
+            }
+            if retryable && attempt < 4 && retry_started.elapsed() < Duration::from_secs(120) {
+                let retry_delay = server_delay
+                    .or(event_retry_after)
+                    .unwrap_or(delay)
+                    .min(Duration::from_secs(30))
+                    .min(Duration::from_secs(120).saturating_sub(retry_started.elapsed()));
+                let delay_ms = retry_delay.as_millis() as u64;
+                let _ = tx
+                    .send(StreamEvent::Retrying {
+                        next_attempt: attempt + 1,
+                        delay_ms,
+                        reason: error_text.clone(),
+                    })
+                    .await;
+                tokio::time::sleep(retry_delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+                attempt_context = seed.next_request();
+                continue;
+            }
+            let _ = tx
+                .send(StreamEvent::ProviderError {
+                    kind: failure_kind.unwrap_or(ProviderFailureKind::Unknown),
+                    message: if error_text.is_empty() {
+                        "Provider stream ended without completion".into()
+                    } else {
+                        error_text.clone()
+                    },
+                    retry_after_ms: event_retry_after
+                        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                })
+                .await;
+            if let Err(error) = result {
+                return Err(error);
+            }
+            anyhow::bail!("{}", error_text);
         }
+        unreachable!()
     }
 }
 
@@ -88,19 +272,8 @@ pub fn is_transport_supported(provider: &str, api: &str) -> bool {
         }
         "google" => api == "google-generative-ai" || api.is_empty(),
         "deepseek" => api == "openai-completions" || api.is_empty(),
-        "opencode" => {
-            api == "openai-completions"
-                || api == "openai-responses"
-                || api == "anthropic-messages"
-                || api == "google-generative-ai"
-                || api.is_empty()
-        }
-        "opencode-go" => {
-            api == "openai-completions"
-                || api == "openai-responses"
-                || api == "anthropic-messages"
-                || api.is_empty()
-        }
+        "opencode" | "opencode-go" => api == "openai-completions" || api.is_empty(),
+        "opencodex" => api == "openai-responses" || api.is_empty(),
         _ => false,
     }
 }
@@ -113,7 +286,14 @@ pub fn is_model_supported(model: &ModelInfo) -> bool {
 fn supported(provider: &str) -> bool {
     matches!(
         provider,
-        "anthropic" | "openai" | "openai-codex" | "google" | "deepseek" | "opencode" | "opencode-go"
+        "anthropic"
+            | "openai"
+            | "openai-codex"
+            | "google"
+            | "deepseek"
+            | "opencode"
+            | "opencode-go"
+            | "opencodex"
     )
 }
 
@@ -186,6 +366,11 @@ pub async fn resolve_provider(
     selection: &str,
     store: &CredentialStore,
 ) -> Result<ResolvedProvider> {
+    if selection.trim().starts_with("opencodex/") && resolve_model(selection).is_err() {
+        crate::opencodex::refresh_cache_if_stale()
+            .await
+            .context("Could not discover local OpenCodex models; check OpenCodex and OPENCODEX_BASE_URL")?;
+    }
     resolve_with(selection, |provider| async move {
         store.resolve_credential(&provider).await
     })
@@ -200,17 +385,23 @@ where
     let model = resolve_model(selection)?;
     let cred = credential(model.provider.clone())
         .await
-        .with_context(|| format!("Authentication failed for {}", model.provider))?
-        .with_context(|| {
-            format!(
-                "No credentials for {}; authenticate via `dume login`",
-                model.provider
-            )
-        })?;
+        .with_context(|| format!("Authentication failed for {}", model.provider))?;
+    if model.provider == "opencodex" {
+        return bind_opencodex(model, cred);
+    }
+    let cred = cred.with_context(|| {
+        format!(
+            "No credentials for {}; authenticate via `dume login`",
+            model.provider
+        )
+    })?;
     bind_credential(model, cred)
 }
 
 fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedProvider> {
+    if model.provider == "opencodex" {
+        return bind_opencodex(model, Some(credential));
+    }
     let required = |value: Option<&str>, field: &str| -> Result<String> {
         value
             .filter(|value| !value.trim().is_empty())
@@ -270,6 +461,36 @@ fn bind_credential(model: ModelInfo, credential: Credential) -> Result<ResolvedP
             model.provider
         ),
     };
+    Ok(ResolvedProvider { model, transport })
+}
+
+fn bind_opencodex(model: ModelInfo, credential: Option<Credential>) -> Result<ResolvedProvider> {
+    anyhow::ensure!(
+        is_model_supported(&model),
+        "OpenCodex requires openai-responses protocol"
+    );
+    let key = match credential.as_ref() {
+        None => None,
+        Some(credential) => {
+            anyhow::ensure!(
+                credential.cred_type == "api_key",
+                "OpenCodex requires an API key, not OAuth"
+            );
+            Some(
+                credential
+                    .key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .context("OpenCodex API key missing")?,
+            )
+        }
+    };
+    let base_url = model
+        .base_url
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(crate::opencodex::base_url)?;
+    let transport = Transport::Codex(CodexProvider::new_opencodex(&base_url, key)?);
     Ok(ResolvedProvider { model, transport })
 }
 
@@ -357,7 +578,9 @@ pub async fn resolve_role_provider(
     // If role candidates failed, attempt fallback to any authenticated supported model
     let all = ModelCatalog::list_all_models().unwrap_or_default();
     for m in all {
-        if is_model_supported(&m) && store.has_credential(&m.provider) {
+        if is_model_supported(&m)
+            && (m.provider == "opencodex" || store.has_credential(&m.provider))
+        {
             let qualified = format!("{}/{}", m.provider, m.id);
             if let Ok(provider) = resolve_provider(&qualified, store).await {
                 return Ok(provider);
@@ -376,7 +599,13 @@ pub async fn resolve_role_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::StreamRequestContext;
     use std::collections::HashMap;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn credential(kind: &str) -> Credential {
         Credential {
@@ -387,6 +616,371 @@ mod tests {
             expires_at: None,
             account_id: Some("test-account".into()),
         }
+    }
+
+    fn local_model(base_url: &str) -> ModelInfo {
+        serde_json::from_value(serde_json::json!({
+            "id":"routed/model", "name":"Local model", "provider":"opencodex",
+            "api":"openai-responses", "baseUrl":base_url,
+            "reasoning":true, "input":["text"]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn opencodex_accepts_optional_proxy_key_and_rejects_oauth_or_remote_urls() {
+        let model = local_model(crate::opencodex::DEFAULT_BASE_URL);
+        assert!(bind_opencodex(model.clone(), None).is_ok());
+        assert!(bind_opencodex(model.clone(), Some(credential("api_key"))).is_ok());
+        assert!(bind_opencodex(model.clone(), Some(credential("oauth"))).is_err());
+        let mut empty = credential("api_key");
+        empty.key = Some(" ".into());
+        assert!(bind_opencodex(model.clone(), Some(empty)).is_err());
+        assert!(bind_opencodex(local_model("https://example.com/v1"), None).is_err());
+        assert!(
+            bind_opencodex(model, None)
+                .unwrap()
+                .with_base_url("https://example.com/v1")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn opencodex_responses_route_streams_tools_and_replays_results_without_oauth_headers() {
+        use crate::types::ToolCall;
+        for with_key in [false, true] {
+            let call = serde_json::json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"read", "arguments":"{}"});
+            let body = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "type":"response.completed", "response":{"status":"completed", "output":[call]}
+                })
+            );
+            let (url, server) = crate::codex::tests::fixture(body);
+            let provider =
+                bind_opencodex(local_model(&url), with_key.then(|| credential("api_key"))).unwrap();
+            let mut history = vec![ChatMessage::user("read")];
+            let context = StreamRequestContext::for_session("local-session");
+            let (tx, mut rx) = mpsc::channel(32);
+            provider
+                .stream_with_context(&history, &[], Some(&context), tx)
+                .await
+                .unwrap();
+            let (headers, request) = server.join().unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("post /v1/responses "));
+            assert_eq!(headers.contains("authorization: bearer test-key"), with_key);
+            assert!(!headers.contains("chatgpt-account-id:"));
+            assert!(!headers.contains("openai-beta:"));
+            assert!(headers.contains("session-id: local-session"));
+            assert_eq!(request["model"], "routed/model");
+            assert_eq!(request["prompt_cache_key"], "local-session");
+            let mut calls = Vec::new();
+            let mut completed = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_delta,
+                        ..
+                    } => calls.push(ToolCall {
+                        id: id.unwrap(),
+                        name: name.unwrap(),
+                        arguments: arguments_delta,
+                    }),
+                    StreamEvent::Completed { .. } => completed = true,
+                    StreamEvent::AttemptFinished { model, outcome, .. } => {
+                        assert_eq!(model, "opencodex/routed/model");
+                        assert_eq!(outcome, AttemptOutcome::Succeeded);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(completed);
+            assert_eq!(calls.len(), 1);
+            history.push(ChatMessage::assistant_with_tool_calls("", calls));
+            history.push(ChatMessage::tool("file contents", "call_1"));
+            let (url, server) = crate::codex::tests::fixture(
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"delta\":\"읽기 완료\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".into()
+            );
+            let provider = provider.with_base_url(&url).unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            provider.stream(&history, &[], tx).await.unwrap();
+            let (_, request) = server.join().unwrap();
+            assert_eq!(request["input"][1]["type"], "function_call");
+            assert_eq!(request["input"][2]["type"], "function_call_output");
+            assert_eq!(request["input"][2]["call_id"], "call_1");
+            assert_eq!(request["input"][2]["output"], "file contents");
+            let mut text = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                }
+            }
+            assert_eq!(text, "읽기 완료");
+        }
+    }
+
+    fn status_fixture(statuses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            for status in statuses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut data = Vec::new();
+                loop {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                    let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&data[..end + 4]);
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                let body = "{}";
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").unwrap();
+            }
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn attempt_events_keep_provider_identity_while_wire_model_stays_bare() {
+        for selection in ["openai/gpt-5.4", "opencode/glm-5.1", "opencode-go/glm-5.1"] {
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let (url, server) = crate::codex::tests::fixture(body.into());
+            let provider =
+                bind_credential(resolve_model(selection).unwrap(), credential("api_key"))
+                    .unwrap()
+                    .with_base_url(&url)
+                    .unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            provider
+                .stream(&[ChatMessage::user("hi")], &[], tx)
+                .await
+                .unwrap();
+            let (_, request) = server.join().unwrap();
+            assert_eq!(request["model"], selection.split_once('/').unwrap().1);
+            let mut identities = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::AttemptStarted { model, .. } => identities.push(model),
+                    StreamEvent::AttemptFinished { model, outcome, .. } => {
+                        assert_eq!(outcome, AttemptOutcome::Succeeded);
+                        identities.push(model);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(identities, [selection, selection]);
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_are_capped_and_auth_is_never_retried() {
+        for (statuses, expected) in [
+            (vec!["503 Service Unavailable"; 4], 4),
+            (vec!["401 Unauthorized"], 1),
+        ] {
+            let (url, server) = status_fixture(statuses);
+            let provider = bind_credential(
+                resolve_model("claude-sonnet-4-5").unwrap(),
+                credential("api_key"),
+            )
+            .unwrap()
+            .with_base_url(&url)
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            assert!(
+                provider
+                    .stream(&[ChatMessage::user("hi")], &[], tx)
+                    .await
+                    .is_err()
+            );
+            server.join().unwrap();
+            let mut starts = 0;
+            while let Some(event) = rx.recv().await {
+                if matches!(event, StreamEvent::AttemptStarted { .. }) {
+                    starts += 1;
+                }
+            }
+            assert_eq!(starts, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_anthropic_sse_error_is_not_retried() {
+        let body = "data: {\"type\":\"error\",\"error\":{\"type\":\"future_error_code\",\"message\":\"unknown\"}}\n\n";
+        let (url, server) = crate::codex::tests::fixture(body.to_string());
+        let provider = bind_credential(
+            resolve_model("claude-sonnet-4-5").unwrap(),
+            credential("api_key"),
+        )
+        .unwrap()
+        .with_base_url(&url)
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(
+            provider
+                .stream(&[ChatMessage::user("hi")], &[], tx)
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+        let mut starts = 0;
+        let mut terminal_kind = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::AttemptStarted { .. } => starts += 1,
+                StreamEvent::ProviderError { kind, .. } => terminal_kind = Some(kind),
+                _ => {}
+            }
+        }
+        assert_eq!(starts, 1);
+        assert_eq!(terminal_kind, Some(ProviderFailureKind::Unknown));
+    }
+
+    #[tokio::test]
+    async fn retries_busy_http_with_attempt_identity_and_reset_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (status, payload, content_type) in [
+                (
+                    "503 Service Unavailable",
+                    r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+                    "application/json",
+                ),
+                (
+                    "200 OK",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"discard\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"partial-call\",\"name\":\"run\",\"input\":{}}}\n\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+                    "text/event-stream",
+                ),
+                (
+                    "200 OK",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                    "text/event-stream",
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut data = Vec::new();
+                loop {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                    let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&data[..end + 4]);
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).unwrap();
+            }
+        });
+        let provider = bind_credential(
+            resolve_model("claude-sonnet-4-5").unwrap(),
+            credential("api_key"),
+        )
+        .unwrap()
+        .with_base_url(&url)
+        .unwrap();
+        let ctx = StreamRequestContext::from_ids("session", "first-request");
+        let (tx, mut rx) = mpsc::channel(32);
+        provider
+            .stream_with_context(&[ChatMessage::user("hi")], &[], Some(&ctx), tx)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let mut starts = Vec::new();
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match &event {
+                StreamEvent::AttemptStarted { context, .. } => {
+                    starts.push(context.request_id.clone())
+                }
+                _ => {}
+            }
+            events.push(event);
+        }
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0], "first-request");
+        assert_ne!(starts[0], starts[1]);
+        assert_ne!(starts[1], starts[2]);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Retrying {
+                next_attempt: 2,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "done"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "discard"))
+        );
+        assert!(events.iter().any(
+            |e| matches!(e, StreamEvent::ToolCallDelta { id: Some(id), .. } if id == "partial-call")
+        ));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Retrying {
+                next_attempt: 3,
+                ..
+            }
+        )));
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::AttemptFinished {
+                    duration_ms,
+                    outcome,
+                    ..
+                } => Some((*duration_ms, *outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 3);
+        assert!(finished.iter().all(|(duration, _)| *duration > 0));
+        assert_eq!(finished[0].1, AttemptOutcome::Failed);
+        assert_eq!(finished[1].1, AttemptOutcome::Failed);
+        assert_eq!(finished[2].1, AttemptOutcome::Succeeded);
+        assert!(
+            matches!(events.iter().find(|e| matches!(e, StreamEvent::AttemptFinished { context, outcome: AttemptOutcome::Failed, .. } if context.request_id == starts[1])), Some(StreamEvent::AttemptFinished { usage: Some(usage), .. }) if usage.input_tokens == 7 && !usage.is_complete)
+        );
     }
 
     #[tokio::test]
@@ -585,7 +1179,24 @@ mod tests {
         ));
         assert!(is_transport_supported("google", "google-generative-ai"));
         assert!(is_transport_supported("opencode", "openai-completions"));
-        assert!(is_transport_supported("opencode-go", "openai-responses"));
+        for provider in ["opencode", "opencode-go"] {
+            for api in [
+                "",
+                "openai-completions",
+                "openai-responses",
+                "anthropic-messages",
+                "google-generative-ai",
+            ] {
+                let mut model = resolve_model("opencode/big-pickle").unwrap();
+                model.provider = provider.into();
+                model.api = api.into();
+                assert_eq!(
+                    is_model_supported(&model),
+                    bind_credential(model, credential("api_key")).is_ok(),
+                    "{provider}/{api}"
+                );
+            }
+        }
         assert!(!is_transport_supported("bedrock", "bedrock-runtime"));
 
         let claude = resolve_model("claude-sonnet-4-5").unwrap();
@@ -620,7 +1231,13 @@ mod tests {
         let resolved = bind_credential(model, credential("api_key")).unwrap();
         assert!(matches!(resolved.transport, Transport::OpenAi(_)));
         assert!(!is_transport_supported("deepseek", "openai-responses"));
-        assert!(bind_credential(resolve_model("deepseek/deepseek-v4-flash").unwrap(), credential("oauth")).is_err());
+        assert!(
+            bind_credential(
+                resolve_model("deepseek/deepseek-v4-flash").unwrap(),
+                credential("oauth")
+            )
+            .is_err()
+        );
     }
 
     #[test]

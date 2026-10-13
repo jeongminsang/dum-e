@@ -5,7 +5,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn wrap_text_line(prefix: &str, text: &str, width: usize) -> Vec<String> {
@@ -72,7 +73,11 @@ pub fn build_transcript_lines(
     let mut lines = Vec::new();
     let mut is_user_logical_line = Vec::new();
 
-    if messages.is_empty() && streaming_text.is_empty() {
+    let has_conversation = messages
+        .iter()
+        .any(|m| m.role == Role::User || m.role == Role::Assistant);
+
+    if !has_conversation && streaming_text.is_empty() {
         lines.push(Line::from(""));
         is_user_logical_line.push(false);
         lines.push(Line::from(vec![
@@ -211,7 +216,9 @@ pub fn build_transcript_lines(
             lines.push(Line::from(""));
             is_user_logical_line.push(false);
         }
-    } else {
+    }
+
+    if has_conversation || !messages.is_empty() {
         for msg in messages {
             match msg.role {
                 Role::User => {
@@ -280,14 +287,12 @@ pub fn build_transcript_lines(
                 }
                 Role::System => {
                     // Notice banner format rather than plain conversational chat
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "  [ NOTICE ] ",
-                            Style::default()
-                                .fg(theme.system_msg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "  [ NOTICE ] ",
+                        Style::default()
+                            .fg(theme.system_msg)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
                     is_user_logical_line.push(false);
                     for line in msg.content.lines() {
                         let wrapped = wrap_text_line("  │ ", line, effective_width);
@@ -304,31 +309,31 @@ pub fn build_transcript_lines(
                 }
             }
         }
+    }
 
-        // Streaming text (in progress)
-        if !streaming_text.is_empty() {
-            for line in streaming_text.lines() {
-                let wrapped = wrap_text_line("  ", line, effective_width);
-                for w in wrapped {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(w, Style::default().fg(theme.foreground)),
-                    ]));
-                    is_user_logical_line.push(false);
-                }
+    // Streaming text (in progress)
+    if !streaming_text.is_empty() {
+        for line in streaming_text.lines() {
+            let wrapped = wrap_text_line("  ", line, effective_width);
+            for w in wrapped {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(w, Style::default().fg(theme.foreground)),
+                ]));
+                is_user_logical_line.push(false);
             }
-            // Streaming cursor indicator
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "▍",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::RAPID_BLINK),
-                ),
-            ]));
-            is_user_logical_line.push(false);
         }
+        // Streaming cursor indicator
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "▍",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::RAPID_BLINK),
+            ),
+        ]));
+        is_user_logical_line.push(false);
     }
 
     (lines, is_user_logical_line)
@@ -344,8 +349,13 @@ pub fn render_transcript(
     theme: &Theme,
 ) {
     let effective_width = area.width.max(1) as usize;
-    let (lines, is_user_logical_line) =
-        build_transcript_lines(messages, streaming_text, recent_sessions, effective_width, theme);
+    let (lines, is_user_logical_line) = build_transcript_lines(
+        messages,
+        streaming_text,
+        recent_sessions,
+        effective_width,
+        theme,
+    );
 
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -359,7 +369,11 @@ pub fn render_transcript(
     let buf = f.buffer_mut();
     for row_offset in 0..area.height as usize {
         let absolute_row = scroll + row_offset;
-        if is_user_logical_line.get(absolute_row).copied().unwrap_or(false) {
+        if is_user_logical_line
+            .get(absolute_row)
+            .copied()
+            .unwrap_or(false)
+        {
             let y = area.y + row_offset as u16;
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
@@ -368,6 +382,78 @@ pub fn render_transcript(
             }
         }
     }
+}
+
+pub fn commit_messages_to_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    messages: &[ChatMessage],
+    width: usize,
+    theme: &Theme,
+) -> std::io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let (lines, is_user) = build_transcript_lines(messages, "", &[], width, theme);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let p = Paragraph::new(lines);
+        p.render(area, buf);
+        for (row_offset, &is_u) in is_user.iter().enumerate() {
+            if is_u && (row_offset as u16) < area.height {
+                let y = area.y + row_offset as u16;
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_style(cell.style().bg(theme.user_msg_bg));
+                    }
+                }
+            }
+        }
+    })?;
+    Ok(())
+}
+
+pub fn commit_welcome_banner_to_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    recent_sessions: &[RecentSessionSummary],
+    width: usize,
+    theme: &Theme,
+) -> std::io::Result<()> {
+    let (lines, _) = build_transcript_lines(&[], "", recent_sessions, width, theme);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let p = Paragraph::new(lines);
+        p.render(area, buf);
+    })?;
+    Ok(())
+}
+
+pub fn render_streaming_viewport(
+    f: &mut Frame,
+    area: Rect,
+    streaming_text: &str,
+    theme: &Theme,
+) {
+    if streaming_text.is_empty() || area.height == 0 {
+        return;
+    }
+    let effective_width = area.width.max(1) as usize;
+    let (lines, _) = build_transcript_lines(&[], streaming_text, &[], effective_width, theme);
+    let h = area.height as usize;
+    let visible: Vec<Line<'static>> = if lines.len() > h {
+        lines[lines.len() - h..].to_vec()
+    } else {
+        lines
+    };
+    let paragraph = Paragraph::new(visible);
+    f.render_widget(paragraph, area);
 }
 
 /// Calculate the total wrapped line count for the transcript given an inner area width.
@@ -396,7 +482,6 @@ pub fn calculate_transcript_height(
     );
     lines.len().min(u16::MAX as usize) as u16
 }
-
 
 pub fn render_input_bar(
     f: &mut Frame,
@@ -427,39 +512,46 @@ pub fn render_input_bar(
         .border_style(Style::default().fg(border_color))
         .title(title);
 
-    let (lines, cursor_y_offset) = if area.height >= 5 {
-        (
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        "> ",
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(input_buffer, Style::default().fg(theme.foreground)),
-                ]),
-                Line::from(""),
-            ],
-            2,
-        )
+    let raw_lines: Vec<&str> = input_buffer.split('\n').collect();
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    for (idx, line) in raw_lines.iter().enumerate() {
+        let prefix = if idx == 0 { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(*line, Style::default().fg(theme.foreground)),
+        ]));
+    }
+
+    let chars: Vec<char> = input_buffer.chars().collect();
+    let pos = cursor_pos.min(chars.len());
+    let mut cursor_line = 0usize;
+    let mut cursor_col_width = 0usize;
+
+    for (i, &c) in chars.iter().enumerate() {
+        if i == pos {
+            break;
+        }
+        if c == '\n' {
+            cursor_line += 1;
+            cursor_col_width = 0;
+        } else {
+            cursor_col_width += UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+    }
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll_y = if cursor_line >= visible_height {
+        (cursor_line + 1 - visible_height) as u16
     } else {
-        (
-            vec![Line::from(vec![
-                Span::styled(
-                    "> ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(input_buffer, Style::default().fg(theme.foreground)),
-            ])],
-            1,
-        )
+        0
     };
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
 
     f.render_widget(paragraph, area);
 
@@ -490,22 +582,19 @@ pub fn render_input_bar(
             if dot_x < buf.area.width && dot_y < buf.area.height {
                 if let Some(cell) = buf.cell_mut((dot_x, dot_y)) {
                     cell.set_symbol("•");
-                    cell.set_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+                    cell.set_style(
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    );
                 }
             }
         }
     }
 
-    // Position cursor based on visual display width of characters before cursor
-    let prefix_width: usize = input_buffer
-        .chars()
-        .take(cursor_pos)
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum();
-
-    let x = area.x + 3 + prefix_width as u16;
-    let y = area.y + cursor_y_offset;
-    if x < area.x + area.width - 1 && y < area.y + area.height {
+    let x = area.x + 3 + cursor_col_width as u16;
+    let y = area.y + 1 + (cursor_line as u16).saturating_sub(scroll_y);
+    if x < area.x + area.width - 1 && y < area.y + area.height - 1 {
         f.set_cursor_position((x, y));
     }
 }
@@ -628,10 +717,44 @@ pub fn render_status_bar(
     thinking: ThinkingLevel,
     is_busy: bool,
     elapsed_secs: Option<f32>,
+    last_run: Option<&str>,
+    session_elapsed: Option<&str>,
+    session_usage: Option<&str>,
     anim_tick: usize,
     available_update: Option<&str>,
     theme: &Theme,
 ) {
+    if area.width < 96 {
+        let short_model: String = model.chars().take(8).collect();
+        let status = if is_busy {
+            elapsed_secs
+                .map(|seconds| format!("RUN {:.0}s", seconds))
+                .unwrap_or_else(|| "RUN".into())
+        } else {
+            last_run.unwrap_or("READY").to_string()
+        };
+        let elapsed = session_elapsed
+            .map(|value| format!("S{value}"))
+            .unwrap_or_default();
+        let usage = session_usage
+            .map(|value| {
+                value
+                    .strip_prefix("TOKENS ")
+                    .unwrap_or(value)
+                    .replace(" +", "+")
+                    .replace(" incomplete", "!")
+            })
+            .unwrap_or_default();
+        let line = Line::from(format!(
+            "{short_model} {} {status} {elapsed} T{usage}",
+            thinking.label()
+        ));
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.status_bar_bg)),
+            area,
+        );
+        return;
+    }
     let thinking_span = match thinking {
         ThinkingLevel::Off => Span::styled(" Thinking: OFF ", Style::default().fg(theme.border)),
         ThinkingLevel::Low => Span::styled(
@@ -713,6 +836,27 @@ pub fn render_status_bar(
             Style::default()
                 .fg(theme.user_msg)
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let timing = if is_busy {
+        elapsed_secs.map(|seconds| format!(" RUN {:.0}s ", seconds))
+    } else {
+        last_run.map(|last| format!(" LAST {last} "))
+    };
+    if let Some(timing) = timing {
+        spans.push(Span::styled(timing, Style::default().fg(theme.accent)));
+    }
+    if let Some(session_elapsed) = session_elapsed {
+        spans.push(Span::styled(
+            format!(" SESSION {session_elapsed} "),
+            Style::default().fg(theme.status_bar_fg),
+        ));
+    }
+    if let Some(session_usage) = session_usage {
+        spans.push(Span::styled(
+            format!(" {session_usage} "),
+            Style::default().fg(theme.status_bar_fg),
         ));
     }
 
@@ -906,7 +1050,10 @@ pub fn render_login_selector_modal(
     let y = (area.height.saturating_sub(height)) / 2;
     let modal_area = Rect::new(x, y, width, height);
 
-    f.render_widget(ratatui::widgets::Clear, Rect::new(area.x, y, area.width, height));
+    f.render_widget(
+        ratatui::widgets::Clear,
+        Rect::new(area.x, y, area.width, height),
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1280,4 +1427,551 @@ pub fn render_btw_modal(
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(block, modal_area);
     f.render_widget(paragraph, inner);
+}
+
+pub fn render_resume_picker_modal(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[RecentSessionSummary],
+    selected_idx: usize,
+    theme: &Theme,
+) {
+    let width = 76.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" Resume Conversation (Enter: Select, Esc: Cancel, ↑/↓: Navigate) ");
+
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines = Vec::new();
+    if sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved conversations found.",
+            Style::default().fg(theme.status_bar_fg),
+        )));
+    } else {
+        for (i, s) in sessions.iter().enumerate() {
+            let is_selected = i == selected_idx;
+            let cursor = if is_selected { " ➔ " } else { "   " };
+            let short_id = if s.session_id.len() >= 8 {
+                &s.session_id[..8]
+            } else {
+                &s.session_id
+            };
+            let preview = s.preview.trim().lines().next().unwrap_or("Empty session");
+            let preview_trunc = if preview.chars().count() > 36 {
+                let p: String = preview.chars().take(33).collect();
+                format!("{}...", p)
+            } else {
+                preview.to_string()
+            };
+
+            let row_style = if is_selected {
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.foreground)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(cursor, Style::default().fg(theme.accent)),
+                Span::styled(
+                    format!("{:<9}", short_id),
+                    if is_selected {
+                        Style::default()
+                            .fg(theme.border_focused)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.border_focused)
+                    },
+                ),
+                Span::styled(
+                    format!("({} msgs) ", s.message_count),
+                    Style::default().fg(theme.border),
+                ),
+                Span::styled(preview_trunc, row_style),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph, inner);
+}
+
+pub fn render_routing_settings_modal(
+    f: &mut Frame,
+    area: Rect,
+    draft: &crate::app::RoutingDraft,
+    theme: &Theme,
+) {
+    let width = 76.min(area.width.saturating_sub(2).max(1));
+    let height = 18.min(area.height.saturating_sub(2).max(1));
+    let modal_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" 라우팅 설정 ");
+    let settings = &draft.settings;
+    let classifier = settings.classifier.as_ref();
+    let backend = classifier
+        .map(|c| match c.backend {
+            dume_provider::ClassifierBackend::OpenCodeZen => "OpenCode Zen",
+            dume_provider::ClassifierBackend::LocalSystemOne => "LocalSystemOne",
+        })
+        .unwrap_or("OpenCode Zen");
+    let mut rows = vec![
+        format!(
+            "{} 사용: {}",
+            marker(draft.selected, 0),
+            if settings.enabled { "예" } else { "아니요" }
+        ),
+        format!("{} 분류 서버: {}", marker(draft.selected, 1), backend),
+        format!(
+            "{} 서버 URL: {}",
+            marker(draft.selected, 2),
+            routing_visible(draft, 2, draft.field_edit)
+        ),
+        format!(
+            "{} 분류 모델: {}",
+            marker(draft.selected, 3),
+            routing_visible(draft, 3, draft.field_edit)
+        ),
+        format!(
+            "{} 표준 계획: {}",
+            marker(draft.selected, 4),
+            role_visible(settings.models.standard.as_deref())
+        ),
+        format!(
+            "{} 복잡 계획: {}",
+            marker(draft.selected, 5),
+            role_visible(settings.models.complex.as_deref())
+        ),
+        format!(
+            "{} 구현: {}",
+            marker(draft.selected, 6),
+            role_visible(settings.models.implementation.as_deref())
+        ),
+        format!(
+            "{} 분류기 키: {} [{}]",
+            marker(draft.selected, 7),
+            routing_key_mask(draft),
+            draft.key_state
+        ),
+        format!("{} 키 저장", marker(draft.selected, 8)),
+        format!("{} 키 삭제", marker(draft.selected, 9)),
+        format!("{} 설정 저장", marker(draft.selected, 10)),
+        format!("{} 수동 연결 확인", marker(draft.selected, 11)),
+        format!("{} 닫기", marker(draft.selected, 12)),
+    ];
+    if draft.picker_role.is_some() {
+        rows.push("↑/↓ 모델 선택 · Enter 적용 · Esc 취소".into());
+        rows.push(format!(
+            "{} 기본 모델 상속",
+            if draft.picker_selected == 0 {
+                "›"
+            } else {
+                " "
+            }
+        ));
+        if let Some(models) = &draft.picker_models {
+            for (idx, model) in models.iter().enumerate() {
+                let selection = idx + 1;
+                rows.push(format!(
+                    "{} {}/{}",
+                    if selection == draft.picker_selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    model.provider,
+                    model.id
+                ));
+            }
+        }
+    } else {
+        rows.push("미저장 키 입력은 연결 확인에 사용되지 않습니다.".into());
+        rows.push("Enter 실행 · Backspace 삭제 · ←/→ 커서 · Tab 다음 항목".into());
+    }
+    rows.push(draft.message.clone());
+    f.render_widget(block, modal_area);
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let selected_row = if draft.picker_role.is_some() {
+        14 + draft.picker_selected
+    } else {
+        draft.selected
+    };
+    let visual_start = rows
+        .iter()
+        .take(selected_row)
+        .map(|row| wrapped_row_count(row, inner.width))
+        .sum::<usize>();
+    let selected_visual_height = rows
+        .get(selected_row)
+        .map_or(1, |row| wrapped_row_count(row, inner.width));
+    let visible_rows = inner.height.max(1) as usize;
+    let cursor_visual_offset = if draft.field_edit && matches!(draft.selected, 2 | 3 | 7) {
+        let value = if draft.selected == 7 {
+            draft.key_input.as_str()
+        } else {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|config| {
+                    if draft.selected == 2 {
+                        config.base_url.as_str()
+                    } else {
+                        config.model.as_str()
+                    }
+                })
+                .unwrap_or("")
+        };
+        let prefix: String = value.chars().take(draft.cursor).collect();
+        (UnicodeWidthStr::width(prefix.as_str()) + 12) / usize::from(inner.width.max(1))
+    } else {
+        0
+    };
+    let target_visual_row =
+        visual_start + cursor_visual_offset.min(selected_visual_height.saturating_sub(1));
+    let scroll = target_visual_row
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(usize::from(u16::MAX)) as u16;
+    f.render_widget(
+        Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+}
+
+pub fn render_routing_probe_confirm_modal(
+    f: &mut Frame,
+    area: Rect,
+    confirmed: bool,
+    theme: &Theme,
+) {
+    let width = 72.min(area.width.saturating_sub(2).max(1));
+    let height = 9.min(area.height.saturating_sub(2).max(1));
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(ratatui::widgets::Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" 외부 연결 확인 ");
+    f.render_widget(block, modal);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("고정된 테스트 문구가 설정 서버로 전송됩니다."),
+            Line::from(
+                "외부 서버 전송으로 API 비용이 발생할 수 있으며 단가는 확인되지 않았습니다.",
+            ),
+            Line::from(format!(
+                "{} 취소     {} 전송 확인",
+                if confirmed { "  " } else { "[선택]" },
+                if confirmed { "[선택]" } else { "  " }
+            )),
+            Line::from("←/→ 또는 Tab 선택 · Enter 적용 · Esc 취소"),
+        ])
+        .wrap(Wrap { trim: false }),
+        modal.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
+}
+
+fn marker(selected: usize, index: usize) -> &'static str {
+    if selected == index { "›" } else { " " }
+}
+fn role_visible(value: Option<&str>) -> &str {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("기본 모델 사용 (상속)")
+}
+fn routing_visible(draft: &crate::app::RoutingDraft, index: usize, editing: bool) -> String {
+    if draft.selected != index || !editing {
+        return if index == 2 {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .unwrap_or_default()
+        } else {
+            draft
+                .settings
+                .classifier
+                .as_ref()
+                .map(|c| c.model.clone())
+                .unwrap_or_default()
+        };
+    }
+    let value = if index == 2 {
+        draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.base_url.as_str())
+            .unwrap_or("")
+    } else {
+        draft
+            .settings
+            .classifier
+            .as_ref()
+            .map(|c| c.model.as_str())
+            .unwrap_or("")
+    };
+    let cursor = value
+        .char_indices()
+        .nth(draft.cursor)
+        .map_or(value.len(), |(index, _)| index);
+    format!("{}│{}", &value[..cursor], &value[cursor..])
+}
+
+fn routing_key_mask(draft: &crate::app::RoutingDraft) -> String {
+    let count = draft.key_input.chars().count().min(24);
+    if draft.selected == 7 && draft.field_edit {
+        let cursor = draft.cursor.min(count);
+        format!(
+            "{}│{}",
+            "•".repeat(cursor),
+            "•".repeat(count.saturating_sub(cursor))
+        )
+    } else {
+        "•".repeat(count)
+    }
+}
+
+fn wrapped_row_count(row: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    UnicodeWidthStr::width(row).max(1).div_ceil(width)
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                let mut row = String::new();
+                let mut skip_until = area.x;
+                for x in area.x..area.right() {
+                    let cell = &buffer[(x, y)];
+                    if x < skip_until {
+                        continue;
+                    }
+                    let symbol = cell.symbol();
+                    row.push_str(symbol);
+                    skip_until = x + UnicodeWidthStr::width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_modal_masks_unsaved_secret_and_keeps_selection_visible_at_narrow_width() {
+        for (width, height) in [(32, 12), (100, 28)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut draft = crate::app::RoutingDraft::new(
+                dume_worker::RoutingSettings::default(),
+                "없음".into(),
+            );
+            draft.selected = 12;
+            draft.key_input = "super-secret-key".into();
+            terminal
+                .draw(|frame| {
+                    render_routing_settings_modal(frame, frame.area(), &draft, &Theme::default())
+                })
+                .unwrap();
+            let rows = rendered_rows(&terminal);
+            let output = rows.join("\n");
+            assert!(output.contains("super-secret-key") == false);
+            assert!(
+                rows.iter().any(|row| row.contains("닫기")),
+                "rows: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("라우팅")),
+                "rows: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_modal_scrolls_long_edit_cursor_into_narrow_viewport() {
+        let backend = TestBackend::new(32, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut draft =
+            crate::app::RoutingDraft::new(dume_worker::RoutingSettings::default(), "없음".into());
+        draft.settings.classifier = Some(dume_provider::ClassifierConfig {
+            backend: dume_provider::ClassifierBackend::OpenCodeZen,
+            base_url: format!("http://127.0.0.1/{}", "경로".repeat(24)),
+            model: "model".into(),
+        });
+        draft.selected = 2;
+        draft.field_edit = true;
+        draft.cursor = draft
+            .settings
+            .classifier
+            .as_ref()
+            .unwrap()
+            .base_url
+            .chars()
+            .count();
+        terminal
+            .draw(|frame| {
+                render_routing_settings_modal(frame, frame.area(), &draft, &Theme::default())
+            })
+            .unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(rows.iter().any(|row| row.contains("›")), "rows: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains('│')), "rows: {rows:?}");
+    }
+
+    fn rendered_status(width: u16) -> String {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    Rect::new(0, 0, width, 1),
+                    "test-model",
+                    ThinkingLevel::Off,
+                    false,
+                    None,
+                    Some("ERROR 3s"),
+                    Some("7s"),
+                    Some("TOKENS 42 +1 incomplete"),
+                    0,
+                    None,
+                    &Theme::default(),
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn status_bar_renders_session_outcome_and_usage_at_narrow_and_wide_sizes() {
+        for width in [40, 80] {
+            let output = rendered_status(width);
+            assert!(output.contains("ERROR 3s"));
+            assert!(output.contains("S7s"));
+            assert!(output.contains("T42+1!"));
+        }
+    }
+
+    #[test]
+    fn routing_modal_renders_korean_enabled_state_at_narrow_and_wide_sizes() {
+        for (width, height) in [(30, 10), (100, 30)] {
+            for enabled in [false, true] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_routing_settings_modal(
+                            frame,
+                            frame.area(),
+                            &{
+                                let mut settings = dume_worker::RoutingSettings::default();
+                                settings.enabled = enabled;
+                                let mut draft =
+                                    crate::app::RoutingDraft::new(settings, "없음".into());
+                                draft.message = "라우팅 설정을 저장했습니다.".into();
+                                draft
+                            },
+                            &Theme::default(),
+                        );
+                    })
+                    .unwrap();
+                let rows = rendered_rows(&terminal);
+                assert!(
+                    rows.iter().any(|row| row.contains("라우팅")),
+                    "rows: {rows:?}"
+                );
+                let selected = if enabled {
+                    "› 사용: 예"
+                } else {
+                    "› 사용: 아니요"
+                };
+                assert!(
+                    rows.iter().any(|row| row.contains(selected)),
+                    "rows: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_commit_messages_and_welcome_banner_to_scrollback() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let banner_res = commit_welcome_banner_to_scrollback(&mut terminal, &[], 80, &Theme::default());
+        assert!(banner_res.is_ok());
+
+        let messages = vec![
+            ChatMessage::user("hello world"),
+            ChatMessage::assistant("hi there!"),
+        ];
+        let msg_res = commit_messages_to_scrollback(&mut terminal, &messages, 80, &Theme::default());
+        assert!(msg_res.is_ok());
+    }
+
+    #[test]
+    fn test_render_streaming_viewport() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                render_streaming_viewport(f, f.area(), "Streaming output line 1\nLine 2", &Theme::default());
+            })
+            .unwrap();
+
+        let rows = rendered_rows(&terminal);
+        assert!(rows.iter().any(|r| r.contains("Streaming output line 1")));
+        assert!(rows.iter().any(|r| r.contains("Line 2")));
+    }
 }

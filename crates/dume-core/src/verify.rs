@@ -10,12 +10,16 @@ pub struct VerificationVerdict {
 }
 
 pub fn verify_allowed_paths(task: &Task, manifest: &ResultManifest) -> bool {
+    verify_changed_paths(task, &manifest.modified_files)
+}
+
+pub fn verify_changed_paths(task: &Task, modified_files: &[String]) -> bool {
     let allowed = match &task.allowed_paths {
         Some(paths) if !paths.is_empty() => paths,
         _ => return true, // No restriction
     };
 
-    manifest.modified_files.iter().all(|file| {
+    modified_files.iter().all(|file| {
         allowed.iter().any(|pattern| {
             if pattern.ends_with('/') {
                 file.starts_with(pattern)

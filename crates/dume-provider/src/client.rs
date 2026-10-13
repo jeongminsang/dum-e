@@ -9,6 +9,14 @@ pub struct LlmClient {
     http: Client,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("HTTP {status}: {body}")]
+pub struct HttpFailure {
+    pub status: StatusCode,
+    pub body: String,
+    pub retry_after: Option<Duration>,
+}
+
 impl Default for LlmClient {
     fn default() -> Self {
         Self::new()
@@ -16,6 +24,16 @@ impl Default for LlmClient {
 }
 
 impl LlmClient {
+    pub(crate) fn local() -> Result<Self> {
+        Ok(Self {
+            http: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(60))
+                .build()?,
+        })
+    }
+
     pub fn new() -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(60))
@@ -74,6 +92,42 @@ impl LlmClient {
                 }
                 Err(e) => return Err(e).context(format!("Failed to connect to {}", url)),
             }
+        }
+    }
+
+    /// Send exactly one HTTP request. Retry policy belongs to the model runtime so
+    /// streamed attempts are observable and are never nested inside transport retries.
+    pub async fn post_once(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {url}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response)
+        } else {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let text = response.text().await.unwrap_or_default();
+            Err(anyhow::Error::new(HttpFailure {
+                status,
+                body: text,
+                retry_after,
+            })
+            .context(format!("Request to {url} failed")))
         }
     }
 

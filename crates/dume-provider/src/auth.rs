@@ -4,7 +4,43 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+
+static REFRESH_OWNERS: AtomicUsize = AtomicUsize::new(0);
+static REFRESH_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+/// Wait for all automatically-owned credential resolutions to finish, bounded by `timeout`.
+/// This cannot protect refreshes from forced process termination or machine failure.
+pub async fn drain_refresh_owners(timeout: Duration) -> Result<()> {
+    let wait = async {
+        let notify = REFRESH_NOTIFY.get_or_init(Notify::new);
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if REFRESH_OWNERS.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for credential refresh owners"))
+}
+
+struct RefreshOwner;
+impl Drop for RefreshOwner {
+    fn drop(&mut self) {
+        REFRESH_OWNERS.fetch_sub(1, Ordering::AcqRel);
+        if let Some(notify) = REFRESH_NOTIFY.get() {
+            notify.notify_waiters();
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credential {
@@ -32,6 +68,18 @@ pub fn normalize_provider(provider: &str) -> &str {
         "google"
     } else {
         provider
+    }
+}
+
+fn credential_env(provider: &str) -> &'static str {
+    match normalize_provider(provider) {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "google" => "GEMINI_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "opencode" | "opencode-go" => "OPENCODE_API_KEY",
+        "opencodex" => "OPENCODEX_API_KEY",
+        _ => "",
     }
 }
 
@@ -165,19 +213,40 @@ impl CredentialStore {
 
     pub async fn resolve_credential(&self, provider: &str) -> Result<Option<Credential>> {
         let provider = normalize_provider(provider);
-        let env = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" => "GEMINI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "opencode" | "opencode-go" => "OPENCODE_API_KEY",
-            _ => "",
-        };
+        let env = credential_env(provider);
         if let Ok(key) = std::env::var(env) {
             if !key.trim().is_empty() {
                 return Ok(Some(Self::api_key(&key)));
             }
         }
+        let provider = provider.to_owned();
+        self.spawn_resolve_owner(provider, None).await
+    }
+
+    async fn spawn_resolve_owner(
+        &self,
+        provider: String,
+        token_url: Option<String>,
+    ) -> Result<Option<Credential>> {
+        let store = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        REFRESH_OWNERS.fetch_add(1, Ordering::AcqRel);
+        tokio::spawn(async move {
+            let _owner = RefreshOwner;
+            let result = store.resolve_owned(&provider, token_url.as_deref()).await;
+            if result.is_err() {
+                tracing::warn!(provider = %provider, "Credential resolution/refresh failed");
+            }
+            let _ = send.send(result);
+        });
+        receive.await.context("Credential refresh owner stopped")?
+    }
+
+    async fn resolve_owned(
+        &self,
+        provider: &str,
+        token_url: Option<&str>,
+    ) -> Result<Option<Credential>> {
         let store = self.clone();
         let _lock = tokio::task::spawn_blocking(move || store.lock()).await??;
         let mut credentials = self.load()?;
@@ -207,7 +276,12 @@ impl CredentialStore {
                         .as_deref()
                         .filter(|s| !s.is_empty())
                         .context("Missing refresh token; login again")?;
-                    let token = crate::oauth::refresh_oauth_token(&config, refresh).await?;
+                    let token = match token_url {
+                        Some(url) => {
+                            crate::oauth::refresh_oauth_token_at(&config, url, refresh).await?
+                        }
+                        None => crate::oauth::refresh_oauth_token(&config, refresh).await?,
+                    };
                     credential = Credential::from_oauth(provider, token, Some(&credential))?;
                     credentials.insert(provider.to_owned(), credential.clone());
                     self.write_all(&credentials)?;
@@ -293,14 +367,7 @@ impl CredentialStore {
 
     pub fn has_credential(&self, provider: &str) -> bool {
         let provider = normalize_provider(provider);
-        let env = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "google" => "GEMINI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "opencode" | "opencode-go" => "OPENCODE_API_KEY",
-            _ => "",
-        };
+        let env = credential_env(provider);
         if let Ok(key) = std::env::var(env) {
             if !key.trim().is_empty() {
                 return true;
@@ -313,7 +380,10 @@ impl CredentialStore {
                         return cred.key.as_ref().is_some_and(|k| !k.trim().is_empty());
                     }
                     "oauth" => {
-                        return cred.access_token.as_ref().is_some_and(|t| !t.trim().is_empty());
+                        return cred
+                            .access_token
+                            .as_ref()
+                            .is_some_and(|t| !t.trim().is_empty());
                     }
                     _ => {}
                 }
@@ -326,6 +396,191 @@ impl CredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifier_env_mapping_does_not_alias_local_backend() {
+        assert_eq!(credential_env("opencode"), "OPENCODE_API_KEY");
+        assert_eq!(credential_env("jev-local-system-one"), "");
+    }
+
+    #[tokio::test]
+    async fn refresh_owner_drain_is_bounded_and_completes() {
+        REFRESH_OWNERS.fetch_add(1, Ordering::AcqRel);
+        let owner = RefreshOwner;
+        assert!(
+            drain_refresh_owners(Duration::from_millis(1))
+                .await
+                .is_err()
+        );
+        drop(owner);
+        drain_refresh_owners(Duration::from_secs(1)).await.unwrap();
+    }
+
+    async fn mock_refresh_server(
+        status: &str,
+        body: &'static str,
+        delay: bool,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_server = release.clone();
+        let status = status.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                bytes.push(stream.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(bytes.clone()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body_bytes = vec![0; length];
+            stream.read_exact(&mut body_bytes).await.unwrap();
+            let request = String::from_utf8(body_bytes).unwrap();
+            let _ = seen_tx.send(request);
+            if delay {
+                release_server.notified().await;
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (url, seen_rx, task, release)
+    }
+
+    fn expired_oauth() -> Credential {
+        Credential {
+            cred_type: "oauth".into(),
+            key: None,
+            access_token: Some("old-access".into()),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: Some(1),
+            account_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_cancel_rotating_refresh_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        store.save("anthropic", &expired_oauth()).unwrap();
+        let (url, seen, server, release) = mock_refresh_server(
+            "200 OK",
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+            true,
+        )
+        .await;
+        let task_store = store.clone();
+        let caller = tokio::spawn(async move {
+            task_store
+                .spawn_resolve_owner("anthropic".into(), Some(url))
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(2), seen)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.contains("old-refresh"));
+        caller.abort();
+        release.notify_one();
+        server.await.unwrap();
+        drain_refresh_owners(Duration::from_secs(2)).await.unwrap();
+        let saved = store.load().unwrap();
+        assert_eq!(
+            saved["anthropic"].access_token.as_deref(),
+            Some("new-access")
+        );
+        assert_eq!(
+            saved["anthropic"].refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolves_dedupe_and_rejected_refresh_preserves_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        store.save("anthropic", &expired_oauth()).unwrap();
+        let (url, seen, server, release) = mock_refresh_server(
+            "200 OK",
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+            true,
+        )
+        .await;
+        let first_store = store.clone();
+        let first_url = url.clone();
+        let first = tokio::spawn(async move {
+            first_store
+                .spawn_resolve_owner("anthropic".into(), Some(first_url))
+                .await
+        });
+        assert!(seen.await.unwrap().contains("old-refresh"));
+        let second_store = store.clone();
+        let second = tokio::spawn(async move {
+            second_store
+                .spawn_resolve_owner("anthropic".into(), Some(url))
+                .await
+        });
+        release.notify_one();
+        server.await.unwrap();
+        assert_eq!(
+            first
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new-access")
+        );
+        assert_eq!(
+            second
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new-access")
+        );
+        drain_refresh_owners(Duration::from_secs(2)).await.unwrap();
+
+        store.save("anthropic", &expired_oauth()).unwrap();
+        let (url, _, server, _) =
+            mock_refresh_server("400 Bad Request", r#"{"error":"invalid_grant"}"#, false).await;
+        assert!(
+            store
+                .spawn_resolve_owner("anthropic".into(), Some(url))
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        let preserved = store.load().unwrap();
+        assert_eq!(
+            preserved["anthropic"].access_token.as_deref(),
+            Some("old-access")
+        );
+        assert_eq!(
+            preserved["anthropic"].refresh_token.as_deref(),
+            Some("old-refresh")
+        );
+    }
 
     #[test]
     fn updates_preserve_other_credentials_and_normalize_alias() {
@@ -426,9 +681,19 @@ mod tests {
         store.save_credential("anthropic", "sk-ant-test").unwrap();
 
         let dir_perm = fs::metadata(&sub).unwrap().permissions().mode();
-        assert_eq!(dir_perm & 0o077, 0, "Directory permissions should not be world or group accessible: {:o}", dir_perm);
+        assert_eq!(
+            dir_perm & 0o077,
+            0,
+            "Directory permissions should not be world or group accessible: {:o}",
+            dir_perm
+        );
 
         let file_perm = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(file_perm & 0o077, 0, "File permissions should not be world or group accessible: {:o}", file_perm);
+        assert_eq!(
+            file_perm & 0o077,
+            0,
+            "File permissions should not be world or group accessible: {:o}",
+            file_perm
+        );
     }
 }

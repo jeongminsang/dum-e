@@ -1,5 +1,7 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
+use crate::types::{
+    ChatMessage, ProviderFailureKind, Role, StreamEvent, TokenUsage, ToolDefinition,
+};
 use anyhow::{Context, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -14,10 +16,43 @@ pub struct GeminiProvider {
     base_url: String,
 }
 
+fn gemini_provider_error(error: &Value) -> (ProviderFailureKind, String) {
+    let code = error.get("status").and_then(Value::as_str).unwrap_or("");
+    let numeric_code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
+    let kind = match code {
+        "RESOURCE_EXHAUSTED" | "UNAVAILABLE" | "ABORTED" => ProviderFailureKind::Transient,
+        "UNAUTHENTICATED" | "PERMISSION_DENIED" => ProviderFailureKind::Auth,
+        "INVALID_ARGUMENT" => ProviderFailureKind::InvalidRequest,
+        "FAILED_PRECONDITION" => ProviderFailureKind::Context,
+        _ if matches!(numeric_code, 429 | 500 | 502 | 503 | 504) => ProviderFailureKind::Transient,
+        _ if numeric_code == 401 || numeric_code == 403 => ProviderFailureKind::Auth,
+        _ if numeric_code == 400 => ProviderFailureKind::InvalidRequest,
+        _ => ProviderFailureKind::Unknown,
+    };
+    (kind, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ToolCall;
+
+    #[test]
+    fn structured_error_status_classification_is_exact() {
+        assert_eq!(
+            gemini_provider_error(&json!({"code":429,"status":"RESOURCE_EXHAUSTED"})).0,
+            ProviderFailureKind::Transient
+        );
+        assert_eq!(
+            gemini_provider_error(&json!({"code":401,"status":"UNAUTHENTICATED"})).0,
+            ProviderFailureKind::Auth
+        );
+        assert_eq!(
+            gemini_provider_error(&json!({"code":499,"status":"VENDOR_BUSY","message":"overload"}))
+                .0,
+            ProviderFailureKind::Unknown
+        );
+    }
 
     #[tokio::test]
     async fn system_tools_and_function_roundtrip_use_gemini_schema() {
@@ -145,7 +180,7 @@ impl GeminiProvider {
             "x-goog-api-key",
             HeaderValue::from_str(&self.api_key).context("Invalid Gemini API key header")?,
         );
-        let resp = self.client.post_with_retry(&url, headers, &body, 3).await?;
+        let resp = self.client.post_once(&url, headers, &body).await?;
         let mut stream = resp.bytes_stream().eventsource();
         let mut call_index = 0usize;
         let call_prefix = crate::types::StreamRequestContext::new().request_id;
@@ -155,8 +190,14 @@ impl GeminiProvider {
                 Ok(event) => {
                     if let Ok(val) = serde_json::from_str::<Value>(&event.data) {
                         if let Some(err) = val.get("error") {
-                            let message = format!("Google API error: {err}");
-                            let _ = tx.send(StreamEvent::Error(message.clone())).await;
+                            let (kind, message) = gemini_provider_error(err);
+                            let _ = tx
+                                .send(StreamEvent::ProviderError {
+                                    kind,
+                                    message: format!("Google API error: {message}"),
+                                    retry_after_ms: None,
+                                })
+                                .await;
                             anyhow::bail!(message);
                         }
                         if let Some(usage) = val.get("usageMetadata") {

@@ -248,4 +248,4 @@ jobs:
           cmp SHA256SUMS "$remote/SHA256SUMS"
           (cd "$remote" && sha256sum -c SHA256SUMS)
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          gh release edit "$RELEASE_TAG" --draft=false
+          gh release edit "$RELEASE_TAG" --draft=false --latest

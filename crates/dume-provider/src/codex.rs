@@ -1,5 +1,7 @@
 use crate::client::LlmClient;
-use crate::types::{ChatMessage, Role, StreamEvent, TokenUsage, ToolDefinition};
+use crate::types::{
+    ChatMessage, ProviderFailureKind, Role, StreamEvent, TokenUsage, ToolDefinition,
+};
 use anyhow::{Context, Result, bail};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -11,8 +13,16 @@ use tokio::sync::mpsc;
 pub struct CodexProvider {
     client: LlmClient,
     access_token: String,
-    account_id: String,
+    account_id: Option<String>,
     base_url: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct CodexResponseFailure {
+    kind: ProviderFailureKind,
+    message: String,
+    retry_after_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -221,14 +231,23 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn codex_errors_and_unexpected_eof_never_complete() {
-        for body in [
-            sse(&[json!({"type":"error","message":"denied"})]),
-            sse(&[json!({"type":"response.failed","response":{"error":{"message":"failed"}}})]),
-            sse(&[
-                json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}),
-            ]),
-            "data: invalid\n\n".into(),
-            "data: [DONE]\n\n".into(),
+        for (body, expected_kind) in [
+            (
+                sse(&[json!({"type":"error","message":"denied"})]),
+                Some(ProviderFailureKind::Unknown),
+            ),
+            (
+                sse(&[json!({"type":"response.failed","response":{"error":{"message":"failed"}}})]),
+                Some(ProviderFailureKind::Unknown),
+            ),
+            (
+                sse(&[
+                    json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}),
+                ]),
+                None,
+            ),
+            ("data: invalid\n\n".into(), None),
+            ("data: [DONE]\n\n".into(), None),
         ] {
             let (url, server) = fixture(body);
             let (tx, mut rx) = mpsc::channel(16);
@@ -240,7 +259,13 @@ pub(crate) mod tests {
                     .is_err()
             );
             server.join().unwrap();
-            assert!(matches!(rx.recv().await, Some(StreamEvent::Error(_))));
+            let terminal = rx.recv().await;
+            match expected_kind {
+                Some(kind) => assert!(
+                    matches!(terminal, Some(StreamEvent::ProviderError { kind: actual, .. }) if actual == kind)
+                ),
+                None => assert!(matches!(terminal, Some(StreamEvent::Error(_)))),
+            }
             assert!(rx.recv().await.is_none());
         }
     }
@@ -287,7 +312,10 @@ pub(crate) mod tests {
         let provider = CodexProvider::new("access-tok", "account-123").with_base_url(&url);
         let ctx = crate::types::StreamRequestContext::for_session("session-cache-aff-99");
         let (tx, _rx) = mpsc::channel(16);
-        provider.stream_with_context("gpt-5", &[ChatMessage::user("hi")], &[], Some(&ctx), tx).await.unwrap();
+        provider
+            .stream_with_context("gpt-5", &[ChatMessage::user("hi")], &[], Some(&ctx), tx)
+            .await
+            .unwrap();
         let (headers, body) = server.join().unwrap();
         assert!(headers.contains("session-id: session-cache-aff-99"));
         assert_eq!(body["prompt_cache_key"], "session-cache-aff-99");
@@ -299,9 +327,18 @@ impl CodexProvider {
         Self {
             client: LlmClient::new(),
             access_token: access_token.to_string(),
-            account_id: account_id.to_string(),
+            account_id: Some(account_id.to_string()),
             base_url: "https://chatgpt.com/backend-api".to_string(),
         }
+    }
+
+    pub fn new_opencodex(base_url: &str, api_key: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: LlmClient::local()?,
+            access_token: api_key.unwrap_or_default().to_string(),
+            account_id: None,
+            base_url: crate::opencodex::validate_base_url(base_url)?,
+        })
     }
 
     pub fn with_base_url(mut self, base_url: &str) -> Self {
@@ -310,7 +347,9 @@ impl CodexProvider {
     }
 
     fn url(&self) -> String {
-        if self.base_url.ends_with("/codex/responses") {
+        if self.account_id.is_none() {
+            format!("{}/responses", self.base_url)
+        } else if self.base_url.ends_with("/codex/responses") {
             self.base_url.clone()
         } else if self.base_url.ends_with("/codex") {
             format!("{}/responses", self.base_url)
@@ -320,11 +359,22 @@ impl CodexProvider {
     }
 
     fn headers(&self, context: Option<&crate::types::StreamRequestContext>) -> Result<HeaderMap> {
-        let mut headers = LlmClient::build_auth_headers(&self.access_token, false)?;
-        headers.insert(
-            "chatgpt-account-id",
-            HeaderValue::from_str(&self.account_id).context("Invalid account ID header")?,
-        );
+        let mut headers = if self.account_id.is_none() && self.access_token.is_empty() {
+            HeaderMap::new()
+        } else {
+            LlmClient::build_auth_headers(&self.access_token, false)?
+        };
+        if let Some(account_id) = &self.account_id {
+            headers.insert(
+                "chatgpt-account-id",
+                HeaderValue::from_str(account_id).context("Invalid account ID header")?,
+            );
+            headers.insert("originator", HeaderValue::from_static("pi"));
+            headers.insert(
+                "openai-beta",
+                HeaderValue::from_static("responses=experimental"),
+            );
+        }
         if let Some(ctx) = context {
             if let Ok(val) = HeaderValue::from_str(&ctx.session_id) {
                 headers.insert("session-id", val);
@@ -333,20 +383,20 @@ impl CodexProvider {
                 headers.insert("x-client-request-id", val);
             }
         }
-        headers.insert("originator", HeaderValue::from_static("pi"));
         headers.insert(
             "user-agent",
             HeaderValue::from_static(concat!("dume/", env!("CARGO_PKG_VERSION"))),
-        );
-        headers.insert(
-            "openai-beta",
-            HeaderValue::from_static("responses=experimental"),
         );
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
         Ok(headers)
     }
 
-    fn body(model: &str, messages: &[ChatMessage], tools: &[ToolDefinition], context: Option<&crate::types::StreamRequestContext>) -> Result<Value> {
+    fn body(
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
+    ) -> Result<Value> {
         let mut input = Vec::new();
         for message in messages {
             match message.role {
@@ -403,7 +453,8 @@ impl CodexProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        self.stream_with_context(model, messages, tools, None, tx).await
+        self.stream_with_context(model, messages, tools, None, tx)
+            .await
     }
 
     pub async fn stream_with_context(
@@ -414,9 +465,20 @@ impl CodexProvider {
         context: Option<&crate::types::StreamRequestContext>,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let result = self.stream_inner(model, messages, tools, context, &tx).await;
+        let result = self
+            .stream_inner(model, messages, tools, context, &tx)
+            .await;
         if let Err(error) = &result {
-            let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+            let event = if let Some(failure) = error.downcast_ref::<CodexResponseFailure>() {
+                StreamEvent::ProviderError {
+                    kind: failure.kind,
+                    message: failure.message.clone(),
+                    retry_after_ms: failure.retry_after_ms,
+                }
+            } else {
+                StreamEvent::Error(error.to_string())
+            };
+            let _ = tx.send(event).await;
         }
         result
     }
@@ -429,13 +491,15 @@ impl CodexProvider {
         context: Option<&crate::types::StreamRequestContext>,
         tx: &mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
+        if self.account_id.is_none() {
+            crate::opencodex::validate_base_url(&self.base_url)?;
+        }
         let response = self
             .client
-            .post_with_retry(
+            .post_once(
                 &self.url(),
                 self.headers(context)?,
                 &Self::body(model, messages, tools, context)?,
-                0,
             )
             .await?;
         let mut stream = response.bytes_stream().eventsource();
@@ -449,6 +513,19 @@ impl CodexProvider {
                 serde_json::from_str(&event.data).context("Invalid Codex SSE JSON")?;
             let (events, terminal) = state.process(&value)?;
             for event in events {
+                if let StreamEvent::ProviderError {
+                    kind,
+                    message,
+                    retry_after_ms,
+                } = event
+                {
+                    return Err(CodexResponseFailure {
+                        kind,
+                        message,
+                        retry_after_ms,
+                    }
+                    .into());
+                }
                 tx.send(event).await.context("Stream receiver closed")?;
             }
             if terminal {
@@ -595,7 +672,33 @@ impl ResponseState {
         let kind = event["type"].as_str().context("Missing Codex event type")?;
         match kind {
             "error" | "response.failed" | "response.cancelled" => {
-                bail!("Codex response error ({})", kind)
+                let error = event
+                    .get("error")
+                    .or_else(|| event.get("response").and_then(|r| r.get("error")))
+                    .unwrap_or(event);
+                let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+                let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+                let kind = match code {
+                    "server_busy"
+                    | "overloaded_error"
+                    | "rate_limit_exceeded"
+                    | "temporarily_unavailable" => ProviderFailureKind::Transient,
+                    "invalid_api_key" | "authentication_error" | "permission_denied" => {
+                        ProviderFailureKind::Auth
+                    }
+                    "invalid_request" | "unsupported_parameter" => {
+                        ProviderFailureKind::InvalidRequest
+                    }
+                    "context_length_exceeded" => ProviderFailureKind::Context,
+                    "" => ProviderFailureKind::Unknown,
+                    _ => ProviderFailureKind::Unknown,
+                };
+                events.push(StreamEvent::ProviderError {
+                    kind,
+                    message: format!("Codex response error ({kind:?}, code={code}): {message}"),
+                    retry_after_ms: event["retry_after_ms"].as_u64(),
+                });
+                return Ok((events, true));
             }
             "response.output_item.added" | "response.output_item.done" => {
                 let index = self.index(event)?;
@@ -695,10 +798,22 @@ impl ResponseState {
                     }
                 }
                 if let Some(usage) = response.get("usage") {
-                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let total = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(input + output);
-                    let cache_read = usage.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|v| v.as_i64());
+                    let input = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let total = usage
+                        .get("total_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(input + output);
+                    let cache_read = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_i64());
                     if input > 0 || output > 0 || total > 0 {
                         events.push(StreamEvent::Usage(TokenUsage {
                             input_tokens: input,

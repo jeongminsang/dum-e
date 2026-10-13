@@ -159,11 +159,19 @@ fn setup_large_log_diagnosis(path: &Path) -> Result<()> {
     init_git_repo(path)?;
     let mut log = String::with_capacity(1024 * 60);
     for i in 1..=500 {
-        log.push_str(&format!("[INFO] 2026-09-22 10:00:{:02} - test_worker_suite_{} PASSED\n", i % 60, i));
+        log.push_str(&format!(
+            "[INFO] 2026-09-22 10:00:{:02} - test_worker_suite_{} PASSED\n",
+            i % 60,
+            i
+        ));
     }
     log.push_str("[ERROR] 2026-09-22 10:08:14 - test_database_connection FAILED: ConnectionRefusedError(port 5432 unreachable)\n");
     for i in 501..=1000 {
-        log.push_str(&format!("[INFO] 2026-09-22 10:15:{:02} - test_worker_suite_{} PASSED\n", i % 60, i));
+        log.push_str(&format!(
+            "[INFO] 2026-09-22 10:15:{:02} - test_worker_suite_{} PASSED\n",
+            i % 60,
+            i
+        ));
     }
     std::fs::write(path.join("test_suite.log"), log)?;
     git_commit_all(path, "Add test run log")?;
@@ -263,11 +271,20 @@ fn check_continuation_constraint(path: &Path) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let diff_files = String::from_utf8_lossy(&diff_working.stdout);
     if !diff_files.trim().is_empty() {
-        return Err("Constraint violated: config.json was modified in working directory!".to_string());
+        return Err(
+            "Constraint violated: config.json was modified in working directory!".to_string(),
+        );
     }
 
     let diff_initial = Command::new("git")
-        .args(["diff", "--name-only", "benchmark_initial", "HEAD", "--", "config.json"])
+        .args([
+            "diff",
+            "--name-only",
+            "benchmark_initial",
+            "HEAD",
+            "--",
+            "config.json",
+        ])
         .current_dir(path)
         .output()
         .map_err(|e| e.to_string())?;
@@ -282,7 +299,8 @@ fn check_continuation_constraint(path: &Path) -> Result<bool, String> {
         return Err("Constraint violated: config.json was removed!".to_string());
     }
     let config_content = std::fs::read_to_string(&config_file).map_err(|e| e.to_string())?;
-    if !config_content.contains("\"port\": 8080") || !config_content.contains("\"protected\": true") {
+    if !config_content.contains("\"port\": 8080") || !config_content.contains("\"protected\": true")
+    {
         return Err("Constraint violated: config.json content altered!".to_string());
     }
 

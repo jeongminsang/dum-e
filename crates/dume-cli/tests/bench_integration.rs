@@ -1,8 +1,10 @@
 use dume_cli::bench::fixtures::all_fixtures;
-use dume_cli::bench::{AttemptRecord, BenchmarkReport, BenchmarkRunConfig, BenchmarkRunner, CaseSummary};
+use dume_cli::bench::{
+    AttemptRecord, BenchmarkReport, BenchmarkRunConfig, BenchmarkRunner, CaseSummary,
+};
 use dume_core::types::*;
-use dume_provider::types::*;
 use dume_provider::AnthropicProvider;
+use dume_provider::types::*;
 use dume_store::HarnessStore;
 use dume_worker::agent_loop::AgentLoop;
 use std::sync::Arc;
@@ -57,7 +59,10 @@ async fn test_bench_streaming_usage_merge_cumulative() {
     thinking_usage.merge_cumulative(&c2b);
     assert_eq!(thinking_usage.input_tokens, 10);
     assert_eq!(thinking_usage.output_tokens, 2);
-    assert_eq!(thinking_usage.total_tokens, 30, "Must preserve provider total when exceeding input + output");
+    assert_eq!(
+        thinking_usage.total_tokens, 30,
+        "Must preserve provider total when exceeding input + output"
+    );
 
     // Turn 2 adds 50 more input and 15 output via accumulate
     let mut turn2_usage = TokenUsage::default();
@@ -102,7 +107,10 @@ async fn test_bench_provider_cache_normalization() {
     let provider = AnthropicProvider::new("test-key").with_base_url(&mock_url);
     let (tx, mut rx) = mpsc::channel(10);
     let msgs = vec![ChatMessage::user("hello")];
-    provider.stream("claude-sonnet-4-5", &msgs, &[], tx).await.unwrap();
+    provider
+        .stream("claude-sonnet-4-5", &msgs, &[], tx)
+        .await
+        .unwrap();
 
     let mut accumulated = TokenUsage::default();
     while let Some(event) = rx.recv().await {
@@ -208,7 +216,9 @@ fn test_bench_parent_child_usage_aggregation() {
     store.record_request_usage(&parent_usage).unwrap();
     store.record_request_usage(&child_usage).unwrap();
 
-    let usages = store.get_attempt_request_usages("att_parent_child").unwrap();
+    let usages = store
+        .get_attempt_request_usages("att_parent_child")
+        .unwrap();
     assert_eq!(usages.len(), 2);
 
     let mut parent_tokens = 0;
@@ -239,21 +249,60 @@ async fn test_bench_failed_cancelled_retains_usage() {
     let db_path = dir.path().join("test.db");
     let artifacts_dir = dir.path().join("artifacts");
     let store = Arc::new(HarnessStore::open(&db_path, &artifacts_dir).unwrap());
+    store
+        .create_goal("goal_cancelled", "cancelled usage fixture")
+        .unwrap();
+    store
+        .create_task(&Task {
+            id: "task_cancelled".to_string(),
+            goal_id: "goal_cancelled".to_string(),
+            title: "cancelled usage fixture".to_string(),
+            description: String::new(),
+            status: TaskStatus::InProgress,
+            dependencies: vec![],
+            acceptance_criteria: vec![],
+            allowed_paths: None,
+            target_branch: "main".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    store
+        .create_attempt(
+            "att_cancelled",
+            "task_cancelled",
+            1,
+            "worker_fixture",
+            dir.path().to_str().unwrap(),
+            60_000,
+        )
+        .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        if let Ok((mut socket, _)) = listener.accept().await {
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut socket, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
+        {
             let mut buf = [0u8; 2048];
-            let _ = socket.read(&mut buf).await;
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut buf))
+                    .await
+                    .is_ok_and(|result| result.is_ok_and(|count| count > 0));
+            let _ = request_tx.send(received);
             // Send usage event and then crash/abort connection
             let sse_chunk = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
                 sse_chunk
             );
-            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                socket.write_all(response.as_bytes()),
+            )
+            .await;
             // Socket drops
         }
     });
@@ -273,7 +322,22 @@ async fn test_bench_failed_cancelled_retains_usage() {
             parent_agent_id: None,
         });
 
-    let outcome = agent.run_task("do task").await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.run_task("do task"),
+    )
+    .await
+    .expect("agent execution must not hang");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(20), request_rx)
+            .await
+            .expect("server must observe a request")
+            .expect("request observation channel must remain open")
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), server)
+        .await
+        .expect("fixture server must stop")
+        .expect("fixture server task must not panic");
     // Agent execution should fail due to unexpected stream EOF
     assert!(outcome.is_err());
 
@@ -281,7 +345,10 @@ async fn test_bench_failed_cancelled_retains_usage() {
     let records = store.get_attempt_request_usages("att_cancelled").unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_tokens, 88);
-    assert!(!records[0].is_complete, "Stream disconnected prematurely must be marked is_complete = false");
+    assert!(
+        !records[0].is_complete,
+        "Stream disconnected prematurely must be marked is_complete = false"
+    );
 }
 
 // 6. Missing usage marks run incomplete
@@ -322,7 +389,10 @@ fn test_bench_missing_usage_marks_incomplete() {
 #[test]
 fn test_bench_acceptance_check_rejects_false_completion() {
     let fixtures = all_fixtures();
-    let targeted_fix = fixtures.iter().find(|f| f.id == "targeted_bug_fix").unwrap();
+    let targeted_fix = fixtures
+        .iter()
+        .find(|f| f.id == "targeted_bug_fix")
+        .unwrap();
 
     let dir = tempdir().unwrap();
     // Setup initial broken fixture
@@ -333,42 +403,67 @@ fn test_bench_acceptance_check_rejects_false_completion() {
     assert!(check_before.is_err() || check_before.unwrap() == false);
 
     // Apply incorrect fix: buggy subtraction
-    std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+    std::fs::write(
+        dir.path().join("calc.py"),
+        "def add(a, b):\n    return a - b\n",
+    )
+    .unwrap();
     let check_wrong = (targeted_fix.check_fn)(dir.path());
     assert!(check_wrong.is_err() || check_wrong.unwrap() == false);
 
     // Apply adversarial cheat: constant return 5 (which passes add(2,3) and add(10,-5))
     std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return 5\n").unwrap();
     let check_cheat = (targeted_fix.check_fn)(dir.path());
-    assert!(check_cheat.is_err() || check_cheat.unwrap() == false, "Constant return 5 must be rejected by hardened oracle");
+    assert!(
+        check_cheat.is_err() || check_cheat.unwrap() == false,
+        "Constant return 5 must be rejected by hardened oracle"
+    );
 
     // Apply correct fix
-    std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+    std::fs::write(
+        dir.path().join("calc.py"),
+        "def add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
     let check_correct = (targeted_fix.check_fn)(dir.path()).unwrap();
     assert!(check_correct);
 
     // Test adversarial case: repo_investigation marker-only output
-    let repo_fix = fixtures.iter().find(|f| f.id == "repo_investigation").unwrap();
+    let repo_fix = fixtures
+        .iter()
+        .find(|f| f.id == "repo_investigation")
+        .unwrap();
     let dir_repo = tempdir().unwrap();
     (repo_fix.setup_fn)(dir_repo.path()).unwrap();
     std::fs::write(dir_repo.path().join(".dume_finding.txt"), "CRITICAL_LEAK\n").unwrap();
     let check_marker_only = (repo_fix.check_fn)(dir_repo.path());
-    assert!(check_marker_only.is_err() || check_marker_only.unwrap() == false, "Marker-only finding must be rejected");
+    assert!(
+        check_marker_only.is_err() || check_marker_only.unwrap() == false,
+        "Marker-only finding must be rejected"
+    );
 
     std::fs::write(
         dir_repo.path().join(".dume_finding.txt"),
         "CRITICAL_LEAK: accidentally committed secret\n",
-    ).unwrap();
+    )
+    .unwrap();
     let check_full_finding = (repo_fix.check_fn)(dir_repo.path()).unwrap();
     assert!(check_full_finding, "Full commit subject must be accepted");
 
     // Test adversarial case: continuation_constraint modifying and committing config.json
-    let cont_fix = fixtures.iter().find(|f| f.id == "continuation_constraint").unwrap();
+    let cont_fix = fixtures
+        .iter()
+        .find(|f| f.id == "continuation_constraint")
+        .unwrap();
     let dir_cont = tempdir().unwrap();
     (cont_fix.setup_fn)(dir_cont.path()).unwrap();
 
     // Modify protected config.json, update server.py to 9090, and commit both
-    std::fs::write(dir_cont.path().join("config.json"), "{\"port\": 9090, \"protected\": false}").unwrap();
+    std::fs::write(
+        dir_cont.path().join("config.json"),
+        "{\"port\": 9090, \"protected\": false}",
+    )
+    .unwrap();
     std::fs::write(dir_cont.path().join("server.py"), "PORT = 9090\n").unwrap();
     let _ = std::process::Command::new("git")
         .args(["add", "."])
@@ -405,11 +500,19 @@ fn test_bench_identical_initial_fixtures() {
                 continue;
             }
             let other_file = dir2.path().join(rel_path);
-            assert!(other_file.exists(), "File missing in second setup: {:?}", rel_path);
+            assert!(
+                other_file.exists(),
+                "File missing in second setup: {:?}",
+                rel_path
+            );
             if entry.is_file() {
                 let content1 = std::fs::read(&entry).unwrap();
                 let content2 = std::fs::read(&other_file).unwrap();
-                assert_eq!(content1, content2, "Fixture contents differed for case: {}", f.id);
+                assert_eq!(
+                    content1, content2,
+                    "Fixture contents differed for case: {}",
+                    f.id
+                );
             }
         }
     }
@@ -436,7 +539,8 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn test_bench_metrics_formulas_and_zero_division() {
     let dir = tempdir().unwrap();
     let artifacts_dir = dir.path().join("artifacts");
-    let _store = Arc::new(HarnessStore::open(&dir.path().join("db.sqlite"), &artifacts_dir).unwrap());
+    let _store =
+        Arc::new(HarnessStore::open(&dir.path().join("db.sqlite"), &artifacts_dir).unwrap());
     let config = BenchmarkRunConfig {
         run_id: "test_calc".to_string(),
         case_ids: vec![],
@@ -494,7 +598,11 @@ fn test_bench_metrics_formulas_and_zero_division() {
     };
 
     let report_a = runner.build_report(
-        vec![BenchmarkRunner::calculate_case_summary("c1", vec![base_att.clone()], vec![cand_att])],
+        vec![BenchmarkRunner::calculate_case_summary(
+            "c1",
+            vec![base_att.clone()],
+            vec![cand_att],
+        )],
         vec!["baseline".to_string(), "candidate".to_string()],
     );
 
@@ -548,7 +656,11 @@ fn test_bench_metrics_formulas_and_zero_division() {
     };
 
     let report_b = runner.build_report(
-        vec![BenchmarkRunner::calculate_case_summary("c2", vec![base_failed], vec![cand_failed])],
+        vec![BenchmarkRunner::calculate_case_summary(
+            "c2",
+            vec![base_failed],
+            vec![cand_failed],
+        )],
         vec!["baseline".to_string(), "candidate".to_string()],
     );
 
@@ -579,7 +691,8 @@ fn test_bench_metrics_formulas_and_zero_division() {
         descendant_tokens: 0,
     };
 
-    let summary_c = BenchmarkRunner::calculate_case_summary("c3", vec![base_att], vec![cand_incomplete]);
+    let summary_c =
+        BenchmarkRunner::calculate_case_summary("c3", vec![base_att], vec![cand_incomplete]);
     assert_eq!(summary_c.token_reduction, None);
     assert_eq!(summary_c.candidate_tokens_per_success, None);
 }
@@ -618,14 +731,18 @@ fn test_bench_persistence_and_markdown_rendering() {
         overall_baseline_tokens_per_success: Some(2000.0),
         overall_candidate_tokens_per_success: Some(1500.0),
         incomplete_attempts_count: 0,
-        execution_order: vec!["c1:rep1:baseline".to_string(), "c1:rep1:candidate".to_string()],
+        execution_order: vec![
+            "c1:rep1:baseline".to_string(),
+            "c1:rep1:candidate".to_string(),
+        ],
     };
 
     // Save JSON
     std::fs::write(&json_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
 
     // Reload JSON from disk simulating process restart
-    let loaded: BenchmarkReport = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    let loaded: BenchmarkReport =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert_eq!(loaded.run_id, "bench_persist");
     assert_eq!(loaded.overall_token_reduction, Some(0.25));
 
