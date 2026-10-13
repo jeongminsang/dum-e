@@ -9,9 +9,31 @@ use dume_store::HarnessStore;
 use dume_worker::agent_loop::AgentLoop;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+
+async fn read_request(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut reader = tokio::io::BufReader::new(socket);
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).await?;
+    Ok(())
+}
 
 // 1. Verify cumulative streaming usage does not repeatedly add previous turn usage
 #[tokio::test]
@@ -91,8 +113,7 @@ async fn test_bench_provider_cache_normalization() {
 
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
-            let mut buf = [0u8; 2048];
-            let _ = socket.read(&mut buf).await;
+            read_request(&mut socket).await.unwrap();
             let sse_body = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -286,11 +307,12 @@ async fn test_bench_failed_cancelled_retains_usage() {
         if let Ok(Ok((mut socket, _))) =
             tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
         {
-            let mut buf = [0u8; 2048];
-            let received =
-                tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut buf))
-                    .await
-                    .is_ok_and(|result| result.is_ok_and(|count| count > 0));
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                read_request(&mut socket),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
             let _ = request_tx.send(received);
             // Send usage event and then crash/abort connection
             let sse_chunk = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n";
