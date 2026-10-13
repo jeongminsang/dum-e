@@ -230,19 +230,8 @@ fn selectable_models() -> Vec<ModelInfo> {
         .collect()
 }
 
-fn subagent_command(command: &str, parent_model: &str, path: &std::path::Path) -> Result<String> {
+fn subagent_command(command: &str, path: &std::path::Path) -> Result<String> {
     let mut settings = SubagentSettings::load_from(path)?;
-    if command == "/subagents" {
-        let model = settings.model.as_deref().unwrap_or(parent_model);
-        let source = if settings.model.is_some() {
-            "configured"
-        } else {
-            "inherited"
-        };
-        return Ok(format!(
-            "Subagent model: {model} ({source})\nUse /subagents model <provider/model> or /subagents model inherit."
-        ));
-    }
     if command == "/subagents model inherit" {
         settings.model = None;
         settings.save_to(path)?;
@@ -698,11 +687,33 @@ fn routing_set_role_model(
     }
 }
 
+pub enum ModelSelectorTarget {
+    Conversation,
+    Subagents {
+        path: std::path::PathBuf,
+        model: Option<String>,
+    },
+}
+
+impl ModelSelectorTarget {
+    pub fn model_offset(&self) -> usize {
+        usize::from(matches!(self, Self::Subagents { .. }))
+    }
+
+    pub fn current_model<'a>(&'a self, parent_model: &'a str) -> &'a str {
+        match self {
+            Self::Conversation => parent_model,
+            Self::Subagents { model, .. } => model.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
 pub enum ModalState {
     None,
     RoutingSettings(RoutingDraft),
     RoutingProbeConfirm(RoutingDraft),
     ModelSelector {
+        target: ModelSelectorTarget,
         models: Vec<ModelInfo>,
         filtered: Vec<ModelInfo>,
         selected_idx: usize,
@@ -737,6 +748,51 @@ pub enum ModalState {
         sessions: Vec<RecentSessionSummary>,
         selected_idx: usize,
     },
+}
+
+impl ModalState {
+    fn model_selector(
+        models: Vec<ModelInfo>,
+        parent_model: &str,
+        target: ModelSelectorTarget,
+    ) -> Self {
+        let current = target.current_model(parent_model);
+        let selected_idx = models
+            .iter()
+            .position(|m| m.id == current || format!("{}/{}", m.provider, m.id) == current)
+            .map(|index| index + target.model_offset())
+            .unwrap_or(0);
+        let mut provider_tabs = vec!["All".to_string()];
+        for model in &models {
+            if !provider_tabs
+                .iter()
+                .any(|tab| tab.eq_ignore_ascii_case(&model.provider))
+            {
+                provider_tabs.push(model.provider.clone());
+            }
+        }
+        Self::ModelSelector {
+            target,
+            filtered: models.clone(),
+            models,
+            selected_idx,
+            filter: String::new(),
+            provider_tabs,
+            active_tab_idx: 0,
+        }
+    }
+
+    fn subagent_model_selector(models: Vec<ModelInfo>, path: std::path::PathBuf) -> Result<Self> {
+        let settings = SubagentSettings::load_from(&path)?;
+        Ok(Self::model_selector(
+            models,
+            "",
+            ModelSelectorTarget::Subagents {
+                path,
+                model: settings.model,
+            },
+        ))
+    }
 }
 
 pub struct App {
@@ -998,6 +1054,49 @@ fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
 }
 
 impl App {
+    fn confirm_model_selection(&mut self) -> Result<()> {
+        let ModalState::ModelSelector {
+            target,
+            filtered,
+            selected_idx,
+            ..
+        } = &self.modal
+        else {
+            return Ok(());
+        };
+        let selected = selected_idx
+            .checked_sub(target.model_offset())
+            .and_then(|index| filtered.get(index))
+            .map(|model| format!("{}/{}", model.provider, model.id));
+        if selected.is_none() && (*selected_idx != 0 || target.model_offset() == 0) {
+            self.modal = ModalState::None;
+            return Ok(());
+        }
+        match target {
+            ModelSelectorTarget::Conversation => {
+                let new_model = selected.expect("conversation model selection");
+                persist_last_used_model(&new_model);
+                self.messages.push(ChatMessage::ui_notice(format!(
+                    "Switched model to '{new_model}'"
+                )));
+                self.model = new_model;
+                self.session_id = dume_provider::types::StreamRequestContext::new().session_id;
+            }
+            ModelSelectorTarget::Subagents { path, .. } => {
+                SubagentSettings {
+                    model: selected.clone(),
+                }
+                .save_to(path)?;
+                self.messages.push(ChatMessage::ui_notice(match selected {
+                    Some(model) => format!("Subagent model set to {model}."),
+                    None => "Subagents now inherit the parent model.".into(),
+                }));
+            }
+        }
+        self.modal = ModalState::None;
+        Ok(())
+    }
+
     fn begin_run(&mut self, run_id: String) {
         self.current_run_id = Some(run_id);
         self.last_routing_decision = None;
@@ -1064,6 +1163,15 @@ impl App {
 
         let mut items = Vec::new();
 
+        for skill in self.skills.list() {
+            if query.is_empty() || skill.name.to_lowercase().starts_with(&query) {
+                items.push(AutocompleteItem {
+                    name: format!("/{}", skill.name),
+                    description: skill.description.clone(),
+                });
+            }
+        }
+
         // Built-in commands
         let builtins = [
             ("/routing", "라우팅 설정 열기"),
@@ -1073,7 +1181,7 @@ impl App {
             ),
             ("/resume", "Resume a previous conversation session"),
             ("/run", "Explicitly resume a paused durable run"),
-            ("/subagents", "Show or set the model used by subagents"),
+            ("/subagents", "Select the model used by subagents"),
             (
                 "/login",
                 "Save provider API key (e.g. /login anthropic <key>)",
@@ -1108,17 +1216,7 @@ impl App {
             }
         }
 
-        // Skills from registry
-        for skill in self.skills.list() {
-            let slash_name = format!("/{}", skill.name);
-            if query.is_empty() || skill.name.to_lowercase().starts_with(&query) {
-                items.push(AutocompleteItem {
-                    name: slash_name,
-                    description: skill.description.clone(),
-                });
-            }
-        }
-
+        items.sort_by_key(|item| item.name != "/model");
         items
     }
 
@@ -1576,6 +1674,7 @@ impl App {
                         "Model catalog updated ({count} models)."
                     )));
                     if let ModalState::ModelSelector {
+                        target,
                         models,
                         filtered,
                         selected_idx,
@@ -1584,8 +1683,8 @@ impl App {
                         active_tab_idx,
                     } = &mut self.modal
                     {
-                        let selected = filtered
-                            .get(*selected_idx)
+                        let selected = selected_idx.checked_sub(target.model_offset())
+                            .and_then(|index| filtered.get(index))
                             .map(|m| (m.provider.clone(), m.id.clone()));
                         let active_provider = provider_tabs
                             .get(*active_tab_idx)
@@ -1620,6 +1719,7 @@ impl App {
                                 filtered
                                     .iter()
                                     .position(|m| m.provider == provider && m.id == id)
+                                    .map(|index| index + target.model_offset())
                             })
                             .unwrap_or(0);
                     }
@@ -2100,6 +2200,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     render_routing_probe_confirm_modal(f, f.area(), draft.probe_confirmation, &app.theme);
                 }
                 ModalState::ModelSelector {
+                    target,
                     filtered,
                     selected_idx,
                     filter,
@@ -2117,6 +2218,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         *active_tab_idx,
                         app.thinking,
                         &app.model,
+                        target,
                         &app.theme,
                     );
                 }
@@ -2276,6 +2378,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
                                 ModalState::ModelSelector {
+                                    target,
                                     models,
                                     filtered,
                                     selected_idx,
@@ -2288,7 +2391,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             app.modal = ModalState::None;
                                         }
                                         crossterm::event::KeyCode::Tab => {
-                                            app.thinking = app.thinking.next();
+                                            if matches!(target, ModelSelectorTarget::Conversation) {
+                                                app.thinking = app.thinking.next();
+                                            }
                                         }
                                         crossterm::event::KeyCode::Left => {
                                             if !provider_tabs.is_empty() {
@@ -2333,17 +2438,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
                                         crossterm::event::KeyCode::Up => {
-                                            if !filtered.is_empty() {
+                                            let count = filtered.len() + target.model_offset();
+                                            if count > 0 {
                                                 if *selected_idx == 0 {
-                                                    *selected_idx = filtered.len() - 1;
+                                                    *selected_idx = count - 1;
                                                 } else {
                                                     *selected_idx -= 1;
                                                 }
                                             }
                                         }
                                         crossterm::event::KeyCode::Down => {
-                                            if !filtered.is_empty() {
-                                                if *selected_idx + 1 >= filtered.len() {
+                                            let count = filtered.len() + target.model_offset();
+                                            if count > 0 {
+                                                if *selected_idx + 1 >= count {
                                                     *selected_idx = 0;
                                                 } else {
                                                     *selected_idx += 1;
@@ -2351,14 +2458,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
                                         crossterm::event::KeyCode::Enter => {
-                                            if let Some(selected) = filtered.get(*selected_idx) {
-                                                let new_model = format!("{}/{}", selected.provider, selected.id);
-                                                persist_last_used_model(&new_model);
-                                                app.messages.push(ChatMessage::ui_notice(format!("Switched model to '{}'", new_model)));
-                                                app.model = new_model;
-                                                app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
+                                            if let Err(error) = app.confirm_model_selection() {
+                                                app.messages.push(ChatMessage::ui_notice(format!("Subagent settings error: {error:#}")));
                                             }
-                                            app.modal = ModalState::None;
                                         }
                                         crossterm::event::KeyCode::Backspace => {
                                             filter.pop();
@@ -3230,24 +3332,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 continue;
                                             }
 
-                                            // Build provider tabs
-                                            let mut provider_tabs = vec!["All".to_string()];
-                                            for m in &models {
-                                                if !provider_tabs.iter().any(|t| t.eq_ignore_ascii_case(&m.provider)) {
-                                                    provider_tabs.push(m.provider.clone());
-                                                }
-                                            }
-
-                                            let current = app.model.clone();
-                                            let initial_idx = models.iter().position(|m| m.id == current || format!("{}/{}", m.provider, m.id) == current).unwrap_or(0);
-                                            app.modal = ModalState::ModelSelector {
-                                                filtered: models.clone(),
-                                                models,
-                                                selected_idx: initial_idx,
-                                                filter: String::new(),
-                                                provider_tabs,
-                                                active_tab_idx: 0,
-                                            };
+                                            app.modal = ModalState::model_selector(models, &app.model, ModelSelectorTarget::Conversation);
                                             continue;
                                         } else if trimmed.starts_with("/model ") {
                                             let new_model = trimmed[7..].trim().to_string();
@@ -3256,9 +3341,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             app.model = new_model;
                                             app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             continue;
-                                        } else if trimmed == "/subagents" || trimmed.starts_with("/subagents ") {
+                                        } else if trimmed == "/subagents" {
+                                            match SubagentSettings::path().and_then(|path| ModalState::subagent_model_selector(selectable_models(), path)) {
+                                                Ok(modal) => app.modal = modal,
+                                                Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Subagent settings error: {error:#}"))),
+                                            }
+                                            continue;
+                                        } else if trimmed.starts_with("/subagents ") {
                                             let result = SubagentSettings::path()
-                                                .and_then(|path| subagent_command(trimmed, &app.model, &path));
+                                                .and_then(|path| subagent_command(trimmed, &path));
                                             let message = match result {
                                                 Ok(message) => message,
                                                 Err(error) => format!("Subagent settings error: {error:#}"),
@@ -3456,7 +3547,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let skills = app.skills.list();
                                             let mut text = String::from("Available Skills:\n");
                                             if skills.is_empty() {
-                                                text.push_str("  (No skills found in .dume/skills or ~/.dume/skills)\n");
+                                                text.push_str("  (No skills available)\n");
                                             } else {
                                                 for skill in skills {
                                                     text.push_str(&format!("  /{:<18} - {}\n", skill.name, skill.description));
@@ -3510,7 +3601,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         } else if trimmed == "/help" {
                                             app.skills.reload();
                                             let mut help = String::from(
-                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /resume [all|<id>]        - Resume a previous conversation session\n  /run resume [run-id]      - Explicitly resume a paused run in this conversation\n  /queue resume <input-id> - Reactivate a paused queued input\n  /subagents                - Show or set the model used by subagents\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
+                                                "DUM-E Commands:\n  /model <provider/model>    - Switch model (e.g. anthropic/claude-sonnet-4-5, openai/gpt-4o)\n  /resume [all|<id>]        - Resume a previous conversation session\n  /run resume [run-id]      - Explicitly resume a paused run in this conversation\n  /queue resume <input-id> - Reactivate a paused queued input\n  /subagents                - Open the subagent model selector\n  /subagents model <model|inherit> - Set subagent model\n  /login <provider> <key>    - Save API key directly in TUI\n  /logout <provider>         - Clear saved credentials\n  /update                    - Check and install latest version in-place\n  /clear                     - Clear conversation transcript\n  /skills                    - List available skills\n  /help                      - Show this help\n\nShortcuts:\n  Ctrl+C / Ctrl+D - Exit\n  Ctrl+L          - Clear screen\n  PageUp/Down     - Scroll transcript\n  Mouse Wheel     - Scroll up/down\n"
                                             );
                                             let skills = app.skills.list();
                                             if !skills.is_empty() {
@@ -3689,10 +3780,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                         }
-                                        ModalState::ModelSelector { filtered, selected_idx, .. } => {
-                                            if !filtered.is_empty() {
+                                        ModalState::ModelSelector { target, filtered, selected_idx, .. } => {
+                                            let count = filtered.len() + target.model_offset();
+                                            if count > 0 {
                                                 if *selected_idx == 0 {
-                                                    *selected_idx = filtered.len() - 1;
+                                                    *selected_idx = count - 1;
                                                 } else {
                                                     *selected_idx -= 1;
                                                 }
@@ -3731,9 +3823,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                         }
-                                        ModalState::ModelSelector { filtered, selected_idx, .. } => {
-                                            if !filtered.is_empty() {
-                                                if *selected_idx + 1 >= filtered.len() {
+                                        ModalState::ModelSelector { target, filtered, selected_idx, .. } => {
+                                            let count = filtered.len() + target.model_offset();
+                                            if count > 0 {
+                                                if *selected_idx + 1 >= count {
                                                     *selected_idx = 0;
                                                 } else {
                                                     *selected_idx += 1;
@@ -5512,27 +5605,82 @@ mod tests {
     }
 
     #[test]
+    fn subagent_picker_saves_and_reopens_without_changing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent/subagents.json");
+        let models = vec![dume_provider::resolve_model("openai/gpt-5.4").unwrap()];
+        let mut app = App::new("parent/model");
+        app.thinking = ThinkingLevel::High;
+        let session_id = app.session_id.clone();
+        app.modal = ModalState::subagent_model_selector(models.clone(), path.clone()).unwrap();
+        let ModalState::ModelSelector { selected_idx, .. } = &mut app.modal else {
+            panic!("expected model picker");
+        };
+        assert_eq!(*selected_idx, 0);
+        *selected_idx = 1;
+        app.confirm_model_selection().unwrap();
+        assert!(matches!(app.modal, ModalState::None));
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+        assert_eq!(app.model, "parent/model");
+        assert_eq!(app.session_id, session_id);
+        assert_eq!(app.thinking, ThinkingLevel::High);
+
+        app.modal = ModalState::subagent_model_selector(models, path.clone()).unwrap();
+        let ModalState::ModelSelector { selected_idx, .. } = &app.modal else {
+            panic!("expected model picker");
+        };
+        assert_eq!(*selected_idx, 1);
+        app.modal = ModalState::None;
+        assert_eq!(
+            SubagentSettings::load_from(&path).unwrap().model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
+
+        app.modal = ModalState::subagent_model_selector(Vec::new(), path.clone()).unwrap();
+        app.confirm_model_selection().unwrap();
+        assert!(SubagentSettings::load_from(&path).unwrap().model.is_none());
+        assert_eq!(app.model, "parent/model");
+        assert_eq!(app.session_id, session_id);
+    }
+
+    #[test]
+    fn subagent_picker_preserves_settings_and_stays_open_on_save_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.json");
+        let original = b"{\"model\":\"openai/gpt-5.4\"}";
+        std::fs::write(&path, original).unwrap();
+        let mut app = App::new("parent/model");
+        app.modal = ModalState::subagent_model_selector(Vec::new(), path.clone()).unwrap();
+        std::fs::create_dir(path.with_extension(format!("tmp-{}", std::process::id()))).unwrap();
+        assert!(app.confirm_model_selection().is_err());
+        assert!(matches!(app.modal, ModalState::ModelSelector { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        std::fs::write(&path, b"invalid JSON").unwrap();
+        assert!(ModalState::subagent_model_selector(Vec::new(), path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid JSON");
+    }
+
+    #[test]
     fn subagent_command_persists_model_and_rejects_invalid_selection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subagents.json");
-        assert!(
-            subagent_command("/subagents", "parent/model", &path)
-                .unwrap()
-                .contains("parent/model (inherited)")
-        );
 
-        subagent_command("/subagents model openai/gpt-5.4", "parent/model", &path).unwrap();
+        subagent_command("/subagents model openai/gpt-5.4", &path).unwrap();
         assert_eq!(
             SubagentSettings::load_from(&path).unwrap().model.as_deref(),
             Some("openai/gpt-5.4")
         );
-        assert!(subagent_command("/subagents model no-such-model", "parent/model", &path).is_err());
+        assert!(subagent_command("/subagents model no-such-model", &path).is_err());
         assert_eq!(
             SubagentSettings::load_from(&path).unwrap().model.as_deref(),
             Some("openai/gpt-5.4")
         );
 
-        subagent_command("/subagents model inherit", "parent/model", &path).unwrap();
+        subagent_command("/subagents model inherit", &path).unwrap();
         assert!(SubagentSettings::load_from(&path).unwrap().model.is_none());
     }
 

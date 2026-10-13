@@ -1,9 +1,9 @@
 ---
-name: ultragoal
+name: goal
 description: Autonomous plan-to-DAG execution workflow with checkpointed worktree verification.
 ---
 
-# UltraGoal Autonomous Execution Workflow
+# Goal Autonomous Execution Workflow
 
 Converts approved implementation plans into verified Task DAGs and coordinates execution through completion.
 

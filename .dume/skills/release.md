@@ -18,7 +18,7 @@ The product release pipeline is native Rust. Do not use the retained TypeScript 
 
 ## Publish
 
-After explicit approval, commit the reviewed changes including `Cargo.lock`, create the matching `v<workspace.version>` tag, and push it. `.github/workflows/release.yml` is the sole tag publisher. It validates the tag/version, calls the reusable native build workflow, and tests six native platform/architecture combinations before publishing checksummed archives.
+After explicit approval, commit the reviewed changes including `Cargo.lock`, create the matching `v<workspace.version>` tag, and push it. `.github/workflows/release.yml` is the sole tag publisher. It validates macOS ARM64 and Ubuntu x64 before changing the version or tag, then calls the reusable native build workflow for those two platforms before publishing checksummed archives. Dev and pull request CI validate macOS ARM64 only. Windows, Intel macOS, and Linux ARM64 release builds are disabled.
 
 No npm publishing or announcement service is part of native distribution. Do not claim hosted runner success from local tests alone.
 

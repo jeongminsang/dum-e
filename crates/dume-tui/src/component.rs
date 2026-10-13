@@ -615,7 +615,7 @@ pub fn render_autocomplete_dropdown(
         return;
     }
 
-    let item_height = items.len().min(6) as u16;
+    let item_height = items.len().min(7) as u16;
     let popup_height = item_height + 2;
     let popup_width = input_area.width.min(70);
 
@@ -875,8 +875,12 @@ pub fn render_model_selector_modal(
     active_tab_idx: usize,
     thinking: ThinkingLevel,
     current_model: &str,
+    target: &crate::app::ModelSelectorTarget,
     theme: &Theme,
 ) {
+    let model_offset = target.model_offset();
+    let parent_model = current_model;
+    let current_model = target.current_model(parent_model);
     let width = (area.width.saturating_sub(8)).min(94).max(40);
     let height = (area.height.saturating_sub(4)).min(26).max(14);
     let x = (area.width.saturating_sub(width)) / 2;
@@ -888,7 +892,11 @@ pub fn render_model_selector_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(" Select LLM Model (Tab: Thinking, Left/Right: Provider Tab, ↑/↓: Navigate, Esc: Cancel) ");
+        .title(if model_offset == 0 {
+            " Select LLM Model (Tab: Thinking, Left/Right: Provider Tab, ↑/↓: Navigate, Esc: Cancel) "
+        } else {
+            " Select Subagent Model (Left/Right: Provider Tab, ↑/↓: Navigate, Enter: Select, Esc: Cancel) "
+        });
 
     let inner = modal_area.inner(ratatui::layout::Margin {
         vertical: 1,
@@ -950,7 +958,11 @@ pub fn render_model_selector_modal(
                 .add_modifier(Modifier::RAPID_BLINK),
         ),
         Span::styled(
-            format!("   [ Tab: Thinking Level = {} ]", thinking.label()),
+            if model_offset == 0 {
+                format!("   [ Tab: Thinking Level = {} ]", thinking.label())
+            } else {
+                format!("   Parent: {parent_model}")
+            },
             thinking_style,
         ),
     ]);
@@ -969,6 +981,26 @@ pub fn render_model_selector_modal(
     };
 
     let mut lines = Vec::new();
+    if model_offset > 0 && scroll_offset == 0 {
+        let selected = selected_idx == 0;
+        let prefix = if selected { "▶ " } else { "  " };
+        let tag = if current_model.is_empty() {
+            " (current)"
+        } else {
+            ""
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}Inherit parent model{tag}"),
+            if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.status_bar_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.foreground)
+            },
+        )));
+    }
     if models.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No authenticated models match the current filter or provider.",
@@ -980,10 +1012,10 @@ pub fn render_model_selector_modal(
         for (i, m) in models
             .iter()
             .enumerate()
-            .skip(scroll_offset)
-            .take(max_visible)
+            .skip(scroll_offset.saturating_sub(model_offset))
+            .take(max_visible.saturating_sub(lines.len()))
         {
-            let is_selected = i == selected_idx;
+            let is_selected = i + model_offset == selected_idx;
             let is_current =
                 m.id == current_model || format!("{}/{}", m.provider, m.id) == current_model;
 
@@ -1017,7 +1049,7 @@ pub fn render_model_selector_modal(
                 Line::from(vec![
                     Span::styled(prefix, name_style),
                     Span::styled(format!("{:<15}", m.provider), prov_style),
-                    Span::styled(format!("{:<32}", m.id), name_style),
+                    Span::styled(m.id.as_str(), name_style),
                     Span::styled(reasoning_badge, Style::default().fg(theme.accent)),
                     Span::styled(tag, Style::default().fg(theme.assistant_msg)),
                 ])
@@ -1799,6 +1831,76 @@ mod status_bar_tests {
                 row
             })
             .collect()
+    }
+
+    #[test]
+    fn subagent_model_picker_renders_inheritance_current_model_and_scrolled_selection() {
+        let base = dume_provider::resolve_model("openai/gpt-5.4").unwrap();
+        let models: Vec<_> = (0..24)
+            .map(|index| {
+                let mut model = base.clone();
+                model.id = format!("child-{index}");
+                model
+            })
+            .collect();
+        for (width, height) in [(60, 18), (100, 30)] {
+            for selected_idx in [0, 1, 24] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let target = crate::app::ModelSelectorTarget::Subagents {
+                    path: std::path::PathBuf::new(),
+                    model: if selected_idx == 0 {
+                        None
+                    } else {
+                        Some("openai/child-0".into())
+                    },
+                };
+                terminal
+                    .draw(|frame| {
+                        render_model_selector_modal(
+                            frame,
+                            frame.area(),
+                            &models,
+                            selected_idx,
+                            "",
+                            &["All".into(), "openai".into()],
+                            0,
+                            ThinkingLevel::Off,
+                            "parent/model",
+                            &target,
+                            &Theme::default(),
+                        );
+                    })
+                    .unwrap();
+                let output = rendered_rows(&terminal).join("\n");
+                assert!(output.contains("Select Subagent Model"), "{output}");
+                assert!(!output.contains("Tab: Thinking"), "{output}");
+                if selected_idx == 0 {
+                    assert!(
+                        output.contains("▶ Inherit parent model (current)"),
+                        "{output}"
+                    );
+                } else if selected_idx == 1 {
+                    assert!(output.contains("Inherit parent model"), "{output}");
+                    assert!(
+                        !output.contains("Inherit parent model (current)"),
+                        "{output}"
+                    );
+                    assert!(
+                        output.lines().any(|line| line.contains('▶')
+                            && line.contains("child-0")
+                            && line.contains("(current)")),
+                        "{output}"
+                    );
+                } else {
+                    assert!(
+                        output
+                            .lines()
+                            .any(|line| line.contains('▶') && line.contains("child-23")),
+                        "{output}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
