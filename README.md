@@ -154,14 +154,15 @@ cargo test --workspace --locked --offline
 
 ## Native Runtime Behavior
 
-### 선택적 Jev 모델 라우팅
+### Optional Jev Model Routing
 
-라우팅은 기본적으로 꺼져 있습니다. `/routing` 또는 기본 단축키 Ctrl+R로
-설정을 열고 분류 서버와 표준 계획·복잡한 계획·구현 모델을 지정합니다.
-단축키는 `~/.dume/agent/keybindings.json`의 `OpenRoutingSettings` 동작으로
-재지정할 수 있습니다. TUI와 자율 워커는 같은 Rust 정책을 사용합니다.
-설정은 전역 `~/.dume/agent/routing.json`에만 저장하며 프로젝트 설정은
-읽지 않습니다. 다음은 모든 역할이 현재 선택 모델을 상속하는 설정입니다.
+Routing is disabled by default. Open the settings with `/routing` or the default
+Ctrl+R shortcut to configure the classifier server and models for standard
+planning, complex planning, and implementation. You can rebind the shortcut through
+the `OpenRoutingSettings` action in `~/.dume/agent/keybindings.json`. The TUI and
+autonomous workers share the same Rust routing policy. Settings are stored only in
+the global `~/.dume/agent/routing.json`; project settings are not read. The following
+configuration makes every role inherit the currently selected model:
 
 ```json
 {
@@ -176,48 +177,55 @@ cargo test --workspace --locked --offline
 }
 ```
 
-분류 설정에는 `backend` (`opencode` 또는 `local_system_one`), `base_url`,
-`model`을 사용합니다. API 기준주소 뒤에 `systemone` 경로를 붙입니다.
-예를 들어 로컬 기준주소 `http://127.0.0.1:8080/v1`은
-`/v1/systemone`으로 요청합니다. 서버와 모델 ID는 직접 지정해야 합니다.
-로컬 서버는 네이티브 System One 결정 모델을 제공해야 합니다.
-일반 채팅 모델의 다음 토큰 확률을 이용하는 분류는 지원하지 않습니다.
-llama.cpp에서 결정 모델을 인식하는 기준은 0.6.0 이상과
-`architecture.output_modalities`의 `decisions`입니다. 이는 배포 중인
-서버와의 실제 호환성을 검증했다는 뜻은 아닙니다.
+Classifier settings use `backend` (`opencode` or `local_system_one`), `base_url`,
+and `model`. The `systemone` path is appended to the API base URL. For example,
+the local base URL `http://127.0.0.1:8080/v1` sends requests to `/v1/systemone`.
+You must specify the server and model ID yourself. A local server must provide a
+native System One decision model. Classification using next-token probabilities
+from a regular chat model is not supported. Decision model recognition in
+llama.cpp requires version 0.6.0 or later and `decisions` in
+`architecture.output_modalities`. These requirements do not establish verified
+compatibility with a deployed server.
 
-꺼져 있거나 미설정이거나 세 역할이 모두 현재 모델을 상속하면 분류 요청은
-없습니다. 활성화한 경우 대화·공개 설정·기준 모델로 정한 epoch에서 한 번
-분류하고, 복잡도 확률이 0.5 이상이면 복잡한 계획 모델을 사용합니다.
-분류 입력은 최신 사용자 요청을 UTF-8 손상 없이 최대 16,000문자로 자릅니다.
-분류는 5초 제한의 단일 시도이며 자동 재시도하지 않습니다.
-성공한 `write_file` 또는 `replace_file_content`의 영속 기록 뒤 **다음**
-생성 요청부터 구현 모델을 사용합니다. 실패·읽기·불확실한 도구 결과는
-단계를 바꾸지 않습니다. 압축과 공급자 캐시 ID 변경도 대화 단계를
-초기화하지 않습니다.
+No classification request is sent when routing is disabled, unconfigured, or all
+three roles inherit the current model. When enabled, classification runs once per
+epoch, identified by the conversation, public settings, and baseline model. A
+complexity probability of at least 0.5 selects the complex planning model. The
+classifier input is the latest user request, truncated to at most 16,000 characters
+without breaking UTF-8. Classification makes a single attempt with a five-second
+timeout and no automatic retries. After a successful `write_file` or
+`replace_file_content` result is durably recorded, the implementation model is used
+starting with the **next** generation request. Failed operations, reads, and
+uncertain tool results do not advance the phase. Compaction and changes to provider
+cache IDs do not reset the conversation phase.
 
-분류 실패나 미완료 분류는 해당 epoch에서 원래 선택 모델을 유지합니다.
-나중에 키를 고치거나 파일 쓰기에 성공해도 같은 epoch의 실패를 다시
-분류하지 않습니다. 공개 설정이나 기준 모델 변경은 다음 안전하게 수락한
-사용자 입력부터 적용하고, 진행 중인 요청·도구 재생의 설정은 유지합니다.
-생성 오류는 기존 재시도·오류 경로를 사용하며 다른 모델로 재실행하지
-않습니다. 취소 후에는 대체 생성 요청을 보내지 않습니다. 명시적 하위
-에이전트 모델은 우선하고, 상속은 부모의 실제 요청 모델을 사용합니다.
-하위 에이전트는 부모의 단계를 변경하거나 자동으로 다시 분류하지 않습니다.
+Failed or incomplete classification keeps the originally selected model for that
+epoch. Fixing a key or successfully writing a file later does not retry failed
+classification within the same epoch. Changes to public settings or the baseline
+model take effect with the next safely accepted user input; requests in progress
+and tool replay retain their existing settings. Generation errors use the existing
+retry and error handling paths without rerunning the request on another model.
+Cancellation does not send an alternative generation request. An explicitly
+selected subagent model takes precedence; inherited models use the parent's actual
+request model. Subagents do not change the parent's phase or automatically
+reclassify.
 
-분류 키는 공개 설정에 넣지 않고 기존 `~/.dume/agent/auth.json`에 따로
-저장합니다. OpenCode Zen은 기존 `opencode` 로그인 키를 공유하며
-`OPENCODE_API_KEY`가 저장 키보다 우선합니다. 로컬 분류 키는
-`jev-local-system-one`으로 분리합니다. 저장 키 삭제는 환경변수를
-제거하지 않습니다. 공개 설정과 키 저장·삭제는 독립 작업으로, 두 파일의
-동시 원자적 저장을 보장하지 않습니다. 인증 JSON은 권한으로 보호되지만
-암호화된 비밀 저장소는 아닙니다.
+Classifier keys are stored separately in the existing `~/.dume/agent/auth.json`,
+not in public settings. OpenCode Zen shares the existing `opencode` login key, and
+`OPENCODE_API_KEY` takes precedence over the stored key. Local classifier keys use
+the separate `jev-local-system-one` entry. Deleting a stored key does not remove
+environment variables. Saving public settings and saving or deleting keys are
+independent operations; atomic updates across both files are not guaranteed.
+The authentication JSON is protected by file permissions but is not an encrypted
+secret store.
 
-설정 저장은 분류 서버에 연결하지 않습니다. 연결 확인은 외부 전송·비용
-경고를 확인한 뒤 명시적으로 실행하며 민감하지 않은 고정 문구만 보냅니다.
-활성 분류는 사용자 요청을 설정한 서버로 전송하고 비용이 발생할 수
-있습니다. 분류 토큰과 생성 사용량은 구분하며, 분류 가격이 없으면
-미확인으로 표시합니다. 비용 절감·품질·속도 향상은 측정하지 않았습니다.
+Saving settings does not connect to the classifier server. A connection check must
+be explicitly requested after acknowledging the warning about external data
+transmission and costs; it sends only a fixed, non-sensitive phrase. Active
+classification sends user requests to the configured server and may incur costs.
+Classifier token usage is tracked separately from generation usage, and costs are
+marked as unknown when classifier pricing is unavailable. Cost savings, quality
+improvements, and speed improvements have not been measured.
 
 ### MCP servers
 
@@ -325,10 +333,6 @@ Python at runtime.
 ---
 
 ## Architecture
-
-<p align="center">
-  <img src="assets/dume_banner.jpg" alt="DUM-E Autonomous Multi-Agent Harness Architecture" width="100%" />
-</p>
 
 ```mermaid
 flowchart TD
