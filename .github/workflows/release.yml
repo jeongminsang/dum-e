@@ -17,9 +17,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Step 1: Run complete CI test suite on main before anything else
+  # Step 1: Validate macOS ARM64 and Linux x64 before changing the version or tag
   ci-check:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin-arm64
+          - runner: ubuntu-24.04
+            platform: linux-x64
     permissions:
       contents: read
     steps:
@@ -43,18 +51,17 @@ jobs:
             workspace-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-${{ hashFiles('Cargo.lock') }}-
             workspace-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-
       - name: Fetch locked dependencies
-        run: cargo fetch --locked
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo fetch --locked --target "$host"
       - name: Check native workspace
         run: cargo check --workspace --locked --offline
-      - name: Test native workspace
-        run: cargo test --workspace --locked --offline
-      - name: Build native product
-        run: cargo build --release -p dume-cli --bin dume --locked --offline
-      - name: Smoke native product outside checkout
+      - name: Test, build, and smoke native archive
+        env:
+          NATIVE_PLATFORM: ${{ matrix.platform }}
         run: |
-          cd "${RUNNER_TEMP}"
-          "${GITHUB_WORKSPACE}/target/release/dume" --help
-          "${GITHUB_WORKSPACE}/target/release/dume" --version
+          bash scripts/build-binaries.sh --offline \
+            --platform "$NATIVE_PLATFORM" --out "$RUNNER_TEMP/dume-native-ci"
 
   # Step 2: Validate or bump version, create git tag, and generate concise changelog notes
   prepare-release:
@@ -133,7 +140,7 @@ jobs:
           name: release-notes
           path: ${{ steps.release_step.outputs.notes_file }}
 
-  # Step 3: Build 6 platform binary archives from the tagged commit
+  # Step 3: Build macOS and Linux binary archives from the tagged commit
   build:
     needs: prepare-release
     permissions:
@@ -171,11 +178,11 @@ jobs:
           python3 - <<'PY'
           import hashlib, os
           from pathlib import Path, PurePosixPath
-          import tarfile, zipfile
+          import tarfile
           root = Path('release-assets')
           version = os.environ['RELEASE_TAG'][1:]
-          binaries = ['dume-' + p + ('.zip' if p.startswith('windows-') else '.tar.gz')
-                      for p in ('darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'windows-arm64', 'windows-x64')]
+          binaries = ['dume-' + p + '.tar.gz'
+                      for p in ('darwin-arm64', 'linux-x64')]
           source = f'dume-{version}-source.tar.gz'
           archives = sorted([source, *binaries])
           checksums = ['source.sha256', *[name + '.sha256' for name in binaries]]
@@ -197,17 +204,11 @@ jobs:
               with (root / name).open('rb') as handle:
                   if hashlib.file_digest(handle, 'sha256').hexdigest() != expected[name]:
                       raise SystemExit(f'Checksum mismatch: {name}')
-              if name.endswith('.zip'):
-                  with zipfile.ZipFile(root / name) as handle:
-                      names = handle.namelist()
-                      if handle.testzip() is not None:
-                          raise SystemExit(f'Corrupt zip: {name}')
-              else:
-                  with tarfile.open(root / name) as handle:
-                      members = handle.getmembers()
-                      if any(not (m.isfile() or m.isdir()) for m in members):
-                          raise SystemExit(f'Non-regular archive entry: {name}')
-                      names = [m.name for m in members]
+              with tarfile.open(root / name) as handle:
+                  members = handle.getmembers()
+                  if any(not (m.isfile() or m.isdir()) for m in members):
+                      raise SystemExit(f'Non-regular archive entry: {name}')
+                  names = [m.name for m in members]
               prefix = f'dume-{version}' if name == source else 'dume'
               for entry in names:
                   parts = PurePosixPath(entry).parts
@@ -216,7 +217,7 @@ jobs:
               required = ([f'{prefix}/Cargo.toml', f'{prefix}/Cargo.lock',
                            f'{prefix}/crates/dume-cli/src/main.rs',
                            f'{prefix}/crates/dume-provider/tests/mock_http_fixtures.rs']
-                          if name == source else [f'{prefix}/dume.exe' if name.endswith('.zip') else f'{prefix}/dume'])
+                          if name == source else [f'{prefix}/dume'])
               required.append(f'{prefix}/LICENSE')
               if not set(required).issubset(names):
                   raise SystemExit(f'Incomplete archive: {name}')
