@@ -1064,6 +1064,15 @@ impl App {
 
         let mut items = Vec::new();
 
+        for skill in self.skills.list() {
+            if query.is_empty() || skill.name.to_lowercase().starts_with(&query) {
+                items.push(AutocompleteItem {
+                    name: format!("/{}", skill.name),
+                    description: skill.description.clone(),
+                });
+            }
+        }
+
         // Built-in commands
         let builtins = [
             ("/routing", "라우팅 설정 열기"),
@@ -1108,17 +1117,7 @@ impl App {
             }
         }
 
-        // Skills from registry
-        for skill in self.skills.list() {
-            let slash_name = format!("/{}", skill.name);
-            if query.is_empty() || skill.name.to_lowercase().starts_with(&query) {
-                items.push(AutocompleteItem {
-                    name: slash_name,
-                    description: skill.description.clone(),
-                });
-            }
-        }
-
+        items.sort_by_key(|item| item.name != "/model");
         items
     }
 
@@ -3456,7 +3455,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             let skills = app.skills.list();
                                             let mut text = String::from("Available Skills:\n");
                                             if skills.is_empty() {
-                                                text.push_str("  (No skills found in .dume/skills or ~/.dume/skills)\n");
+                                                text.push_str("  (No skills available)\n");
                                             } else {
                                                 for skill in skills {
                                                     text.push_str(&format!("  /{:<18} - {}\n", skill.name, skill.description));

@@ -57,6 +57,7 @@ def allowed(path):
     return (path in ('Cargo.toml', 'Cargo.lock', 'scripts/build-binaries.sh', 'scripts/create-source-archive.sh',
                     'scripts/install.sh', 'scripts/test-native-install.py')
             or parts[0] in ('crates', 'licenses')
+            or (parts[:2] == ('.dume', 'skills') and len(parts) == 3 and parts[2].endswith('.md'))
             or (len(parts) == 1 and parts[0].startswith(('LICENSE', 'NOTICE'))))
 
 files = {}
@@ -75,7 +76,7 @@ else:
     candidates = [root / path for path in (
         'Cargo.toml', 'Cargo.lock', 'scripts/build-binaries.sh', 'scripts/create-source-archive.sh',
         'scripts/install.sh', 'scripts/test-native-install.py')]
-    for pattern in ('crates/**/*', 'licenses/**/*', 'LICENSE*', 'NOTICE*'):
+    for pattern in ('crates/**/*', '.dume/skills/*.md', 'licenses/**/*', 'LICENSE*', 'NOTICE*'):
         candidates.extend(root.glob(pattern))
     for path in sorted(set(candidates)):
         relative = path.relative_to(root).as_posix()

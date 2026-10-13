@@ -615,7 +615,7 @@ pub fn render_autocomplete_dropdown(
         return;
     }
 
-    let item_height = items.len().min(6) as u16;
+    let item_height = items.len().min(7) as u16;
     let popup_height = item_height + 2;
     let popup_width = input_area.width.min(70);
 

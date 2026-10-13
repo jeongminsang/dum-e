@@ -79,6 +79,42 @@ mod tests {
     }
 
     #[test]
+    fn slash_autocomplete_shows_bundled_skills_on_the_first_page_outside_a_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new("test-model");
+        app.skills = dume_core::SkillRegistry::load_default_for(directory.path());
+        app.insert_char('/');
+        let items = app.get_autocomplete_items();
+        let first_page: Vec<_> = items.iter().take(7).map(|item| item.name.as_str()).collect();
+        assert_eq!(
+            first_page,
+            [
+                "/model",
+                "/add-llm-provider",
+                "/deep-interview",
+                "/goal",
+                "/interactive-testing",
+                "/ralplan",
+                "/release",
+            ]
+        );
+        assert!(items.iter().any(|item| item.name == "/model"));
+        assert!(items.iter().any(|item| item.name == "/skills"));
+
+        for (prefix, expected) in [
+            ("/m", "/model"),
+            ("/deep", "/deep-interview"),
+            ("/ral", "/ralplan"),
+            ("/go", "/goal"),
+        ] {
+            app.input_buffer = prefix.into();
+            let matches = app.get_autocomplete_items();
+            assert_eq!(matches.len(), 1, "{prefix}");
+            assert_eq!(matches[0].name, expected);
+        }
+    }
+
+    #[test]
     fn test_ctrl_c_safeguard_and_double_press() {
         let mut app = App::new("test-model");
         app.insert_char('a');

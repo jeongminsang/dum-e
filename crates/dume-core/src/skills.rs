@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const BUNDLED_SKILLS: &[(&str, &str)] = &[
+    (
+        "add-llm-provider.md",
+        include_str!("../../../.dume/skills/add-llm-provider.md"),
+    ),
+    (
+        "deep-interview.md",
+        include_str!("../../../.dume/skills/deep-interview.md"),
+    ),
+    (
+        "interactive-testing.md",
+        include_str!("../../../.dume/skills/interactive-testing.md"),
+    ),
+    ("ralplan.md", include_str!("../../../.dume/skills/ralplan.md")),
+    ("release.md", include_str!("../../../.dume/skills/release.md")),
+    (
+        "goal.md",
+        include_str!("../../../.dume/skills/goal.md"),
+    ),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
@@ -26,15 +47,20 @@ impl SkillRegistry {
         }
     }
 
-    /// Load skills from standard paths:
-    /// 1. `.dume/skills/*.md` in current directory or git root
-    /// 2. `~/.dume/skills/*.md` in home directory
+    /// Load bundled skills, then override them from the current directory's
+    /// `.dume/skills/*.md` and the home directory's `~/.dume/skills/*.md`.
     pub fn load_default() -> Self {
         Self::load_default_for(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
     pub fn load_default_for(worktree: &Path) -> Self {
         let mut registry = Self::new();
+        for (filename, content) in BUNDLED_SKILLS {
+            let mut skill = Self::parse_skill_content(content, Path::new(filename), 0);
+            // Bundled instructions have no on-disk file to reload.
+            skill.file_path = PathBuf::new();
+            registry.skills.insert(skill.name.clone(), skill);
+        }
 
         if let Ok(worktree_root) = std::fs::canonicalize(worktree) {
             let local_skills = worktree_root.join(".dume/skills");
@@ -105,26 +131,30 @@ impl SkillRegistry {
             ));
         }
         let raw = std::fs::read_to_string(path)?;
-        let (name, description, content) = parse_frontmatter(&raw, path);
         let mtime_nanos = std::fs::metadata(path)?
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        Ok(Self::parse_skill_content(&raw, path, mtime_nanos))
+    }
+
+    fn parse_skill_content(raw: &str, path: &Path, mtime_nanos: u128) -> Skill {
+        let (name, description, content) = parse_frontmatter(raw, path);
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let content_hash = hex::encode(hasher.finalize());
 
-        Ok(Skill {
+        Skill {
             name,
             description,
             content,
             file_path: path.to_path_buf(),
             content_hash,
             mtime_nanos,
-        })
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Skill> {
@@ -259,6 +289,51 @@ fn parse_frontmatter(raw: &str, path: &Path) -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_skills_are_available_outside_a_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = SkillRegistry::load_default_for(directory.path());
+        for (filename, content) in BUNDLED_SKILLS {
+            let (name, _, _) = parse_frontmatter(content, Path::new(filename));
+            let skill = registry.get(&name).unwrap();
+            assert!(!skill.description.is_empty(), "{name}");
+            assert!(!skill.content.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn bundled_catalog_covers_every_repository_skill() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dume/skills");
+        let mut repository = SkillRegistry::new();
+        repository.load_from_dir(&directory);
+        let bundled_names: std::collections::BTreeSet<_> = BUNDLED_SKILLS
+            .iter()
+            .map(|(filename, content)| parse_frontmatter(content, Path::new(filename)).0)
+            .collect();
+        let repository_names = repository.skills.keys().cloned().collect();
+        assert_eq!(bundled_names, repository_names);
+    }
+
+    #[test]
+    fn local_skills_override_bundled_instructions_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let skills = directory.path().join(".dume/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let file = skills.join("deep-interview.md");
+        std::fs::write(&file, "---\nname: deep-interview\n---\nLocal instructions").unwrap();
+        let mut registry = SkillRegistry::load_default_for(directory.path());
+        let local = registry.get("deep-interview").unwrap();
+        assert_eq!(local.content, "Local instructions");
+        assert_eq!(local.file_path, std::fs::canonicalize(&file).unwrap());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&file, "---\nname: deep-interview\n---\nUpdated instructions").unwrap();
+        assert_eq!(
+            registry.get_or_reload("deep-interview").unwrap().content,
+            "Updated instructions"
+        );
+    }
 
     #[test]
     fn test_parse_frontmatter_standard() {
