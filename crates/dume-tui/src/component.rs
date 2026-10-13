@@ -336,6 +336,13 @@ pub fn build_transcript_lines(
         is_user_logical_line.push(false);
     }
 
+    // The untrimmed paragraph wrapper renders whitespace-only lines as two rows.
+    for line in &mut lines {
+        if line.spans.iter().all(|span| span.content.trim().is_empty()) {
+            line.spans.clear();
+        }
+    }
+
     (lines, is_user_logical_line)
 }
 
@@ -1831,6 +1838,90 @@ mod status_bar_tests {
                 row
             })
             .collect()
+    }
+
+    #[test]
+    fn transcript_blank_lines_keep_message_positions_and_backgrounds_aligned() {
+        let messages = vec![
+            ChatMessage::user("first\n\n    \nlast"),
+            ChatMessage::assistant("ASSISTANT_REPLY\n\n    \nASSISTANT_END"),
+            ChatMessage::user("NEXT"),
+        ];
+        let theme = Theme::default();
+        for width in [32, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_transcript(
+                        frame,
+                        frame.area(),
+                        &messages,
+                        "stream\n\n    \nSTREAM_END",
+                        0,
+                        &[],
+                        &theme,
+                    );
+                })
+                .unwrap();
+            let rows = rendered_rows(&terminal);
+            assert_eq!(rows[4].trim(), "last", "{rows:?}");
+            assert_eq!(rows[7].trim(), "ASSISTANT_REPLY", "{rows:?}");
+            assert_eq!(rows[10].trim(), "ASSISTANT_END", "{rows:?}");
+            assert_eq!(rows[13].trim(), "NEXT", "{rows:?}");
+            assert_eq!(rows[19].trim(), "STREAM_END", "{rows:?}");
+            let buffer = terminal.backend().buffer();
+            for y in 0..24 {
+                let highlighted = matches!(y, 0..=5 | 12..=14);
+                for x in 0..width {
+                    assert_eq!(
+                        buffer[(x, y)].bg == theme.user_msg_bg,
+                        highlighted,
+                        "background at ({x}, {y}), rows: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_skill_workflows_do_not_push_followups_below_the_viewport() {
+        let workflow = include_str!("../../../.dume/skills/deep-interview.md");
+        let mut messages = Vec::new();
+        for turn in 0..3 {
+            messages.push(ChatMessage::user(format!("Request {turn}\n\n{workflow}")));
+            messages.push(ChatMessage::assistant(format!("Reply {turn}")));
+            messages.push(ChatMessage::user(format!("FOLLOWUP_{turn}")));
+        }
+        let theme = Theme::default();
+        let height = 18;
+        for width in [24, 80, 120] {
+            let total = calculate_transcript_height(width, &messages, "", 0);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_transcript(
+                        frame,
+                        frame.area(),
+                        &messages,
+                        "",
+                        total.saturating_sub(height),
+                        &[],
+                        &theme,
+                    );
+                })
+                .unwrap();
+            let rows = rendered_rows(&terminal);
+            assert_eq!(
+                rows[usize::from(height - 3)].trim(),
+                "FOLLOWUP_2",
+                "{rows:?}"
+            );
+            let buffer = terminal.backend().buffer();
+            for x in 0..width {
+                assert_eq!(buffer[(x, height - 3)].bg, theme.user_msg_bg);
+                assert_ne!(buffer[(x, height - 1)].bg, theme.user_msg_bg);
+            }
+        }
     }
 
     #[test]
