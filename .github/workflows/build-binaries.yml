@@ -87,17 +87,32 @@ jobs:
                   raise SystemExit('Source checksum mismatch')
           PY
           mkdir source
-          tar -xzf "source-assets/dume-${RELEASE_TAG#v}-source.tar.gz" -C source
+          tar -xzf "source-assets/dume-${RELEASE_TAG#v}-source.tar.gz" --strip-components=1 -C source
       - name: Install native Rust 1.96.0
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
+      - name: Cache native Rust dependencies and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/target
+          key: native-${{ matrix.platform }}-rust-1.96.0-${{ hashFiles('source/Cargo.lock') }}-${{ inputs.commit }}
+          restore-keys: |
+            native-${{ matrix.platform }}-rust-1.96.0-${{ hashFiles('source/Cargo.lock') }}-
+            native-${{ matrix.platform }}-rust-1.96.0-
+      - name: Fetch locked native dependencies
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo fetch --manifest-path source/Cargo.toml --locked --target "$host"
       - name: Test, build, and smoke extracted release archive
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          bash "source/dume-${RELEASE_TAG#v}/scripts/build-binaries.sh" \
+          bash source/scripts/build-binaries.sh --offline \
             --platform "$NATIVE_PLATFORM" --out "$GITHUB_WORKSPACE/release-assets"
       - name: Upload verified native archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

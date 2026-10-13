@@ -150,10 +150,10 @@ impl WorkerHost {
         };
 
         if result.is_err() {
-            if let Some(p) = pid {
+            if let Some(_pid) = pid {
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(-(p as libc::pid_t), libc::SIGTERM);
+                    libc::kill(-(_pid as libc::pid_t), libc::SIGTERM);
                 }
                 #[cfg(not(unix))]
                 {
@@ -165,7 +165,7 @@ impl WorkerHost {
                 {
                     #[cfg(unix)]
                     unsafe {
-                        libc::kill(-(p as libc::pid_t), libc::SIGKILL);
+                        libc::kill(-(_pid as libc::pid_t), libc::SIGKILL);
                     }
                     #[cfg(not(unix))]
                     {
@@ -176,7 +176,7 @@ impl WorkerHost {
                     // Reap descendants that inherited the worker's pipes as well.
                     #[cfg(unix)]
                     unsafe {
-                        libc::kill(-(p as libc::pid_t), libc::SIGKILL);
+                        libc::kill(-(_pid as libc::pid_t), libc::SIGKILL);
                     }
                 }
             } else {

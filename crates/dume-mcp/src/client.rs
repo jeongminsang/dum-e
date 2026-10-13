@@ -4,7 +4,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};

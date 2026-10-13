@@ -25,12 +25,25 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
+      - name: Cache Rust dependencies and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: workspace-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            workspace-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-${{ hashFiles('Cargo.lock') }}-
+            workspace-${{ runner.os }}-${{ runner.arch }}-rust-1.96.0-
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Check native workspace
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --locked --offline
       - name: Test native workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --offline
       - name: Build native product
-        run: cargo build --release -p dume-cli --bin dume --locked
+        run: cargo build --release -p dume-cli --bin dume --locked --offline
       - name: Smoke native product outside checkout
         run: |
           cd "${RUNNER_TEMP}"

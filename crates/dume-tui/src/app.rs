@@ -80,7 +80,6 @@ enum PersistEvent {
 }
 
 pub struct ConversationLock {
-    #[allow(dead_code)]
     file: std::fs::File,
     path: std::path::PathBuf,
 }
@@ -99,16 +98,15 @@ impl ConversationLock {
             .truncate(false)
             .open(&path)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
                 anyhow::bail!(
                     "Conversation '{}' is currently active in another session",
                     conversation_id
                 );
             }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
 
         Ok(Self { file, path })
@@ -117,11 +115,7 @@ impl ConversationLock {
 
 impl Drop for ConversationLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        let _ = self.file.unlock();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -3880,7 +3874,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
             }
-            _ = wait_for_signal(&mut sighup, &mut sigterm) => {
+            _ = async {
+                #[cfg(unix)]
+                wait_for_signal(&mut sighup, &mut sigterm).await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => {
                 let _ = persist_tx.send(PersistEvent::Status {
                     conv_id: app.conversation_id.clone(),
                     status: "interrupted".to_string(),
