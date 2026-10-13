@@ -1,0 +1,46 @@
+name: Verify Windows Tests
+
+on:
+  push:
+    branches: [fix/windows-ci-verification]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup default 1.96.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-verify-${{ matrix.runner }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: windows-verify-${{ matrix.runner }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Run all test targets
+        run: cargo test --workspace --locked --offline --no-fail-fast
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-verify-${{ matrix.runner }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
