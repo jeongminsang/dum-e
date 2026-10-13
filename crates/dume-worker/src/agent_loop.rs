@@ -1598,7 +1598,7 @@ async fn run_isolated_child(
         .with_context(|| format!("Subagent isolation failed at {}", child.display()))?;
     let base_commit = tokio::process::Command::new("git")
         .arg("-C")
-        .arg(child)
+        .arg(dume_git::worktree::git_path(child))
         .args(["rev-parse", "HEAD"])
         .output()
         .await
@@ -1640,7 +1640,7 @@ async fn run_isolated_child(
             };
             let changed_files = match tokio::process::Command::new("git")
                 .arg("-C")
-                .arg(child)
+                .arg(dume_git::worktree::git_path(child))
                 .args(["status", "--short"])
                 .output()
                 .await
@@ -4122,9 +4122,8 @@ mod tests {
 
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; 4096];
-                let _ = socket.read(&mut buf).await;
+                use tokio::io::AsyncWriteExt;
+                let _ = read_http_json(&mut socket).await;
 
                 // Always ask to run bash "echo looping"
                 let sse = format!(

@@ -1264,7 +1264,7 @@ async fn test_r5_process_boundary_crash_and_recovery() {
             description: "Test crash boundary".to_string(),
             status: TaskStatus::Ready,
             dependencies: vec![],
-            acceptance_criteria: vec!["true".to_string()],
+            acceptance_criteria: vec!["exit 0".to_string()],
             allowed_paths: None,
             target_branch: "main".to_string(),
             created_at: 0,
@@ -1328,7 +1328,10 @@ async fn test_r5_process_boundary_crash_and_recovery() {
     let stdout = String::from_utf8_lossy(&child_res.stdout);
     assert!(
         stdout.contains("DUME_BOUNDARY_GIT_UPDATED_BEFORE_DB_APPLIED"),
-        "Child must reach exact crash boundary between Git ref update and DB write"
+        "Child must reach exact crash boundary between Git ref update and DB write. status: {}, stdout: {}, stderr: {}",
+        child_res.status,
+        stdout,
+        String::from_utf8_lossy(&child_res.stderr)
     );
     assert_eq!(
         child_res.status.code(),

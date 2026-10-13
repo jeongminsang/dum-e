@@ -931,7 +931,16 @@ impl LocalToolExecutor {
         limit: usize,
     ) -> Result<String> {
         let search_path = if let Some(pf) = path_filter {
-            self.resolve_path(pf)?.to_string_lossy().to_string()
+            let path = self.resolve_path(pf)?;
+            let base = self.resolve_path(".")?;
+            let relative = path.strip_prefix(&base)?.to_string_lossy().to_string();
+            #[cfg(windows)]
+            let relative = relative.replace('\\', "/");
+            if relative.is_empty() {
+                ".".to_string()
+            } else {
+                relative
+            }
         } else {
             ".".to_string()
         };

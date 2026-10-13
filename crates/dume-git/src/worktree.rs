@@ -1,6 +1,30 @@
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::path::Path;
 use tokio::process::Command;
+
+pub fn git_path(path: &Path) -> Cow<'_, std::ffi::OsStr> {
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        let mut normalized = match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(drive) => {
+                std::path::PathBuf::from(format!("{}:", drive as char))
+            }
+            std::path::Prefix::VerbatimUNC(server, share) => {
+                let mut unc = std::ffi::OsString::from(r"\\");
+                unc.push(server);
+                unc.push(r"\");
+                unc.push(share);
+                std::path::PathBuf::from(unc)
+            }
+            _ => return Cow::Borrowed(path.as_os_str()),
+        };
+        // Git for Windows does not accept canonical Windows verbatim path prefixes.
+        normalized.extend(path.components().skip(1));
+        return Cow::Owned(normalized.into_os_string());
+    }
+    Cow::Borrowed(path.as_os_str())
+}
 
 pub async fn create_git_worktree(
     repo_path: &Path,
@@ -27,9 +51,9 @@ pub async fn create_git_worktree(
 
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_path)
+        .arg(git_path(repo_path))
         .args(["worktree", "add", "--detach", "--"])
-        .arg(worktree_dir)
+        .arg(git_path(worktree_dir))
         .arg(commit_or_branch)
         .output()
         .await
@@ -55,9 +79,9 @@ pub async fn create_git_worktree(
 pub async fn remove_git_worktree(repo_path: &Path, worktree_dir: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_path)
+        .arg(git_path(repo_path))
         .args(["worktree", "remove", "--"])
-        .arg(worktree_dir)
+        .arg(git_path(worktree_dir))
         .output()
         .await
         .with_context(|| {
@@ -92,7 +116,7 @@ mod tests {
     async fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
-            .arg(repo)
+            .arg(git_path(repo))
             .args(args)
             .output()
             .await
@@ -107,7 +131,8 @@ mod tests {
     #[tokio::test]
     async fn worktree_ownership_and_dirty_output_are_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
+        let canonical = dir.path().canonicalize().unwrap();
+        let repo = canonical.as_path();
         git(repo, &["init"]).await;
         git(
             repo,
