@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "dume-cli"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "dume-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "hex",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "dume-git"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "dume-core",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "dume-mcp"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "dume-core",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "dume-provider"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "base64",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "dume-store"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "dume-core",
  "hex",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "dume-tui"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "base64",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "dume-worker"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "dume-core",
