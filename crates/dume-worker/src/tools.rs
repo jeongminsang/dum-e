@@ -373,6 +373,7 @@ mod tests {
         assert!(format!("{error:#}").contains("Artifact must be a regular file"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_symlink_containment_in_tools() {
         let dir = tempfile::tempdir().unwrap();
@@ -380,23 +381,20 @@ mod tests {
         let secret_file = outside_dir.path().join("secret.txt");
         std::fs::write(&secret_file, b"secret content").unwrap();
 
-        #[cfg(unix)]
-        {
-            let symlink_path = dir.path().join("link_to_secret");
-            std::os::unix::fs::symlink(&secret_file, &symlink_path).unwrap();
+        let symlink_path = dir.path().join("link_to_secret");
+        std::os::unix::fs::symlink(&secret_file, &symlink_path).unwrap();
 
-            let executor = LocalToolExecutor::new(dir.path());
-            let err = executor
-                .execute(
-                    "read_artifact",
-                    &serde_json::json!({
-                        "path": "link_to_secret"
-                    }),
-                )
-                .await;
-            assert!(err.is_err());
-            assert!(err.unwrap_err().to_string().contains("Security violation"));
-        }
+        let executor = LocalToolExecutor::new(dir.path());
+        let err = executor
+            .execute(
+                "read_artifact",
+                &serde_json::json!({
+                    "path": "link_to_secret"
+                }),
+            )
+            .await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Security violation"));
     }
 
     #[tokio::test]

@@ -475,7 +475,14 @@ done
     }
 
     fn write_project_config(root: &Path, script: &Path, args: &str, exposure: &str) {
-        let config = json!({"servers":{"project_server":{"command":"/bin/sh","args":[script.to_string_lossy(),root.parent().unwrap().join("payload").to_string_lossy(),args],"exposure":exposure}}});
+        let script = script.to_string_lossy().replace('\\', "/");
+        let payload = root
+            .parent()
+            .unwrap()
+            .join("payload")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let config = json!({"servers":{"project_server":{"command":"sh","args":[script,payload,args],"exposure":exposure}}});
         fs::write(
             root.join(".dume/mcp.json"),
             serde_json::to_vec(&config).unwrap(),

@@ -169,22 +169,16 @@ fn project_mcp_config_requires_explicit_current_fingerprint_trust() {
     std::fs::create_dir_all(global_config.parent().unwrap()).unwrap();
     let changed_marker = home.path().join("changed-launched");
     let global_marker = home.path().join("global-launched");
-    let changed_command = marker_command(home.path(), "changed-child", &changed_marker);
-    let global_command = marker_command(home.path(), "global-child", &global_marker);
+    let changed_command = marker_command(&changed_marker);
+    let global_command = marker_command(&global_marker);
     std::fs::write(
         &config,
-        format!(
-            r#"{{"servers":{{"local":{{"command":"{}"}}}}}}"#,
-            changed_command.display()
-        ),
+        serde_json::json!({"servers": {"local": changed_command}}).to_string(),
     )
     .unwrap();
     std::fs::write(
         &global_config,
-        format!(
-            r#"{{"servers":{{"global":{{"command":"{}"}}}}}}"#,
-            global_command.display()
-        ),
+        serde_json::json!({"servers": {"global": global_command}}).to_string(),
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_dume");
@@ -254,15 +248,12 @@ fn project_mcp_trust_is_shared_with_registered_worker_worktree() {
     git(&main, &["config", "user.email", "test@example.invalid"]);
     git(&main, &["config", "user.name", "Test"]);
     let marker = home.path().join("worker-launched");
-    let command = marker_command(home.path(), "worker-child", &marker);
+    let command = marker_command(&marker);
     let config_dir = main.join(".dume");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("mcp.json"),
-        format!(
-            r#"{{"servers":{{"local":{{"command":"{}"}}}}}}"#,
-            command.display()
-        ),
+        serde_json::json!({"servers": {"local": command}}).to_string(),
     )
     .unwrap();
     git(&main, &["add", ".dume/mcp.json"]);
@@ -298,25 +289,22 @@ fn project_mcp_trust_is_shared_with_registered_worker_worktree() {
     );
 }
 
-#[cfg(unix)]
-fn marker_command(
-    directory: &std::path::Path,
-    name: &str,
-    marker: &std::path::Path,
-) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let command = directory.join(name);
-    std::fs::write(
-        &command,
-        format!(
-            "#!/bin/sh\nprintf launched > '{}'\nexit 0\n",
-            marker.display()
-        ),
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&command).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&command, permissions).unwrap();
+fn marker_command(marker: &std::path::Path) -> serde_json::Value {
+    #[cfg(windows)]
+    let command = {
+        let script = marker.with_extension("cmd");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\necho launched > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        serde_json::json!({"command": script})
+    };
+    #[cfg(not(windows))]
+    let command = serde_json::json!({
+        "command": "sh",
+        "args": ["-c", "printf launched > \"$1\"", "dume-marker", marker]
+    });
     command
 }
 
@@ -329,21 +317,19 @@ fn disabled_global_server_overrides_project_and_is_not_project_trusted() {
     std::fs::create_dir_all(&global_dir).unwrap();
     std::fs::create_dir_all(&project_dir).unwrap();
     let marker = home.path().join("disabled-launched");
-    let command = marker_command(home.path(), "disabled-child", &marker);
+    let command = marker_command(&marker);
+    let mut global_command = command.clone();
+    global_command["enabled"] = serde_json::json!(false);
+    let mut project_command = command;
+    project_command["enabled"] = serde_json::json!(true);
     std::fs::write(
         global_dir.join("mcp.json"),
-        format!(
-            r#"{{"servers":{{"same":{{"command":"{}","enabled":false}}}}}}"#,
-            command.display()
-        ),
+        serde_json::json!({"servers": {"same": global_command}}).to_string(),
     )
     .unwrap();
     std::fs::write(
         project_dir.join("mcp.json"),
-        format!(
-            r#"{{"servers":{{"same":{{"command":"{}","enabled":true}}}}}}"#,
-            command.display()
-        ),
+        serde_json::json!({"servers": {"same": project_command}}).to_string(),
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_dume");
