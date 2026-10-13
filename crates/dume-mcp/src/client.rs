@@ -394,6 +394,55 @@ done
         .unwrap()
     }
 
+    fn process_has_exited(pid: i32) -> Result<bool> {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(true);
+            }
+            return Err(error).context("Failed to probe descendant process");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // An orphan can remain a zombie until init reaps it; PID existence
+            // alone does not mean it can still execute.
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit_once(')')
+                        .and_then(|(_, fields)| fields.split_whitespace().next())
+                        .context("Missing descendant process state")?;
+                    Ok(matches!(state, "Z" | "X"))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error).context("Failed to read descendant process state"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exited_process_is_detected_before_its_zombie_is_reaped() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
+            while !process_has_exited(pid).unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let probe = unsafe { libc::kill(pid, 0) };
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert!(exited.is_ok(), "Exited child was not detected as a zombie");
+        assert_eq!(probe, 0, "Child must still have a PID before wait reaps it");
+    }
+
     #[tokio::test]
     async fn stdio_initialize_paginated_list_and_call() {
         let (_dir, script) = fixture("paginate");
@@ -467,14 +516,16 @@ done
         })
         .await
         .unwrap();
+        assert!(!process_has_exited(descendant).unwrap());
         client.shutdown().await;
         assert!(client.child.lock().await.id().is_none());
-        let result = unsafe { libc::kill(descendant, 0) };
-        assert_eq!(result, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !process_has_exited(descendant).unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP descendant is still running after shutdown");
     }
 }
 
