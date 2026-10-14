@@ -3,7 +3,7 @@ use dume_provider::types::{ChatMessage, Role};
 use dume_store::RecentSessionSummary;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
@@ -717,6 +717,49 @@ impl ThinkingLevel {
     }
 }
 
+fn status_model_spans(
+    model: &str,
+    is_busy: bool,
+    anim_tick: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let style = Style::default()
+        .fg(theme.status_bar_fg)
+        .add_modifier(Modifier::BOLD);
+    if !is_busy {
+        return vec![Span::styled(model.to_owned(), style)];
+    }
+    let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) =
+        (theme.status_bar_fg, theme.status_bar_bg)
+    else {
+        return vec![Span::styled(model.to_owned(), style)];
+    };
+    let width = model.width() as f32;
+    let half_width = (width * 0.1).max(3.0);
+    // One two-second sweep on the existing 80 ms animation clock.
+    let position = (anim_tick % 25) as f32 / 25.0 * (width + 2.0 * half_width) - half_width;
+    let mut column = 0.0;
+    Span::raw(model)
+        .styled_graphemes(style)
+        .map(|grapheme| {
+            let glyph_width = grapheme.symbol.width() as f32;
+            let center = column + glyph_width / 2.0;
+            column += glyph_width;
+            let distance = ((center - position).abs() / half_width).min(1.0);
+            let intensity = 0.5 * (1.0 + (std::f32::consts::PI * distance).cos());
+            let alpha = 0.5 + 0.5 * intensity;
+            let blend = |foreground: u8, background: u8| {
+                (f32::from(background) + (f32::from(foreground) - f32::from(background)) * alpha)
+                    .round() as u8
+            };
+            Span::styled(
+                grapheme.symbol.to_owned(),
+                style.fg(Color::Rgb(blend(fr, br), blend(fg, bg), blend(fb, bb))),
+            )
+        })
+        .collect()
+}
+
 pub fn render_status_bar(
     f: &mut Frame,
     area: Rect,
@@ -761,18 +804,20 @@ pub fn render_status_bar(
         } else {
             let mut name = String::new();
             let mut width = 0;
-            for ch in model_name.chars() {
-                let char_width = ch.width().unwrap_or(0);
-                if width + char_width > model_width - 1 {
+            for grapheme in Span::raw(model_name).styled_graphemes(Style::default()) {
+                let glyph_width = grapheme.symbol.width();
+                if width + glyph_width > model_width - 1 {
                     break;
                 }
-                name.push(ch);
-                width += char_width;
+                name.push_str(grapheme.symbol);
+                width += glyph_width;
             }
             name.push('…');
             name
         };
-        let line = Line::from(format!("{short_model}{details}"));
+        let mut spans = status_model_spans(&short_model, is_busy, anim_tick, theme);
+        spans.push(Span::raw(details));
+        let line = Line::from(spans);
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.status_bar_bg)),
             area,
@@ -801,16 +846,18 @@ pub fn render_status_bar(
         ),
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" Model: {} ", model),
-            Style::default()
-                .fg(theme.status_bar_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
+    let mut spans = vec![Span::styled(
+        " Model: ",
+        Style::default()
+            .fg(theme.status_bar_fg)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(status_model_spans(model, is_busy, anim_tick, theme));
+    spans.extend([
+        Span::raw(" "),
         Span::styled("|", Style::default().fg(theme.border)),
         thinking_span,
-    ];
+    ]);
 
     if let Some(version) = available_update {
         spans.push(Span::styled(
@@ -2109,6 +2156,97 @@ mod status_bar_tests {
             assert!(output.contains("ERROR 3s"));
             assert!(output.contains("S7s"));
             assert!(output.contains("T42+1!"));
+        }
+    }
+
+    #[test]
+    fn model_shimmer_preserves_complete_graphemes_and_static_fallback() {
+        let theme = Theme::default();
+        for model in ["", "한글모델", "e\u{301}", "👩‍💻"] {
+            let spans = status_model_spans(model, true, 12, &theme);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                model
+            );
+            assert_eq!(Line::from(spans.clone()).width(), model.width());
+            if model == "e\u{301}" || model == "👩‍💻" {
+                assert_eq!(spans.len(), 1);
+            }
+        }
+        assert_eq!(
+            status_model_spans("model", false, 0, &theme),
+            status_model_spans("model", false, 12, &theme)
+        );
+        let fallback = Theme {
+            status_bar_fg: Color::White,
+            ..theme
+        };
+        assert_eq!(
+            status_model_spans("model", true, 0, &fallback),
+            status_model_spans("model", true, 12, &fallback)
+        );
+    }
+
+    #[test]
+    fn status_model_shimmer_changes_colors_without_moving_text_or_metrics() {
+        for width in [32, 80, 140] {
+            let render = |busy, tick| {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_status_bar(
+                            frame,
+                            Rect::new(0, 0, width, 1),
+                            "openai-codex/gpt-6-astra",
+                            ThinkingLevel::Off,
+                            busy,
+                            Some(3.0),
+                            Some("DONE 3s"),
+                            Some("7s"),
+                            Some("TOKENS 42"),
+                            tick,
+                            None,
+                            &Theme::default(),
+                        );
+                    })
+                    .unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let first = render(true, 0);
+            let next = render(true, 12);
+            let model_range = if width < 96 { 0..11 } else { 8..32 };
+            let cells = |buffer: &ratatui::buffer::Buffer| {
+                buffer.content()[model_range.clone()].to_vec()
+            };
+            let first_cells = cells(&first);
+            let next_cells = cells(&next);
+            assert_eq!(
+                first_cells
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>(),
+                next_cells
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            );
+            assert_ne!(first_cells, next_cells);
+            assert!(next_cells.windows(2).any(|pair| pair[0].fg != pair[1].fg));
+            assert!(
+                first_cells
+                    .iter()
+                    .chain(&next_cells)
+                    .all(|cell| cell.bg == Theme::default().status_bar_bg)
+            );
+            if width < 96 {
+                assert_eq!(&first.content()[11..], &next.content()[11..]);
+            } else {
+                assert_eq!(&first.content()[..8], &next.content()[..8]);
+            }
+            assert_eq!(render(false, 0), render(false, 12));
         }
     }
 
