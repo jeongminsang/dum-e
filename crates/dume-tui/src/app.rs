@@ -1,5 +1,6 @@
 use crate::component::{
-    AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel, build_transcript_lines,
+    calculate_transcript_height,
     render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
     render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
     render_resume_picker_modal, render_routing_probe_confirm_modal, render_routing_settings_modal,
@@ -7,11 +8,12 @@ use crate::component::{
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
+use crate::selection::{TextSelection, copy_to_clipboard};
 use crate::theme::Theme;
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -38,6 +40,10 @@ use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
 
 fn save_credential_and_rotate_session(
     store: &dume_provider::CredentialStore,
@@ -2064,6 +2070,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
     let mut status_reporter = ProgramStatusReporter::new(io::stdout().is_terminal());
+    let mut selection = TextSelection::default();
 
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -2125,7 +2132,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.scroll_offset = max_scroll;
             } else if app.scroll_offset >= max_scroll {
                 app.scroll_offset = max_scroll;
-                app.auto_scroll = true;
+                app.auto_scroll = !selection.is_dragging();
             }
 
             render_transcript(
@@ -2356,6 +2363,33 @@ async fn run_app<B: ratatui::backend::Backend>(
                     );
                 }
             }
+            if matches!(app.modal, ModalState::None) && autocomplete_items.is_empty() {
+                selection.update_viewport(
+                    f.buffer_mut(),
+                    transcript_area,
+                    chunks[1].inner(ratatui::layout::Margin::new(1, 1)),
+                    app.scroll_offset,
+                );
+                if selection.selects_transcript() {
+                    let (lines, _) = build_transcript_lines(
+                        &app.messages,
+                        &app.streaming_text,
+                        &app.recent_sessions,
+                        transcript_area.width as usize,
+                        &app.theme,
+                    );
+                    selection.refresh_transcript(lines);
+                }
+                selection.highlight(
+                    f.buffer_mut(),
+                    ratatui::style::Style::default()
+                        .bg(app.theme.accent)
+                        .fg(ratatui::style::Color::Black),
+                );
+            } else {
+                selection.clear();
+                selection.update_viewport(f.buffer_mut(), Default::default(), Default::default(), 0);
+            }
         })?;
 
         tokio::select! {
@@ -2375,6 +2409,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if key.kind == crossterm::event::KeyEventKind::Release {
                                 continue;
                             }
+                            selection.clear();
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
                                 ModalState::ModelSelector {
@@ -3769,6 +3804,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         Event::Mouse(mouse) => {
                             match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if matches!(app.modal, ModalState::None) && app.get_autocomplete_items().is_empty() => {
+                                    let (lines, _) = build_transcript_lines(
+                                        &app.messages,
+                                        &app.streaming_text,
+                                        &app.recent_sessions,
+                                        terminal.size()?.width as usize,
+                                        &app.theme,
+                                    );
+                                    if selection.start(mouse, lines) {
+                                        app.auto_scroll = false;
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => selection.drag(mouse),
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if let Some(text) = selection.release(mouse) {
+                                        if let Err(error) = copy_to_clipboard(text).await {
+                                            app.messages.push(ChatMessage::ui_notice(format!("Could not copy selection: {error}")));
+                                        }
+                                    }
+                                }
                                 MouseEventKind::ScrollUp => {
                                     match &mut app.modal {
                                         ModalState::ResumePicker { sessions, selected_idx } => {
@@ -3859,6 +3915,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Event::Paste(text) => {
+                            selection.clear();
+                            let text = normalize_pasted_text(&text);
                             match &mut app.modal {
                                 ModalState::None => {
                                     app.autocomplete_dismissed = true;
@@ -3891,6 +3949,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Event::Resize(_, _) => {
+                            selection.clear();
                             terminal.autoresize()?;
                         }
                         _ => {}
@@ -3898,6 +3957,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
             Some(stream_event) = stream_rx.recv() => {
+                if matches!(
+                    &stream_event,
+                    ConversationEvent::Compacted(_)
+                        | ConversationEvent::Stream(StreamEvent::Retrying { .. })
+                ) {
+                    selection.clear();
+                }
                 let finished_run_id = match &stream_event {
                     ConversationEvent::Finished { run_id: Some(run_id), .. }
                         if app.current_run_id.as_deref() == Some(run_id.as_str()) => Some(run_id.clone()),
@@ -4768,6 +4834,24 @@ mod tests {
     use super::*;
     use dume_provider::types::Role;
     use std::collections::VecDeque;
+
+    #[test]
+    fn pasted_line_endings_are_normalized_before_rendering_or_submission() {
+        for pasted in [
+            "first\rsecond\r안녕",
+            "first\r\nsecond\r\n안녕",
+            "first\nsecond\n안녕",
+        ] {
+            let normalized = normalize_pasted_text(pasted);
+            assert_eq!(normalized, "first\nsecond\n안녕");
+            assert_eq!(normalized.lines().count(), 3);
+            assert!(!normalized.contains('\r'));
+        }
+        assert_eq!(
+            normalize_pasted_text("first\r\n\r\nlast\r"),
+            "first\n\nlast\n"
+        );
+    }
 
     #[test]
     fn routing_field_cursor_edits_korean_by_unicode_scalar_and_roles_do_not_change_parent_model() {

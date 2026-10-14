@@ -114,6 +114,12 @@ in `~/.dume/agent/subagents.json` and does not change the current conversation's
 model. You can also use `/subagents model <provider/model>` or
 `/subagents model inherit` directly.
 
+Drag with the left mouse button to select conversation text or visible prompt
+text. Releasing the button copies the selection automatically. The mouse wheel
+still scrolls the conversation and navigates pickers. Typing or resizing clears
+the selection. macOS uses its system clipboard; other platforms use OSC 52,
+which requires clipboard-write support in the terminal.
+
 ### Local OpenCodex
 
 With OpenCodex running locally, discover its models and select one directly:
