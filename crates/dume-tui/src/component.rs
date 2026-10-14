@@ -114,7 +114,7 @@ pub fn build_transcript_lines(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " to cycle thinking intensity (OFF / LOW / MED / HIGH)",
+                " to cycle supported thinking levels (DEFAULT uses the model default)",
                 Style::default().fg(theme.foreground),
             ),
         ]));
@@ -689,33 +689,7 @@ pub fn render_autocomplete_dropdown(
     f.render_widget(paragraph, popup_area);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingLevel {
-    Off,
-    Low,
-    Medium,
-    High,
-}
-
-impl ThinkingLevel {
-    pub fn next(self) -> Self {
-        match self {
-            ThinkingLevel::Off => ThinkingLevel::Low,
-            ThinkingLevel::Low => ThinkingLevel::Medium,
-            ThinkingLevel::Medium => ThinkingLevel::High,
-            ThinkingLevel::High => ThinkingLevel::Off,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ThinkingLevel::Off => "OFF",
-            ThinkingLevel::Low => "LOW",
-            ThinkingLevel::Medium => "MED",
-            ThinkingLevel::High => "HIGH",
-        }
-    }
-}
+pub use dume_provider::reasoning::ReasoningEffort as ThinkingLevel;
 
 fn status_model_spans(
     model: &str,
@@ -794,7 +768,12 @@ pub fn render_status_bar(
                     .replace(" incomplete", "!")
             })
             .unwrap_or_default();
-        let details = format!(" {} {status} {elapsed} T{usage}", thinking.label());
+        let thinking_label = if thinking == ThinkingLevel::Default {
+            "DEF"
+        } else {
+            thinking.label()
+        };
+        let details = format!(" {thinking_label} {status} {elapsed} T{usage}");
         let model_name = model.split_once('/').map_or(model, |(_, name)| name);
         let model_width = usize::from(area.width).saturating_sub(details.width());
         let short_model = if model_name.width() <= model_width {
@@ -824,27 +803,16 @@ pub fn render_status_bar(
         );
         return;
     }
-    let thinking_span = match thinking {
-        ThinkingLevel::Off => Span::styled(" Thinking: OFF ", Style::default().fg(theme.border)),
-        ThinkingLevel::Low => Span::styled(
-            " Thinking: LOW ",
-            Style::default()
-                .fg(theme.user_msg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        ThinkingLevel::Medium => Span::styled(
-            " Thinking: MED ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        ThinkingLevel::High => Span::styled(
-            " Thinking: HIGH ",
-            Style::default()
-                .fg(theme.assistant_msg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    };
+    let thinking_span = Span::styled(
+        format!(" Thinking: {} ", thinking.label()),
+        Style::default()
+            .fg(if thinking == ThinkingLevel::Default {
+                theme.border
+            } else {
+                theme.accent
+            })
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut spans = vec![Span::styled(
         " Model: ",
@@ -1001,18 +969,13 @@ pub fn render_model_selector_modal(
     f.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[0]);
 
     // 2. Search bar + Thinking level button
-    let thinking_style = match thinking {
-        ThinkingLevel::Off => Style::default().fg(theme.border),
-        ThinkingLevel::Low => Style::default()
-            .fg(theme.user_msg)
-            .add_modifier(Modifier::BOLD),
-        ThinkingLevel::Medium => Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-        ThinkingLevel::High => Style::default()
-            .fg(theme.assistant_msg)
-            .add_modifier(Modifier::BOLD),
-    };
+    let thinking_style = Style::default()
+        .fg(if thinking == ThinkingLevel::Default {
+            theme.border
+        } else {
+            theme.accent
+        })
+        .add_modifier(Modifier::BOLD);
 
     let search_line = Line::from(vec![
         Span::styled(
@@ -1029,8 +992,15 @@ pub fn render_model_selector_modal(
                 .add_modifier(Modifier::RAPID_BLINK),
         ),
         Span::styled(
-            if model_offset == 0 {
-                format!("   [ Tab: Thinking Level = {} ]", thinking.label())
+            if let Some(model) = selected_idx
+                .checked_sub(model_offset)
+                .and_then(|index| models.get(index))
+            {
+                if model.supported_efforts().len() <= 1 {
+                    "   [ Thinking: N/A ]".to_string()
+                } else {
+                    format!("   [ Tab: Thinking Level = {} ]", thinking.label())
+                }
             } else {
                 format!("   Parent: {parent_model}")
             },
@@ -2019,7 +1989,7 @@ mod status_bar_tests {
                             "",
                             &["All".into(), "openai".into()],
                             0,
-                            ThinkingLevel::Off,
+                            ThinkingLevel::Default,
                             "parent/model",
                             &target,
                             &Theme::default(),
@@ -2128,7 +2098,7 @@ mod status_bar_tests {
                     frame,
                     Rect::new(0, 0, width, 1),
                     model,
-                    ThinkingLevel::Off,
+                    ThinkingLevel::Default,
                     false,
                     None,
                     Some("ERROR 3s"),
@@ -2201,7 +2171,7 @@ mod status_bar_tests {
                             frame,
                             Rect::new(0, 0, width, 1),
                             "openai-codex/gpt-6-astra",
-                            ThinkingLevel::Off,
+                            ThinkingLevel::Default,
                             busy,
                             Some(3.0),
                             Some("DONE 3s"),

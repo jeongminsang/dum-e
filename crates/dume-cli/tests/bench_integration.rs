@@ -334,6 +334,8 @@ async fn test_bench_failed_cancelled_retains_usage() {
         .with_base_url(&mock_url)
         .with_store(Arc::clone(&store))
         .with_request_context(StreamRequestContext {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: "sess_cancel".to_string(),
             request_id: "req_cancel_1".to_string(),
             benchmark_run_id: Some("bench_1".to_string()),

@@ -23,6 +23,70 @@ mod tests {
     use crate::types::ToolCall;
 
     #[tokio::test]
+    async fn thinking_configuration_and_signed_blocks_survive_tool_replay() {
+        use crate::reasoning::ReasoningEffort;
+        for (model, effort, budget) in [
+            ("claude-sonnet-4-5", ReasoningEffort::Low, Some(1024)),
+            ("claude-sonnet-4-5", ReasoningEffort::Medium, Some(8192)),
+            ("claude-sonnet-4-5", ReasoningEffort::High, Some(16384)),
+            ("claude-sonnet-4-6", ReasoningEffort::High, None),
+        ] {
+            let sse = [
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"", "signature":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"opaque thought"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque signature"}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            ].iter().map(|event| format!("data: {event}\n\n")).collect();
+            let (url, server) = crate::codex::tests::fixture(sse);
+            let mut context = crate::types::StreamRequestContext::new();
+            context.reasoning_effort = Some(effort);
+            let mut replay = ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "old".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+            );
+            replay.anthropic_thinking = vec![
+                json!({"type":"thinking", "thinking":"previous", "signature":"previous signature"}),
+            ];
+            let (tx, mut rx) = mpsc::channel(16);
+            AnthropicProvider::new("fake")
+                .with_base_url(&url)
+                .stream_with_context(
+                    model,
+                    &[
+                        ChatMessage::user("local fixture"),
+                        replay,
+                        ChatMessage::tool("result", "old"),
+                    ],
+                    &[],
+                    Some(&context),
+                    tx,
+                )
+                .await
+                .unwrap();
+            let (_, request) = server.join().unwrap();
+            assert_eq!(
+                request["messages"][1]["content"][0]["signature"],
+                "previous signature"
+            );
+            if let Some(budget) = budget {
+                assert_eq!(request["thinking"]["type"], "enabled");
+                assert_eq!(request["thinking"]["budget_tokens"], budget);
+                assert!(request["max_tokens"].as_i64().unwrap() > budget);
+            } else {
+                assert_eq!(request["thinking"]["type"], "adaptive");
+                assert_eq!(request["output_config"]["effort"], "high");
+            }
+            assert!(
+                matches!(rx.recv().await, Some(StreamEvent::AnthropicThinking(blocks)) if blocks[0]["thinking"] == "opaque thought" && blocks[0]["signature"] == "opaque signature")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_auth_and_tool_names_round_trip() {
         for oauth in [false, true] {
             let wire_name = if oauth { "Read" } else { "read" };
@@ -225,6 +289,9 @@ mod tests {
 }
 
 impl AnthropicProvider {
+    pub(crate) fn url(&self) -> String {
+        format!("{}/messages", self.base_url)
+    }
     pub fn new(api_key: &str) -> Self {
         Self {
             client: LlmClient::new(),
@@ -326,10 +393,10 @@ impl AnthropicProvider {
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        _context: Option<&crate::types::StreamRequestContext>,
+        context: Option<&crate::types::StreamRequestContext>,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let url = format!("{}/messages", self.base_url);
+        let url = self.url();
         let headers = self.headers()?;
         let caching_enabled = self.should_cache();
 
@@ -338,7 +405,7 @@ impl AnthropicProvider {
             .filter(|m| m.role != Role::System)
             .map(|m| match m.role {
                 Role::Assistant => {
-                    let mut content_blocks = Vec::new();
+                    let mut content_blocks = m.anthropic_thinking.clone();
                     if !m.content.is_empty() {
                         content_blocks.push(json!({
                             "type": "text",
@@ -413,6 +480,39 @@ impl AnthropicProvider {
             "stream": true,
         });
 
+        if let Some(effort) = context
+            .and_then(|ctx| ctx.reasoning_effort)
+            .filter(|effort| !effort.is_default())
+        {
+            let adaptive = [
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-haiku-5",
+                "claude-fable-5",
+                "claude-mythos-5",
+            ]
+            .iter()
+            .any(|prefix| model.starts_with(prefix));
+            if adaptive {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": effort});
+                body["max_tokens"] = json!(32768);
+            } else {
+                let budget = match effort {
+                    crate::reasoning::ReasoningEffort::Low => 1024,
+                    crate::reasoning::ReasoningEffort::Medium => 8192,
+                    crate::reasoning::ReasoningEffort::High => 16384,
+                    _ => anyhow::bail!("Unsupported Anthropic thinking budget"),
+                };
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                body["max_tokens"] = json!(budget + 4096);
+            }
+        }
+
         let mut system_blocks: Vec<Value> = Vec::new();
         if self.oauth {
             system_blocks.push(json!({
@@ -456,6 +556,7 @@ impl AnthropicProvider {
         let resp = self.client.post_once(&url, headers, &body).await?;
         let mut stream = resp.bytes_stream().eventsource();
         let mut completed = false;
+        let mut thinking_blocks = std::collections::BTreeMap::<usize, Value>::new();
 
         while let Some(event_res) = stream.next().await {
             match event_res {
@@ -468,6 +569,11 @@ impl AnthropicProvider {
                                         parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
                                             as usize;
                                     if let Some(cb) = parsed.get("content_block") {
+                                        if cb["type"] == "thinking"
+                                            || cb["type"] == "redacted_thinking"
+                                        {
+                                            thinking_blocks.insert(index, cb.clone());
+                                        }
                                         if cb.get("type").and_then(|t| t.as_str())
                                             == Some("tool_use")
                                         {
@@ -509,6 +615,23 @@ impl AnthropicProvider {
                                             .get("type")
                                             .and_then(|t| t.as_str())
                                             .unwrap_or("");
+                                        if let Some(block) = thinking_blocks.get_mut(&index) {
+                                            let field = match delta_type {
+                                                "thinking_delta" => Some("thinking"),
+                                                "signature_delta" => Some("signature"),
+                                                _ => None,
+                                            };
+                                            if let Some(field) = field {
+                                                let mut value = block[field]
+                                                    .as_str()
+                                                    .unwrap_or_default()
+                                                    .to_string();
+                                                value.push_str(
+                                                    delta[field].as_str().unwrap_or_default(),
+                                                );
+                                                block[field] = json!(value);
+                                            }
+                                        }
                                         if delta_type == "text_delta" {
                                             if let Some(text) =
                                                 delta.get("text").and_then(|t| t.as_str())
@@ -535,6 +658,16 @@ impl AnthropicProvider {
                                 }
                                 "message_start" => {
                                     if let Some(msg) = parsed.get("message") {
+                                        let identity =
+                                            crate::types::ResponseIdentity::from_response(
+                                                msg, "model", "id",
+                                            );
+                                        if identity.model.is_some()
+                                            || identity.response_id.is_some()
+                                        {
+                                            tx.send(StreamEvent::ResponseIdentity(identity))
+                                                .await?;
+                                        }
                                         if let Some(usage) = msg.get("usage") {
                                             let raw_input = usage
                                                 .get("input_tokens")
@@ -607,6 +740,14 @@ impl AnthropicProvider {
                                         .and_then(|d| d.get("stop_reason"))
                                         .and_then(|s| s.as_str())
                                     {
+                                        if !thinking_blocks.is_empty() {
+                                            tx.send(StreamEvent::AnthropicThinking(
+                                                std::mem::take(&mut thinking_blocks)
+                                                    .into_values()
+                                                    .collect(),
+                                            ))
+                                            .await?;
+                                        }
                                         let _ = tx
                                             .send(StreamEvent::Completed {
                                                 finish_reason: stop.to_string(),

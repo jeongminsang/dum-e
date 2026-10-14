@@ -22,6 +22,8 @@ pub struct ModelInfo {
     pub base_url: Option<String>,
     #[serde(default)]
     pub reasoning: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_levels: Option<Vec<crate::reasoning::ReasoningEffort>>,
     #[serde(default)]
     pub input: Vec<String>,
     #[serde(rename = "contextWindow", default)]
@@ -286,6 +288,7 @@ impl ModelCatalog {
                         api: api.to_string(),
                         base_url: None,
                         reasoning: model.reasoning,
+                        reasoning_levels: None,
                         input: model.modalities.map_or_else(Vec::new, |value| value.input),
                         context_window: model.limit.as_ref().and_then(|value| value.context),
                         max_tokens: model.limit.and_then(|value| value.output),
@@ -346,6 +349,7 @@ impl ModelCatalog {
                 api: effective_api.to_string(),
                 base_url: standard_base_url,
                 reasoning: m.reasoning,
+                reasoning_levels: m.reasoning_levels,
                 input: m.input,
                 context_window: m.context_window,
                 max_tokens: m.max_tokens,
@@ -368,6 +372,16 @@ impl ModelCatalog {
                 api: "openai-codex-responses".to_string(),
                 base_url: Some("https://chatgpt.com/backend-api".to_string()),
                 reasoning: !model.supported_reasoning_levels.is_empty(),
+                reasoning_levels: Some(
+                    model
+                        .supported_reasoning_levels
+                        .iter()
+                        .filter_map(|level| {
+                            serde_json::from_value(level.get("effort").unwrap_or(level).clone())
+                                .ok()
+                        })
+                        .collect(),
+                ),
                 input: model.input_modalities,
                 context_window: model.context_window,
                 max_tokens: None,
@@ -559,7 +573,8 @@ impl ModelCatalog {
             .ok()
             .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
             .is_some_and(|age| age <= std::time::Duration::from_secs(86400));
-        if fresh && Self::load_codex_cache(&root, account_id).is_some() {
+        if fresh && Self::load_codex_cache(&root, account_id)
+            .is_some_and(|models| models.iter().all(|model| model.reasoning_levels.is_some())) {
             return Ok(None);
         }
         let credential = store.resolve_credential("openai-codex").await?
@@ -802,6 +817,13 @@ mod tests {
         assert_eq!(model.context_window, Some(272000));
         assert_eq!(model.input, ["text", "image"]);
         assert!(model.reasoning);
+        assert_eq!(
+            model.reasoning_levels,
+            Some(vec![
+                crate::reasoning::ReasoningEffort::Low,
+                crate::reasoning::ReasoningEffort::High
+            ])
+        );
     }
 
     #[tokio::test]

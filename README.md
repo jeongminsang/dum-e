@@ -114,6 +114,27 @@ in `~/.dume/agent/subagents.json` and does not change the current conversation's
 model. You can also use `/subagents model <provider/model>` or
 `/subagents model inherit` directly.
 
+Tab cycles the selected model's supported thinking levels. In `/model` and
+`/subagents`, Tab configures the highlighted model. Preferences are stored by
+`provider/model` in `~/.dume/agent/models-store.json` under `thinking_by_model`,
+and restored when you switch models or reopen DUM-E. `DEFAULT` uses the server's
+default; `OFF` explicitly disables reasoning and appears only where supported.
+Models without advertised adjustment support show `N/A` in the picker and use
+`DEFAULT`; DUM-E does not infer levels from model names. Codex and OpenCodex model
+catalogs supply their supported thinking levels. Custom entries
+in `~/.dume/agent/models.json` can declare `reasoning_levels` (an empty list
+disables adjustment). Selected values are sent in each provider's request format;
+changing a preference affects subsequent requests, not a request already streaming.
+Routing and subagents use the preference for their own effective model.
+
+The status bar shows the model and effort sent with the active request. DUM-E
+trusts the provider's model identifiers and successful responses; a different or
+missing response model name does not fail the request. Provider errors are shown
+in the conversation and leave the TUI available for another request. Server model
+names and response IDs are retained only for diagnostics with attempt usage;
+request context records the endpoint and effort. `/session` and
+`dume runtime inspect <run-id>` expose these records.
+
 Drag with the left mouse button to select conversation text or visible prompt
 text. Releasing the button copies the selection automatically. The mouse wheel
 still scrolls the conversation and navigates pickers. Typing or resizing clears

@@ -68,7 +68,18 @@ impl ResolvedProvider {
         context: Option<&crate::types::StreamRequestContext>,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let seed = context.cloned().unwrap_or_default();
+        let mut seed = context.cloned().unwrap_or_default();
+        let effort = match seed.reasoning_effort {
+            Some(effort) => effort,
+            None => crate::reasoning::saved_effort(&self.model)?,
+        };
+        seed.reasoning_effort = Some(effort);
+        seed.endpoint = Some(match &self.transport {
+            Transport::Anthropic(p) | Transport::AnthropicOAuth(p) => p.url(),
+            Transport::OpenAi(p) => p.url(),
+            Transport::Codex(p) => p.url(),
+            Transport::Google(p) => p.url(&self.model.id),
+        });
         let mut attempt_context = seed.clone();
         let mut delay = Duration::from_millis(500);
         let retry_started = Instant::now();
@@ -110,7 +121,16 @@ impl ResolvedProvider {
                         )
                         .await
                     }
-                    Transport::Google(p) => p.stream(model, messages, tools, attempt_tx).await,
+                    Transport::Google(p) => {
+                        p.stream_with_context(
+                            model,
+                            messages,
+                            tools,
+                            Some(&attempt_ctx),
+                            attempt_tx,
+                        )
+                        .await
+                    }
                 }
             };
             tokio::pin!(run);
@@ -125,11 +145,17 @@ impl ResolvedProvider {
             let mut provider_error = None;
             let mut failure_kind = None;
             let mut event_retry_after = None;
+            let mut identity = crate::types::ResponseIdentity::default();
             let result = loop {
                 tokio::select! {
                   event = attempt_rx.recv() => {
                     let Some(event) = event else { break Err(anyhow::anyhow!("Provider stream ended without completion")); };
                   match event {
+                      StreamEvent::ResponseIdentity(reported) => {
+                          identity.model = reported.model.or(identity.model);
+                          identity.response_id = reported.response_id.or(identity.response_id);
+                          let _ = tx.send(StreamEvent::ResponseIdentity(identity.clone())).await;
+                      }
                       StreamEvent::Usage(u) => { usage.get_or_insert_with(TokenUsage::default).merge_cumulative(&u); let _ = tx.send(StreamEvent::Usage(u)).await; }
                       StreamEvent::Completed { finish_reason } => completion = Some(finish_reason),
                       StreamEvent::Error(error) => provider_error = Some(error),
@@ -142,6 +168,13 @@ impl ResolvedProvider {
             };
             while let Some(event) = attempt_rx.recv().await {
                 match event {
+                    StreamEvent::ResponseIdentity(reported) => {
+                        identity.model = reported.model.or(identity.model);
+                        identity.response_id = reported.response_id.or(identity.response_id);
+                        let _ = tx
+                            .send(StreamEvent::ResponseIdentity(identity.clone()))
+                            .await;
+                    }
                     StreamEvent::Error(error) => provider_error = Some(error),
                     StreamEvent::ProviderError {
                         kind,
@@ -179,6 +212,7 @@ impl ResolvedProvider {
                     } else {
                         failure_kind = Some(ProviderFailureKind::InvalidRequest);
                     }
+                    provider_error = Some(format!("{error:#}"));
                 }
                 provider_error.get_or_insert_with(|| format!("{error:#}"));
             }
@@ -205,6 +239,7 @@ impl ResolvedProvider {
                     },
                     duration_ms: elapsed,
                     usage,
+                    identity: identity.clone(),
                     error: (!succeeded).then(|| {
                         if error_text.is_empty() {
                             "Provider stream ended without completion".to_string()
@@ -261,6 +296,7 @@ impl ResolvedProvider {
         unreachable!()
     }
 }
+
 
 /// Check if a provider and its wire protocol (api) are supported by local execution transports.
 pub fn is_transport_supported(provider: &str, api: &str) -> bool {
@@ -618,6 +654,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn codex_efforts_reach_http_and_provider_response_names_are_diagnostic_only() {
+        use crate::reasoning::ReasoningEffort;
+        use serde_json::json;
+        for (effort, reported, success) in [
+            (ReasoningEffort::Low, "gpt-6-astra", true),
+            (ReasoningEffort::Medium, "gpt-6-astra-2026-10-01", true),
+            (ReasoningEffort::High, "provider-astra-alias", true),
+            (ReasoningEffort::Default, "", true),
+        ] {
+            let response = json!({"id":"resp-test","model":reported,"status":"completed", "output":[{"type":"function_call","id":"fc","call_id":"call","name":"write_file","arguments":"{}"}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}});
+            let (url, server) = crate::codex::tests::fixture(format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"type":"response.created","response":{"id":"resp-test","model":"gpt-6-astra"}}),
+                json!({"type":"response.completed","response":response})
+            ));
+            let mut model = resolve_model("openai-codex/gpt-5.4").unwrap();
+            model.id = "gpt-6-astra".into();
+            model.reasoning = true;
+            model.reasoning_levels = Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]);
+            let provider = bind_credential(model, credential("oauth"))
+                .unwrap()
+                .with_base_url(&url)
+                .unwrap();
+            let mut context = StreamRequestContext::new();
+            context.reasoning_effort = Some(effort);
+            let (tx, mut rx) = mpsc::channel(32);
+            assert_eq!(
+                provider
+                    .stream_with_context(
+                        &[ChatMessage::user("local fixture")],
+                        &[],
+                        Some(&context),
+                        tx
+                    )
+                    .await
+                    .is_ok(),
+                success
+            );
+            let (_, request) = server.join().unwrap();
+            assert_eq!(request["model"], "gpt-6-astra");
+            if effort == ReasoningEffort::Default {
+                assert!(request.get("reasoning").is_none());
+            } else {
+                assert_eq!(request["reasoning"]["effort"], json!(effort));
+            }
+            let mut attempts = 0;
+            let mut completed = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::AttemptStarted { context, .. } => {
+                        attempts += 1;
+                        assert_eq!(context.reasoning_effort, Some(effort));
+                        assert_eq!(context.endpoint, Some(format!("{url}/codex/responses")));
+                    }
+                    StreamEvent::AttemptFinished {
+                        identity,
+                        outcome,
+                        usage,
+                        ..
+                    } => {
+                        assert_eq!(
+                            identity.model.as_deref(),
+                            Some(if reported.is_empty() { "gpt-6-astra" } else { reported })
+                        );
+                        assert_eq!(identity.response_id.as_deref(), Some("resp-test"));
+                        assert_eq!(outcome == AttemptOutcome::Succeeded, success);
+                        assert_eq!(usage.unwrap().input_tokens, 7);
+                    }
+                    StreamEvent::Completed { .. } => completed = true,
+                    StreamEvent::Retrying { .. } => panic!("successful provider responses must not retry"),
+                    _ => {}
+                }
+            }
+            assert_eq!(attempts, 1);
+            assert_eq!(completed, success);
+        }
+    }
+
     fn local_model(base_url: &str) -> ModelInfo {
         serde_json::from_value(serde_json::json!({
             "id":"routed/model", "name":"Local model", "provider":"opencodex",
@@ -722,7 +841,10 @@ mod tests {
         }
     }
 
-    fn status_fixture(statuses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
+    fn status_fixture(
+        statuses: Vec<&'static str>,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
@@ -752,8 +874,7 @@ mod tests {
                         break;
                     }
                 }
-                let body = "{}";
-                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").unwrap();
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
         (url, handle)
@@ -797,7 +918,7 @@ mod tests {
             (vec!["503 Service Unavailable"; 4], 4),
             (vec!["401 Unauthorized"], 1),
         ] {
-            let (url, server) = status_fixture(statuses);
+            let (url, server) = status_fixture(statuses, "{}");
             let provider = bind_credential(
                 resolve_model("claude-sonnet-4-5").unwrap(),
                 credential("api_key"),
@@ -820,6 +941,62 @@ mod tests {
                 }
             }
             assert_eq!(starts, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_rejections_keep_status_code_and_body_in_terminal_events() {
+        let body =
+            r#"{"error":{"code":"model_not_found","message":"requested model unavailable"}}"#;
+        for (selection, credential_type) in [
+            ("openai/gpt-5.4", "api_key"),
+            ("openai-codex/gpt-5.4", "oauth"),
+        ] {
+            let (url, server) = status_fixture(vec!["400 Bad Request"], body);
+            let provider = bind_credential(
+                resolve_model(selection).unwrap(),
+                credential(credential_type),
+            )
+            .unwrap()
+            .with_base_url(&url)
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            assert!(
+                provider
+                    .stream(&[ChatMessage::user("hi")], &[], tx)
+                    .await
+                    .is_err()
+            );
+            server.join().unwrap();
+            let mut starts = 0;
+            let mut errors = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::AttemptStarted { .. } => starts += 1,
+                    StreamEvent::AttemptFinished {
+                        outcome, error, ..
+                    } => {
+                        assert_eq!(outcome, AttemptOutcome::Failed);
+                        errors.push(error.unwrap());
+                    }
+                    StreamEvent::ProviderError {
+                        kind, message, ..
+                    } => {
+                        assert_eq!(kind, ProviderFailureKind::InvalidRequest);
+                        errors.push(message);
+                    }
+                    StreamEvent::Completed { .. } | StreamEvent::Retrying { .. } => {
+                        panic!("A rejected model must fail without retry or completion");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(starts, 1);
+            assert_eq!(errors.len(), 2);
+            for error in errors {
+                assert!(error.contains("HTTP 400"), "{error}");
+                assert!(error.contains(body), "{error}");
+            }
         }
     }
 

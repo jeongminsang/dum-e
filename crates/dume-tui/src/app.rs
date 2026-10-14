@@ -842,6 +842,9 @@ pub struct App {
     pub session_timing_complete: bool,
     pub last_routing_decision: Option<dume_worker::routing::RoutingDecision>,
     active_request_model: Option<String>,
+    active_thinking: Option<ThinkingLevel>,
+    thinking_preferences: dume_provider::reasoning::ReasoningPreferences,
+    thinking_path: std::path::PathBuf,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -939,6 +942,17 @@ fn format_session_metrics(metrics: &dume_store::ConversationRuntimeMetrics) -> S
                 },
                 usage
             ));
+            if let Some(identity) = attempt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("response_identity"))
+            {
+                text.push_str(&format!(
+                    "; server={} response={}",
+                    identity["model"].as_str().unwrap_or("unknown"),
+                    identity["response_id"].as_str().unwrap_or("unknown")
+                ));
+            }
         }
     }
     for tool in &metrics.tool_executions {
@@ -1028,24 +1042,15 @@ fn find_resumable_run(
     }))
 }
 
-pub fn persist_last_used_model(model: &str) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
-    let mut obj = if let Ok(content) = std::fs::read_to_string(&store_path) {
-        serde_json::from_str::<serde_json::Value>(&content)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if let Some(map) = obj.as_object_mut() {
-        map.insert("last_used_model".to_string(), serde_json::json!(model));
-    }
-    if let Some(parent) = store_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(serialized) = serde_json::to_string_pretty(&obj) {
-        let _ = std::fs::write(&store_path, serialized);
-    }
+pub fn persist_last_used_model(model: &str) -> Result<()> {
+    persist_model_to(&dume_provider::reasoning::preferences_path(), model)
+}
+
+fn persist_model_to(path: &std::path::Path, model: &str) -> Result<()> {
+    dume_provider::reasoning::update_settings(path, |settings| {
+        settings.insert("last_used_model".into(), serde_json::json!(model));
+        Ok(())
+    })
 }
 
 fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
@@ -1090,11 +1095,12 @@ impl App {
         match target {
             ModelSelectorTarget::Conversation => {
                 let new_model = selected.expect("conversation model selection");
-                persist_last_used_model(&new_model);
+                persist_model_to(&self.thinking_path, &new_model)?;
                 self.messages.push(ChatMessage::ui_notice(format!(
                     "Switched model to '{new_model}'"
                 )));
                 self.model = new_model;
+                self.restore_thinking();
                 self.session_id = dume_provider::types::StreamRequestContext::new().session_id;
             }
             ModelSelectorTarget::Subagents { path, .. } => {
@@ -1116,6 +1122,7 @@ impl App {
         self.current_run_id = Some(run_id);
         self.last_routing_decision = None;
         self.active_request_model = None;
+        self.active_thinking = None;
     }
 
     fn status_model(&self) -> &str {
@@ -1133,6 +1140,78 @@ impl App {
         }
     }
 
+    fn restore_thinking(&mut self) {
+        self.thinking = dume_provider::resolve_model(&self.model)
+            .ok()
+            .map(|model| self.thinking_for(&model))
+            .unwrap_or_default();
+    }
+
+    fn thinking_for(&self, model: &ModelInfo) -> ThinkingLevel {
+        let effort = self
+            .thinking_preferences
+            .get(&model.qualified_id())
+            .copied()
+            .unwrap_or_default();
+        if model.validate_effort(effort).is_ok() {
+            effort
+        } else {
+            ThinkingLevel::Default
+        }
+    }
+
+    fn cycle_thinking(&mut self, model: ModelInfo) {
+        let levels = model.supported_efforts();
+        if levels.len() <= 1 {
+            self.messages.push(ChatMessage::ui_notice(format!(
+                "Thinking adjustment is unavailable for {}.",
+                model.qualified_id()
+            )));
+            return;
+        }
+        let current = self.thinking_for(&model);
+        let index = levels
+            .iter()
+            .position(|level| *level == current)
+            .unwrap_or(0);
+        let next = levels[(index + 1) % levels.len()];
+        match dume_provider::reasoning::save_effort(&self.thinking_path, &model, next) {
+            Ok(()) => {
+                self.thinking_preferences.insert(model.qualified_id(), next);
+                self.restore_thinking();
+            }
+            Err(error) => self.messages.push(ChatMessage::ui_notice(format!(
+                "Could not save thinking setting: {error:#}"
+            ))),
+        }
+    }
+
+    fn status_thinking(&self) -> ThinkingLevel {
+        if self.is_busy {
+            self.active_thinking.unwrap_or(self.thinking)
+        } else {
+            self.thinking
+        }
+    }
+
+    fn picker_thinking(&self) -> ThinkingLevel {
+        if let ModalState::ModelSelector {
+            target,
+            filtered,
+            selected_idx,
+            ..
+        } = &self.modal
+        {
+            if let Some(model) = selected_idx
+                .checked_sub(target.model_offset())
+                .and_then(|index| filtered.get(index))
+            {
+                return self.thinking_for(model);
+            }
+        }
+        self.thinking
+    }
+
     pub fn new(model: impl Into<String>) -> Self {
         let m = model.into();
         let effective_model = if m == "anthropic/claude-sonnet-4-5" || m.is_empty() {
@@ -1142,9 +1221,25 @@ impl App {
         };
 
         let recent_sessions = load_recent_sessions_overview();
+        let thinking_path = dume_provider::reasoning::preferences_path();
+        let preferences = dume_provider::reasoning::load_preferences(&thinking_path);
+        let error = preferences
+            .as_ref()
+            .err()
+            .map(|error| format!("Could not load thinking settings: {error:#}"));
+        let thinking_preferences = preferences.unwrap_or_default();
+        let thinking = dume_provider::resolve_model(&effective_model)
+            .ok()
+            .and_then(|model| {
+                thinking_preferences
+                    .get(&model.qualified_id())
+                    .copied()
+                    .filter(|effort| model.validate_effort(*effort).is_ok())
+            })
+            .unwrap_or_default();
 
         Self {
-            messages: Vec::new(),
+            messages: error.into_iter().map(ChatMessage::ui_notice).collect(),
             input_buffer: String::new(),
             cursor_pos: 0, // In characters, not bytes!
             streaming_text: String::new(),
@@ -1152,7 +1247,10 @@ impl App {
             auto_scroll: true,
             is_busy: false,
             model: effective_model,
-            thinking: ThinkingLevel::Off,
+            thinking,
+            thinking_preferences,
+            thinking_path,
+            active_thinking: None,
             theme: Theme::default(),
             skills: SkillRegistry::load_default(),
             autocomplete_index: 0,
@@ -1548,8 +1646,9 @@ impl App {
                 self.active_request_model = None;
                 self.last_routing_decision = Some(decision);
             }
-            ConversationEvent::Stream(StreamEvent::AttemptStarted { model, .. }) => {
+            ConversationEvent::Stream(StreamEvent::AttemptStarted { model, context }) => {
                 self.active_request_model = Some(model);
+                self.active_thinking = context.reasoning_effort;
             }
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
                 self.streaming_text.push_str(&delta);
@@ -1614,6 +1713,7 @@ impl App {
                 self.streaming_text.clear();
                 self.is_busy = false;
                 self.active_request_model = None;
+                self.active_thinking = None;
                 self.busy_started_at = None;
             }
             ConversationEvent::OAuthComplete { provider, result } => {
@@ -1713,6 +1813,7 @@ impl App {
             }
             ConversationEvent::CatalogRefreshFinished(result) => match result {
                 Ok(Some(count)) => {
+                    self.restore_thinking();
                     self.messages.push(ChatMessage::ui_notice(format!(
                         "Model catalog updated ({count} models)."
                     )));
@@ -2223,7 +2324,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 f,
                 chunks[2],
                 app.status_model(),
-                app.thinking,
+                app.status_thinking(),
                 app.is_busy,
                 elapsed_secs,
                 last_run.as_deref(),
@@ -2260,7 +2361,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         filter,
                         provider_tabs,
                         *active_tab_idx,
-                        app.thinking,
+                        app.picker_thinking(),
                         &app.model,
                         target,
                         &app.theme,
@@ -2462,9 +2563,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         crossterm::event::KeyCode::Esc => {
                                             app.modal = ModalState::None;
                                         }
-                                        crossterm::event::KeyCode::Tab => {
-                                            if matches!(target, ModelSelectorTarget::Conversation) {
-                                                app.thinking = app.thinking.next();
+                                        _ if matches!(keybindings.action(key), Action::Tab) => {
+                                            if let Some(model) = selected_idx.checked_sub(target.model_offset()).and_then(|index| filtered.get(index)).cloned() {
+                                                app.cycle_thinking(model);
                                             }
                                         }
                                         crossterm::event::KeyCode::Left => {
@@ -2885,6 +2986,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                                 app.conversation_id = loaded_rec.id.clone();
                                                                 let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
+                                                                app.restore_thinking();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
                                                                 for mr in msg_recs {
@@ -3222,7 +3324,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.cursor_pos = app.input_buffer.chars().count();
                                         app.autocomplete_dismissed = true;
                                     } else {
-                                        app.thinking = app.thinking.next();
+                                        match dume_provider::resolve_model(&app.model) {
+                                            Ok(model) => app.cycle_thinking(model),
+                                            Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not change thinking: {error:#}"))),
+                                        }
                                     }
                                 }
                                 Action::PageUp => {
@@ -3408,9 +3513,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             continue;
                                         } else if trimmed.starts_with("/model ") {
                                             let new_model = trimmed[7..].trim().to_string();
-                                            persist_last_used_model(&new_model);
+                                            if let Err(error) = persist_model_to(&app.thinking_path, &new_model) {
+                                                app.messages.push(ChatMessage::ui_notice(format!("Could not save model selection: {error:#}")));
+                                                continue;
+                                            }
                                             app.messages.push(ChatMessage::ui_notice(format!("Switched model to '{}'", new_model)));
                                             app.model = new_model;
+                                            app.restore_thinking();
                                             app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             continue;
                                         } else if trimmed == "/subagents" {
@@ -3584,6 +3693,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                                 app.conversation_id = loaded_rec.id.clone();
                                                                 let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
+                                                                app.restore_thinking();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
                                                                 for mr in msg_recs {
@@ -4461,6 +4571,7 @@ struct StreamTurn {
     reasoning: Vec<serde_json::Value>,
     deepseek_reasoning: String,
     gemini_parts: Vec<serde_json::Value>,
+    anthropic_thinking: Vec<serde_json::Value>,
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
@@ -4494,6 +4605,9 @@ impl StreamTurn {
             StreamEvent::CodexReasoning(items) => self.reasoning.extend(items.iter().cloned()),
             StreamEvent::DeepSeekReasoning(delta) => self.deepseek_reasoning.push_str(delta),
             StreamEvent::GeminiParts(parts) => self.gemini_parts.extend(parts.iter().cloned()),
+            StreamEvent::AnthropicThinking(parts) => {
+                self.anthropic_thinking.extend(parts.iter().cloned())
+            }
             StreamEvent::ToolCallDelta {
                 index,
                 id,
@@ -4523,6 +4637,7 @@ impl StreamTurn {
             }
             StreamEvent::Usage(_) => {}
             StreamEvent::AttemptStarted { .. }
+            | StreamEvent::ResponseIdentity(_)
             | StreamEvent::AttemptFinished { .. }
             | StreamEvent::ProviderError { .. }
             | StreamEvent::Retrying { .. } => {}
@@ -4566,6 +4681,7 @@ impl StreamTurn {
             message.deepseek_reasoning = Some(self.deepseek_reasoning);
         }
         message.gemini_parts = self.gemini_parts;
+        message.anthropic_thinking = self.anthropic_thinking;
         Ok((message, calls))
     }
 }
@@ -4626,13 +4742,15 @@ where
                 }
                 turn.push(&event)?;
             }
-            turn.finish().and_then(|(assistant, calls)| {
+            Ok::<_, anyhow::Error>(turn.finish().and_then(|(assistant, calls)| {
                 anyhow::ensure!(calls.is_empty(), "tool calls are disabled for /btw");
                 Ok(assistant)
-            })
+            }))
         };
         let operation = async {
-            tokio::try_join!(stream(model.to_string(), messages, context, event_tx), collect).map(|(_, msg)| msg)
+            let (result, message) = tokio::try_join!(async { Ok::<_, anyhow::Error>(stream(model.to_string(), messages, context, event_tx).await) }, collect)?;
+            result?;
+            message
         };
         let result = session.with_checkpoints(&cancellation, async {
             tokio::select! {
@@ -4710,13 +4828,13 @@ where
                         | StreamEvent::Usage(_)
                         | StreamEvent::AttemptStarted { .. }
                         | StreamEvent::AttemptFinished { .. }
+                        | StreamEvent::ResponseIdentity(_)
                         | StreamEvent::Retrying { .. }
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }
             }
-            let (assistant, calls) = turn.finish()?;
-            Ok((assistant, calls, actual_model))
+            Ok((turn.finish(), actual_model))
         };
         // Both futures are scoped: errors drop the other side, never detach a producer.
         let effective_model = if let (Some(snapshot), Some(session)) =
@@ -4736,11 +4854,14 @@ where
         } else {
             original_model.to_string()
         };
-        let (prepared, (assistant, tool_calls, actual_model)) = tokio::select! {
+        let (prepared, (turn, actual_model)) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
-            result = async { tokio::try_join!(stream(messages.clone(), tools, session_id.clone(), effective_model, sub_tx), collect) } => result?,
+            // Drain queued attempt evidence when the producer fails; collector errors still cancel it.
+            result = async { tokio::try_join!(async { Ok::<_, anyhow::Error>(stream(messages.clone(), tools, session_id.clone(), effective_model, sub_tx).await) }, collect) } => result?,
         };
+        let prepared = prepared?;
+        let (assistant, tool_calls) = turn?;
         dispatcher.set_model(actual_model.as_deref().unwrap_or(&prepared.effective_model));
         *messages = prepared.messages;
         messages.push(assistant.clone());
@@ -4869,6 +4990,67 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_picker_settings_restore_per_model_and_skip_unsupported_levels() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new("openai-codex/gpt-5.4");
+        app.thinking_path = directory.path().join("models-store.json");
+        app.thinking_preferences.clear();
+        let mut first = dume_provider::resolve_model("openai-codex/gpt-5.4").unwrap();
+        first.reasoning_levels = Some(vec![ThinkingLevel::Low, ThinkingLevel::High]);
+        app.cycle_thinking(first.clone());
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::Low);
+        app.cycle_thinking(first.clone());
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        let mut second = first.clone();
+        second.provider = "openai".into();
+        assert_eq!(app.thinking_for(&second), ThinkingLevel::Default);
+        app.cycle_thinking(second.clone());
+        assert_eq!(app.thinking_for(&second), ThinkingLevel::Low);
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        app.thinking_preferences = dume_provider::reasoning::load_preferences(&app.thinking_path).unwrap();
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        let mut unsupported = first.clone();
+        unsupported.reasoning_levels = None;
+        assert_eq!(app.thinking_for(&unsupported), ThinkingLevel::Default);
+        app.cycle_thinking(unsupported);
+        assert!(app.messages.last().unwrap().content.contains("unavailable"));
+        app.modal = ModalState::model_selector(vec![first], &app.model, ModelSelectorTarget::Conversation);
+        assert_eq!(app.picker_thinking(), ThinkingLevel::High);
+    }
+
+    #[test]
+    fn status_keeps_requested_model_and_provider_errors_leave_input_available() {
+        let mut app = App::new("openai-codex/gpt-5.4");
+        app.is_busy = true;
+        let mut context = dume_provider::types::StreamRequestContext::new();
+        context.reasoning_effort = Some(ThinkingLevel::High);
+        app.receive(ConversationEvent::Stream(StreamEvent::AttemptStarted {
+            context: context.clone(), model: app.model.clone(),
+        }));
+        assert_eq!(app.status_thinking(), ThinkingLevel::High);
+        for identity in [
+            dume_provider::types::ResponseIdentity::default(),
+            dume_provider::types::ResponseIdentity {
+                model: Some("provider-alias".into()), response_id: Some("response-id".into()),
+            },
+        ] {
+            app.receive(ConversationEvent::Stream(StreamEvent::ResponseIdentity(identity.clone())));
+            app.receive(ConversationEvent::Stream(StreamEvent::AttemptFinished {
+                context: context.clone(), model: app.model.clone(),
+                outcome: dume_provider::AttemptOutcome::Succeeded, duration_ms: 1, usage: None, error: None, identity,
+            }));
+            assert_eq!(app.status_model(), app.model);
+        }
+        let error = "Provider: model_not_found: requested model is unavailable";
+        app.receive(ConversationEvent::Finished {
+            run_id: None, messages: Vec::new(), error: Some(error.into()), session_id: None,
+        });
+        assert!(!app.is_busy);
+        assert_eq!(app.status_model(), app.model);
+        assert_eq!(app.messages.last().unwrap().content, format!("Error: {error}"));
+    }
     use dume_provider::types::Role;
     use std::collections::VecDeque;
 
@@ -4913,6 +5095,7 @@ mod tests {
         assert_eq!(draft.settings.models.complex, None);
         let app = App::new("parent/model");
         let model = ModelInfo {
+            reasoning_levels: None,
             id: "selected".into(),
             name: "선택".into(),
             provider: "fixture".into(),
@@ -5630,6 +5813,7 @@ mod tests {
                 .await
                 .unwrap();
                 send(StreamEvent::AttemptFinished {
+                    identity: Default::default(),
                     context: context.clone(),
                     model: "fake/model".into(),
                     outcome: dume_provider::types::AttemptOutcome::Failed,
@@ -5661,6 +5845,7 @@ mod tests {
                 send(StreamEvent::TextDelta("answer".into())).await.unwrap();
                 send(completed("stop")).await.unwrap();
                 send(StreamEvent::AttemptFinished {
+                    identity: Default::default(),
                     context: retry_context,
                     model: "fake/model".into(),
                     outcome: dume_provider::types::AttemptOutcome::Succeeded,
@@ -5976,6 +6161,7 @@ mod tests {
                         }
                         events
                             .send(StreamEvent::AttemptFinished {
+                                identity: Default::default(),
                                 context,
                                 model: "test".into(),
                                 outcome: dume_provider::AttemptOutcome::Succeeded,
@@ -6070,6 +6256,91 @@ mod tests {
             events.push(event);
         }
         (result, requests, events)
+    }
+
+    #[tokio::test]
+    async fn producer_error_drains_final_attempt_identity_before_ending_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(HarnessStore::in_memory(directory.path().join("artifacts")).unwrap());
+        store
+            .create_conversation("identity-test", "/tmp", "test", "session")
+            .unwrap();
+        let scope = RuntimeScope::Conversation("identity-test".into());
+        let receipt = store
+            .admit_input(scope.clone(), "input", InputKind::Submit, "fixture")
+            .unwrap();
+        let session = RunSession::start(
+            store.clone(),
+            scope,
+            receipt.run_id.as_deref().unwrap(),
+            "identity-test",
+        )
+        .unwrap();
+        let mut dispatcher =
+            ToolDispatcher::new(directory.path(), "test", CancellationToken::new())
+                .with_store(store.clone());
+        let (tx, _rx) = mpsc::channel(100);
+        let mut messages = vec![ChatMessage::user("fixture")];
+        let result = run_conversation(
+            &mut messages,
+            &tx,
+            &mut dispatcher,
+            &mut "session".to_string(),
+            &CancellationToken::new(),
+            Some(&session),
+            1,
+            None,
+            "test",
+            |_, _, _, _, events| async move {
+                let context = dume_provider::types::StreamRequestContext::from_ids(
+                    "session",
+                    "failed-identity",
+                );
+                events
+                    .send(StreamEvent::AttemptStarted {
+                        context: context.clone(),
+                        model: "test".into(),
+                    })
+                    .await
+                    .unwrap();
+                events
+                    .send(delta(
+                        0,
+                        Some("write"),
+                        Some("write_file"),
+                        r#"{"path":"blocked.txt","content":"bad"}"#,
+                    ))
+                    .await
+                    .unwrap();
+                events
+                    .send(StreamEvent::AttemptFinished {
+                        context,
+                        model: "test".into(),
+                        outcome: dume_provider::AttemptOutcome::Failed,
+                        duration_ms: 1,
+                        usage: None,
+                        identity: dume_provider::types::ResponseIdentity {
+                            model: Some("other".into()),
+                            response_id: Some("response".into()),
+                        },
+                        error: Some("Provider rejected requested model".into()),
+                    })
+                    .await
+                    .unwrap();
+                // All sends complete in one poll; the producer error must not discard queued evidence.
+                anyhow::bail!("Provider rejected requested model");
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("Provider rejected requested model"));
+        let metrics = store.conversation_runtime_metrics("identity-test").unwrap();
+        assert_eq!(metrics.model_attempts[0].state, "failed");
+        assert_eq!(
+            metrics.model_attempts[0].usage.as_ref().unwrap()["response_identity"]["model"],
+            "other"
+        );
+        assert!(metrics.tool_executions.is_empty());
+        assert!(!directory.path().join("blocked.txt").exists());
     }
 
     #[tokio::test]

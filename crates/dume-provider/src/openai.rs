@@ -3,7 +3,7 @@ use crate::types::{
     ChatMessage, ProviderFailureKind, Role, StreamEvent, StreamRequestContext, TokenUsage,
     ToolDefinition,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue, USER_AGENT};
@@ -63,6 +63,9 @@ fn openai_stream_failure(error: &Value) -> ProviderStreamFailure {
 }
 
 impl OpenAiProvider {
+    pub(crate) fn url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
+    }
     pub fn new(api_key: &str) -> Self {
         Self {
             client: LlmClient::new(),
@@ -147,7 +150,7 @@ impl OpenAiProvider {
         context: Option<&StreamRequestContext>,
         tx: &mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.url();
         let mut headers = LlmClient::build_auth_headers(&self.api_key, false)?;
 
         if let Some(profile) = &self.opencode_profile {
@@ -257,6 +260,22 @@ impl OpenAiProvider {
             }
         });
 
+        if let Some(effort) = context
+            .and_then(|ctx| ctx.reasoning_effort)
+            .filter(|effort| !effort.is_default())
+        {
+            if self.deepseek {
+                if effort == crate::reasoning::ReasoningEffort::None {
+                    body["thinking"] = json!({"type": "disabled"});
+                } else {
+                    body["thinking"] = json!({"type": "enabled"});
+                    body["reasoning_effort"] = json!(effort);
+                }
+            } else {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
+
         if !tools.is_empty() {
             let tools_val: Vec<Value> = tools
                 .iter()
@@ -276,12 +295,13 @@ impl OpenAiProvider {
 
         let resp = self.client.post_once(&url, headers, &body).await?;
         let mut stream = resp.bytes_stream().eventsource();
+        let mut finish_reason = None;
 
         while let Some(event_res) = stream.next().await {
             match event_res {
                 Ok(event) => {
                     if event.data.trim() == "[DONE]" {
-                        bail!("OpenAI stream ended without a finish reason");
+                        break;
                     }
                     {
                         let parsed = serde_json::from_str::<Value>(&event.data)
@@ -289,27 +309,33 @@ impl OpenAiProvider {
                         if let Some(error) = parsed.get("error") {
                             return Err(anyhow::Error::new(openai_stream_failure(error)));
                         }
+                        let identity =
+                            crate::types::ResponseIdentity::from_response(&parsed, "model", "id");
+                        if identity.model.is_some() || identity.response_id.is_some() {
+                            tx.send(StreamEvent::ResponseIdentity(identity)).await?;
+                        }
                         anyhow::ensure!(parsed["choices"].is_array(), "Missing OpenAI choices");
-                        if self.deepseek {
-                            if let Some(usage) = parsed.get("usage") {
-                                let input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
-                                let output_tokens =
-                                    usage["completion_tokens"].as_i64().unwrap_or(0);
-                                let total_tokens = usage["total_tokens"]
-                                    .as_i64()
-                                    .unwrap_or(input_tokens + output_tokens);
-                                tx.send(StreamEvent::Usage(TokenUsage {
-                                    input_tokens,
-                                    output_tokens,
-                                    total_tokens,
-                                    cache_read_tokens: usage["prompt_cache_hit_tokens"].as_i64(),
-                                    cache_write_tokens: None,
-                                    raw_usage: Some(usage.clone()),
-                                    is_complete: true,
-                                }))
-                                .await
-                                .context("Stream receiver closed")?;
-                            }
+                        if let Some(usage) = parsed.get("usage").filter(|value| value.is_object()) {
+                            let input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
+                            let output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
+                            let total_tokens = usage["total_tokens"]
+                                .as_i64()
+                                .unwrap_or(input_tokens + output_tokens);
+                            tx.send(StreamEvent::Usage(TokenUsage {
+                                input_tokens,
+                                output_tokens,
+                                total_tokens,
+                                cache_read_tokens: if self.deepseek {
+                                    usage["prompt_cache_hit_tokens"].as_i64()
+                                } else {
+                                    usage["prompt_tokens_details"]["cached_tokens"].as_i64()
+                                },
+                                cache_write_tokens: None,
+                                raw_usage: Some(usage.clone()),
+                                is_complete: true,
+                            }))
+                            .await
+                            .context("Stream receiver closed")?;
                         }
                         if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
                             if let Some(choice) = choices.first() {
@@ -370,45 +396,7 @@ impl OpenAiProvider {
                                 if let Some(finish) =
                                     choice.get("finish_reason").and_then(|f| f.as_str())
                                 {
-                                    tx.send(StreamEvent::Completed {
-                                        finish_reason: finish.to_string(),
-                                    })
-                                    .await
-                                    .context("Stream receiver closed")?;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        if !self.deepseek {
-                            if let Some(usage) = parsed.get("usage") {
-                                let input_tokens = usage
-                                    .get("prompt_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let output_tokens = usage
-                                    .get("completion_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let total_tokens = usage
-                                    .get("total_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(input_tokens + output_tokens);
-                                let cache_read_tokens = usage
-                                    .get("prompt_tokens_details")
-                                    .and_then(|d| d.get("cached_tokens"))
-                                    .and_then(|v| v.as_i64());
-                                if input_tokens > 0 || output_tokens > 0 || total_tokens > 0 {
-                                    let _ = tx
-                                        .send(StreamEvent::Usage(TokenUsage {
-                                            input_tokens,
-                                            output_tokens,
-                                            total_tokens,
-                                            cache_read_tokens,
-                                            cache_write_tokens: None,
-                                            raw_usage: Some(usage.clone()),
-                                            is_complete: true,
-                                        }))
-                                        .await;
+                                    finish_reason = Some(finish.to_string());
                                 }
                             }
                         }
@@ -421,7 +409,11 @@ impl OpenAiProvider {
             }
         }
 
-        bail!("OpenAI stream ended without a finish reason")
+        let finish_reason = finish_reason.context("OpenAI stream ended without a finish reason")?;
+        tx.send(StreamEvent::Completed { finish_reason })
+            .await
+            .context("Stream receiver closed")?;
+        Ok(())
     }
 }
 
@@ -429,6 +421,58 @@ impl OpenAiProvider {
 mod tests {
     use super::*;
     use crate::types::ToolCall;
+
+    #[tokio::test]
+    async fn effort_and_final_usage_identity_are_not_lost_after_finish_reason() {
+        use crate::reasoning::ReasoningEffort;
+        for (deepseek, effort) in [
+            (false, ReasoningEffort::High),
+            (true, ReasoningEffort::None),
+            (true, ReasoningEffort::High),
+            (true, ReasoningEffort::Max),
+        ] {
+            let sse = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}),
+                json!({"model":"reported","id":"response","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}})
+            );
+            let (url, server) = crate::codex::tests::fixture(sse);
+            let provider = if deepseek {
+                OpenAiProvider::new_deepseek("fake")
+            } else {
+                OpenAiProvider::new("fake")
+            };
+            let mut context = StreamRequestContext::new();
+            context.reasoning_effort = Some(effort);
+            let (tx, mut rx) = mpsc::channel(16);
+            provider
+                .with_base_url(&url)
+                .stream_with_context("fixture", &[], &[], Some(&context), tx)
+                .await
+                .unwrap();
+            let (_, body) = server.join().unwrap();
+            if deepseek && effort == ReasoningEffort::None {
+                assert_eq!(body["thinking"]["type"], "disabled");
+                assert!(body.get("reasoning_effort").is_none());
+            } else {
+                assert_eq!(body["reasoning_effort"], json!(effort));
+                if deepseek {
+                    assert_eq!(body["thinking"]["type"], "enabled");
+                }
+            }
+            assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(_))));
+            assert!(
+                matches!(rx.recv().await, Some(StreamEvent::ResponseIdentity(identity)) if identity.model.as_deref() == Some("reported"))
+            );
+            assert!(
+                matches!(rx.recv().await, Some(StreamEvent::Usage(usage)) if usage.input_tokens == 7)
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(StreamEvent::Completed { .. })
+            ));
+        }
+    }
 
     #[test]
     fn structured_error_formats_classify_only_exact_codes() {

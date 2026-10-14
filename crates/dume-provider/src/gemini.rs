@@ -37,6 +37,64 @@ mod tests {
     use super::*;
     use crate::types::ToolCall;
 
+    #[tokio::test]
+    async fn model_specific_thinking_levels_and_budgets_reach_http() {
+        use crate::reasoning::ReasoningEffort;
+        for (model, effort, config) in [
+            (
+                "gemini-2.5-pro",
+                ReasoningEffort::Low,
+                json!({"thinkingBudget":1024}),
+            ),
+            (
+                "gemini-2.5-pro",
+                ReasoningEffort::Medium,
+                json!({"thinkingBudget":8192}),
+            ),
+            (
+                "gemini-2.5-pro",
+                ReasoningEffort::High,
+                json!({"thinkingBudget":24576}),
+            ),
+            (
+                "gemini-2.5-flash",
+                ReasoningEffort::None,
+                json!({"thinkingBudget":0}),
+            ),
+            (
+                "gemini-3-pro",
+                ReasoningEffort::High,
+                json!({"thinkingLevel":"high"}),
+            ),
+        ] {
+            let (url, server) = crate::codex::tests::fixture(format!(
+                "data: {}\n\n",
+                json!({"modelVersion":model,"responseId":"response","candidates":[{"finishReason":"STOP"}]})
+            ));
+            let mut context = crate::types::StreamRequestContext::new();
+            context.reasoning_effort = Some(effort);
+            let (tx, mut rx) = mpsc::channel(16);
+            GeminiProvider::new("fake")
+                .with_base_url(&url)
+                .stream_with_context(
+                    model,
+                    &[ChatMessage::user("local fixture")],
+                    &[],
+                    Some(&context),
+                    tx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                server.join().unwrap().1["generationConfig"]["thinkingConfig"],
+                config
+            );
+            assert!(
+                matches!(rx.recv().await, Some(StreamEvent::ResponseIdentity(identity)) if identity.model.as_deref() == Some(model) && identity.response_id.as_deref() == Some("response"))
+            );
+        }
+    }
+
     #[test]
     fn structured_error_status_classification_is_exact() {
         assert_eq!(
@@ -148,6 +206,12 @@ mod tests {
 }
 
 impl GeminiProvider {
+    pub(crate) fn url(&self, model: &str) -> String {
+        format!(
+            "{}/models/{model}:streamGenerateContent?alt=sse",
+            self.base_url
+        )
+    }
     pub fn new(api_key: &str) -> Self {
         Self {
             client: LlmClient::new(),
@@ -168,12 +232,40 @@ impl GeminiProvider {
         tools: &[ToolDefinition],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse",
-            self.base_url, model
-        );
+        self.stream_with_context(model, messages, tools, None, tx)
+            .await
+    }
 
-        let body = Self::request_body(messages, tools)?;
+    pub async fn stream_with_context(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        context: Option<&crate::types::StreamRequestContext>,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<()> {
+        let url = self.url(model);
+
+        let mut body = Self::request_body(messages, tools)?;
+        if let Some(effort) = context
+            .and_then(|ctx| ctx.reasoning_effort)
+            .filter(|effort| !effort.is_default())
+        {
+            use crate::reasoning::ReasoningEffort;
+            let config = if model.starts_with("gemini-2.5") {
+                let budget = match effort {
+                    ReasoningEffort::None => 0,
+                    ReasoningEffort::Low => 1024,
+                    ReasoningEffort::Medium => 8192,
+                    ReasoningEffort::High => 24576,
+                    _ => anyhow::bail!("Unsupported Gemini thinking budget"),
+                };
+                json!({"thinkingBudget": budget})
+            } else {
+                json!({"thinkingLevel": effort})
+            };
+            body["generationConfig"] = json!({"thinkingConfig": config});
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -199,6 +291,14 @@ impl GeminiProvider {
                                 })
                                 .await;
                             anyhow::bail!(message);
+                        }
+                        let identity = crate::types::ResponseIdentity::from_response(
+                            &val,
+                            "modelVersion",
+                            "responseId",
+                        );
+                        if identity.model.is_some() || identity.response_id.is_some() {
+                            tx.send(StreamEvent::ResponseIdentity(identity)).await?;
                         }
                         if let Some(usage) = val.get("usageMetadata") {
                             let input = usage
