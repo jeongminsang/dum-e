@@ -1,25 +1,17 @@
 use crate::component::{
     AutocompleteItem, LoginProviderChoice, ThinkingLevel, build_transcript_lines,
-    calculate_transcript_height,
-    render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
-    render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
-    render_resume_picker_modal, render_routing_probe_confirm_modal, render_routing_settings_modal,
-    render_status_bar, render_transcript, render_update_modal,
+    calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
+    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
+    render_oauth_waiting_modal, render_resume_picker_modal, render_routing_probe_confirm_modal,
+    render_routing_settings_modal, render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
 use crate::selection::{TextSelection, copy_to_clipboard};
+use crate::terminal::{ScreenRecovery, TerminalSession, read_events};
 use crate::theme::Theme;
-use anyhow::Result;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use anyhow::{Context, Result};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use dume_core::skills::SkillRegistry;
 use dume_core::updater::UpdateInfo;
 use dume_provider::ModelInfo;
@@ -30,7 +22,6 @@ use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
 use dume_worker::runtime::{RunSession, ToolStart};
 use dume_worker::subagent_settings::SubagentSettings;
-use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -1891,48 +1882,10 @@ pub async fn run_tui_with_target(
     target: ResumeTarget,
     routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    let backend = CrosstermBackend::new(stdout);
+    let _session = TerminalSession::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-
-    let default_hook = Arc::new(std::panic::take_hook());
-    let hook_clone = default_hook.clone();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
-        hook_clone(panic_info);
-    }));
-
-    let res = run_app(&mut terminal, model, target, routing_snapshot).await;
-
-    // Restore terminal
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
-
-    std::panic::set_hook(Box::new(move |panic_info| default_hook(panic_info)));
-
-    res
+    run_app(&mut terminal, model, target, routing_snapshot).await
 }
 
 #[cfg(unix)]
@@ -1953,30 +1906,10 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<()> {
     let keybindings = KeyBindings::load_default()?;
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<crossterm::event::Event>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<io::Result<Event>>();
     let (stream_tx, mut stream_rx) = mpsc::channel::<ConversationEvent>(100);
     let cancellation = CancellationToken::new();
 
-    let reader_cancel = cancellation.child_token();
-    tokio::spawn(async move {
-        let mut reader = crossterm::event::EventStream::new();
-        loop {
-            tokio::select! {
-                _ = reader_cancel.cancelled() => break,
-                maybe_event = reader.next() => {
-                    match maybe_event {
-                        Some(Ok(event)) => {
-                            if event_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Some(Err(_)) => {}
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
     let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
@@ -2207,6 +2140,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut screen_recovery = ScreenRecovery::new();
     let mut status_reporter = ProgramStatusReporter::new(io::stdout().is_terminal());
     let mut selection = TextSelection::default();
 
@@ -2242,9 +2177,15 @@ async fn run_app<B: ratatui::backend::Backend>(
     spawn_codex_catalog_refresh(stream_tx.clone());
     spawn_opencodex_catalog_refresh(stream_tx.clone(), app.model.starts_with("opencodex/"));
 
+    let reader_task = tokio::spawn(read_events(
+        crossterm::event::EventStream::new(),
+        event_tx,
+        cancellation.child_token(),
+    ));
+
     let result: Result<()> = async {
       'app_loop: loop {
-        terminal.draw(|f| {
+        screen_recovery.draw(terminal, |f| {
             let line_count = app.input_buffer.split('\n').count().max(1);
             let input_height = (line_count as u16 + 2)
                 .min(10)
@@ -2536,12 +2477,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.receive(ConversationEvent::RoutingProbeFinished { probe_id, message });
                 }
             }
-            Some(event) = event_rx.recv() => {
+            event = event_rx.recv() => {
+                let event = event.context("terminal input reader stopped")?;
                 let mut events = vec![event];
                 while let Ok(next) = event_rx.try_recv() {
                     events.push(next);
                 }
                 for event in events {
+                    let event = event.context("reading terminal input")?;
                     match event {
                     Event::Key(key) => {
                             if key.kind == crossterm::event::KeyEventKind::Release {
@@ -4097,8 +4040,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         Event::Resize(_, _) => {
                             selection.clear();
-                            terminal.autoresize()?;
+                            screen_recovery.request_repaint();
                         }
+                        Event::FocusGained => screen_recovery.request_repaint(),
                         _ => {}
                     }
                 }
@@ -4224,6 +4168,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     let _ = persist_handle.await;
 
     cancellation.cancel();
+    let _ = reader_task.await;
     if let ModalState::RoutingSettings(draft) | ModalState::RoutingProbeConfirm(draft) =
         &mut app.modal
     {
