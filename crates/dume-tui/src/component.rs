@@ -732,7 +732,6 @@ pub fn render_status_bar(
     theme: &Theme,
 ) {
     if area.width < 96 {
-        let short_model: String = model.chars().take(8).collect();
         let status = if is_busy {
             elapsed_secs
                 .map(|seconds| format!("RUN {:.0}s", seconds))
@@ -752,10 +751,28 @@ pub fn render_status_bar(
                     .replace(" incomplete", "!")
             })
             .unwrap_or_default();
-        let line = Line::from(format!(
-            "{short_model} {} {status} {elapsed} T{usage}",
-            thinking.label()
-        ));
+        let details = format!(" {} {status} {elapsed} T{usage}", thinking.label());
+        let model_name = model.split_once('/').map_or(model, |(_, name)| name);
+        let model_width = usize::from(area.width).saturating_sub(details.width());
+        let short_model = if model_name.width() <= model_width {
+            model_name.to_string()
+        } else if model_width == 0 {
+            String::new()
+        } else {
+            let mut name = String::new();
+            let mut width = 0;
+            for ch in model_name.chars() {
+                let char_width = ch.width().unwrap_or(0);
+                if width + char_width > model_width - 1 {
+                    break;
+                }
+                name.push(ch);
+                width += char_width;
+            }
+            name.push('…');
+            name
+        };
+        let line = Line::from(format!("{short_model}{details}"));
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.status_bar_bg)),
             area,
@@ -2055,7 +2072,7 @@ mod status_bar_tests {
         assert!(rows.iter().any(|row| row.contains('│')), "rows: {rows:?}");
     }
 
-    fn rendered_status(width: u16) -> String {
+    fn rendered_status(width: u16, model: &str) -> String {
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -2063,7 +2080,7 @@ mod status_bar_tests {
                 render_status_bar(
                     frame,
                     Rect::new(0, 0, width, 1),
-                    "test-model",
+                    model,
                     ThinkingLevel::Off,
                     false,
                     None,
@@ -2088,11 +2105,28 @@ mod status_bar_tests {
     #[test]
     fn status_bar_renders_session_outcome_and_usage_at_narrow_and_wide_sizes() {
         for width in [40, 80] {
-            let output = rendered_status(width);
+            let output = rendered_status(width, "test-model");
             assert!(output.contains("ERROR 3s"));
             assert!(output.contains("S7s"));
             assert!(output.contains("T42+1!"));
         }
+    }
+
+    #[test]
+    fn narrow_status_identifies_model_instead_of_only_provider() {
+        for width in [40, 80] {
+            let output = rendered_status(width, "openai-codex/gpt-6-astra");
+            assert!(output.contains("gpt-6-astra"), "{output}");
+            assert!(output.contains("ERROR 3s"), "{output}");
+            assert!(output.contains("T42+1!"), "{output}");
+        }
+        let output = rendered_status(32, "opencodex/한글모델이름이아주긴경우");
+        // Wide glyphs occupy a symbol cell followed by a blank buffer cell.
+        assert!(output.starts_with("한 글 모 …"), "{output}");
+        assert!(output.contains("ERROR 3s"), "{output}");
+        assert!(output.contains("T42+1!"), "{output}");
+        let output = rendered_status(120, "openai-codex/gpt-6-astra");
+        assert!(output.contains("Model: openai-codex/gpt-6-astra"));
     }
 
     #[test]

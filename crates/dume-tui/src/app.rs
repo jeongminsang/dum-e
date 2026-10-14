@@ -357,7 +357,15 @@ fn routing_snapshot_for_run(
     snapshot.with_epoch_preservation(resuming)
 }
 
-fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> ChatMessage {
+fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> Option<ChatMessage> {
+    if decision.phase != dume_store::RoutingPhase::Fixed
+        || matches!(
+            decision.reason.as_str(),
+            "disabled" | "all_roles_inherit_original" | "all_roles_match_original_model"
+        )
+    {
+        return None;
+    }
     let usage = decision
         .classifier_usage
         .as_ref()
@@ -368,13 +376,13 @@ fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> 
             )
         })
         .unwrap_or_default();
-    ChatMessage::ui_notice(format!(
+    Some(ChatMessage::ui_notice(format!(
         "라우팅: {} → {} · {}{}",
         decision.original_model,
         decision.effective_model,
         decision.notice_text(),
         usage,
-    ))
+    )))
 }
 
 fn routing_run_status(status: Option<&str>) -> bool {
@@ -833,6 +841,7 @@ pub struct App {
     pub session_elapsed_ms: i64,
     pub session_timing_complete: bool,
     pub last_routing_decision: Option<dume_worker::routing::RoutingDecision>,
+    active_request_model: Option<String>,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -1106,6 +1115,22 @@ impl App {
     fn begin_run(&mut self, run_id: String) {
         self.current_run_id = Some(run_id);
         self.last_routing_decision = None;
+        self.active_request_model = None;
+    }
+
+    fn status_model(&self) -> &str {
+        if self.is_busy {
+            self.active_request_model
+                .as_deref()
+                .or_else(|| {
+                    self.last_routing_decision
+                        .as_ref()
+                        .map(|decision| decision.effective_model.as_str())
+                })
+                .unwrap_or(&self.model)
+        } else {
+            &self.model
+        }
     }
 
     pub fn new(model: impl Into<String>) -> Self {
@@ -1150,6 +1175,7 @@ impl App {
             session_elapsed_ms: 0,
             session_timing_complete: false,
             last_routing_decision: None,
+            active_request_model: None,
         }
     }
 
@@ -1513,10 +1539,17 @@ impl App {
                 }
             }
             ConversationEvent::RoutingDecision(decision) => {
-                self.messages
-                    .retain(|message| !message.content.starts_with("라우팅: "));
-                self.messages.push(routing_decision_notice(&decision));
+                self.messages.retain(|message| {
+                    message.is_model_visible() || !message.content.starts_with("라우팅: ")
+                });
+                if let Some(notice) = routing_decision_notice(&decision) {
+                    self.messages.push(notice);
+                }
+                self.active_request_model = None;
                 self.last_routing_decision = Some(decision);
+            }
+            ConversationEvent::Stream(StreamEvent::AttemptStarted { model, .. }) => {
+                self.active_request_model = Some(model);
             }
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
                 self.streaming_text.push_str(&delta);
@@ -1559,12 +1592,15 @@ impl App {
                 let decision_notice = self
                     .last_routing_decision
                     .as_ref()
-                    .map(routing_decision_notice);
+                    .and_then(routing_decision_notice);
                 if let Some(session_id) = session_id {
                     self.session_id = session_id;
                 }
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
                 self.messages = messages;
+                self.messages.retain(|message| {
+                    message.is_model_visible() || !message.content.starts_with("라우팅: ")
+                });
                 if let Some(notice) = decision_notice {
                     self.messages
                         .retain(|message| message.content != notice.content);
@@ -1577,6 +1613,7 @@ impl App {
                 }
                 self.streaming_text.clear();
                 self.is_busy = false;
+                self.active_request_model = None;
                 self.busy_started_at = None;
             }
             ConversationEvent::OAuthComplete { provider, result } => {
@@ -2185,7 +2222,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             render_status_bar(
                 f,
                 chunks[2],
-                &app.model,
+                app.status_model(),
                 app.thinking,
                 app.is_busy,
                 elapsed_secs,
@@ -5336,8 +5373,9 @@ mod tests {
     }
 
     #[test]
-    fn routing_decision_is_visible_controlplane_and_excluded_from_model_history() {
+    fn routing_updates_status_without_notices_or_changing_model_history() {
         let mut app = App::new("original/model");
+        app.is_busy = true;
         app.messages.push(ChatMessage::user("실제 요청"));
         let history_before = model_messages(&app.messages);
         app.receive(ConversationEvent::RoutingDecision(
@@ -5354,24 +5392,92 @@ mod tests {
             },
         ));
         assert_eq!(model_messages(&app.messages), history_before);
-        assert!(
-            app.messages
-                .last()
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.status_model(), "effective/model");
+        assert_eq!(app.model, "original/model");
+        assert_eq!(
+            app.last_routing_decision
+                .as_ref()
                 .unwrap()
-                .content
-                .contains("original/model → effective/model")
-        );
-        assert!(
-            app.messages
-                .last()
+                .classifier_usage
+                .as_ref()
                 .unwrap()
-                .content
-                .contains("분류 토큰 7+2 (가격 미확인)")
+                .input_tokens,
+            7
         );
         assert_eq!(
             app.last_routing_decision.as_ref().unwrap().effective_model,
             "effective/model"
         );
+    }
+
+    #[test]
+    fn status_follows_request_attempts_and_returns_to_selected_model() {
+        let mut app = App::new("original/model");
+        let user = ChatMessage::user("라우팅: 사용자 요청");
+        app.messages.push(user.clone());
+        for reason in [
+            "disabled",
+            "all_roles_inherit_original",
+            "all_roles_match_original_model",
+        ] {
+            app.receive(ConversationEvent::RoutingDecision(
+                dume_worker::routing::RoutingDecision {
+                    original_model: app.model.clone(),
+                    effective_model: app.model.clone(),
+                    phase: dume_store::RoutingPhase::Fixed,
+                    epoch: None,
+                    reason: reason.into(),
+                    classifier_usage: None,
+                },
+            ));
+            assert_eq!(app.messages, vec![user.clone()]);
+        }
+        app.begin_run("run".into());
+        app.is_busy = true;
+        assert_eq!(app.status_model(), "original/model");
+        for (phase, model) in [
+            (dume_store::RoutingPhase::Planning, "planning/model"),
+            (
+                dume_store::RoutingPhase::Implementation,
+                "implementation/model",
+            ),
+        ] {
+            app.receive(ConversationEvent::RoutingDecision(
+                dume_worker::routing::RoutingDecision {
+                    original_model: "original/model".into(),
+                    effective_model: model.into(),
+                    phase,
+                    epoch: Some("epoch".into()),
+                    reason: "complexity_complex".into(),
+                    classifier_usage: None,
+                },
+            ));
+            assert_eq!(app.status_model(), model);
+            app.receive(ConversationEvent::Stream(StreamEvent::AttemptStarted {
+                context: dume_provider::types::StreamRequestContext::new(),
+                model: format!("{model}-actual"),
+            }));
+            assert_eq!(app.status_model(), format!("{model}-actual"));
+            assert_eq!(app.model, "original/model");
+        }
+        // A new selection during a run must not hide the model already executing.
+        app.model = "selected/next".into();
+        assert_eq!(app.status_model(), "implementation/model-actual");
+        app.receive(ConversationEvent::Finished {
+            run_id: Some("run".into()),
+            messages: vec![
+                user.clone(),
+                ChatMessage::ui_notice("라우팅: 오래된 정상 안내"),
+            ],
+            error: None,
+            session_id: None,
+        });
+        assert_eq!(app.status_model(), "selected/next");
+        assert_eq!(app.messages, vec![user]);
+        app.begin_run("next-run".into());
+        app.is_busy = true;
+        assert_eq!(app.status_model(), "selected/next");
     }
 
     #[test]
@@ -5398,7 +5504,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_keeps_latest_routing_controlplane_notice_without_changing_model_history() {
+    fn finished_keeps_routing_failure_warning_without_changing_model_history() {
         let mut app = App::new("original/model");
         app.current_run_id = Some("run-routing".into());
         app.is_busy = true;
@@ -5407,10 +5513,10 @@ mod tests {
         app.receive(ConversationEvent::RoutingDecision(
             dume_worker::routing::RoutingDecision {
                 original_model: "original/model".into(),
-                effective_model: "opencode/qa-implementation".into(),
-                phase: dume_store::RoutingPhase::Implementation,
+                effective_model: "original/model".into(),
+                phase: dume_store::RoutingPhase::Fixed,
                 epoch: Some("epoch-current".into()),
-                reason: "complexity_complex".into(),
+                reason: "transport".into(),
                 classifier_usage: Some(dume_provider::classifier::ClassifierUsage {
                     input_tokens: 4,
                     output_tokens: 2,
@@ -5427,16 +5533,17 @@ mod tests {
             assert!(
                 app.messages
                     .iter()
-                    .any(|message| message.content.contains("opencode/qa-implementation"))
+                    .any(|message| message.content.contains("분류기 서버에 연결할 수 없어"))
             );
             assert_eq!(
                 app.messages
                     .iter()
-                    .filter(|message| message.content.contains("opencode/qa-implementation"))
+                    .filter(|message| message.content.contains("분류기 서버에 연결할 수 없어"))
                     .count(),
                 1
             );
             assert_eq!(model_messages(&app.messages), history_before);
+            assert_eq!(app.status_model(), "original/model");
             if error.is_some() {
                 assert!(
                     app.messages
@@ -5448,27 +5555,29 @@ mod tests {
     }
 
     #[test]
-    fn newer_fixed_routing_decision_replaces_old_controlplane_notice_and_stale_finish_cannot_reverse_it()
-     {
+    fn normal_routing_clears_old_warning_and_stale_finish_cannot_reverse_it() {
         let mut app = App::new("original/model");
         app.current_run_id = Some("run-current".into());
         app.is_busy = true;
         let decision =
-            |effective: &str, epoch: Option<&str>| dume_worker::routing::RoutingDecision {
+            |effective: &str, epoch: Option<&str>, reason: &str| dume_worker::routing::RoutingDecision {
                 original_model: "original/model".into(),
                 effective_model: effective.into(),
                 phase: dume_store::RoutingPhase::Fixed,
                 epoch: epoch.map(str::to_string),
-                reason: "disabled".into(),
+                reason: reason.into(),
                 classifier_usage: None,
             };
         app.receive(ConversationEvent::RoutingDecision(decision(
             "old/model",
             Some("old"),
+            "transport",
         )));
+        assert_eq!(app.messages.len(), 1);
         app.receive(ConversationEvent::RoutingDecision(decision(
             "original/model",
             None,
+            "disabled",
         )));
         app.receive(ConversationEvent::Finished {
             run_id: Some("run-stale".into()),
@@ -5476,16 +5585,9 @@ mod tests {
             error: None,
             session_id: None,
         });
-        assert!(
-            app.messages
-                .iter()
-                .any(|message| message.content.contains("original/model"))
-        );
-        assert!(
-            !app.messages
-                .iter()
-                .any(|message| message.content.contains("old/model"))
-        );
+        assert!(app.messages.is_empty());
+        assert!(app.is_busy);
+        assert_eq!(app.status_model(), "original/model");
         assert_eq!(app.last_routing_decision.as_ref().unwrap().epoch, None);
     }
 

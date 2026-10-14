@@ -207,6 +207,12 @@ starting with the **next** generation request. Failed operations, reads, and
 uncertain tool results do not advance the phase. Compaction and changes to provider
 cache IDs do not reset the conversation phase.
 
+The status bar below the prompt shows the selected model while idle and the
+actual request model while working, including changes from planning to
+implementation. Routing does not change the `/model` selection. Normal routing
+decisions do not add conversation notices; classifier and configuration failures
+remain visible as warnings.
+
 Failed or incomplete classification keeps the originally selected model for that
 epoch. Fixing a key or successfully writing a file later does not retry failed
 classification within the same epoch. Changes to public settings or the baseline
