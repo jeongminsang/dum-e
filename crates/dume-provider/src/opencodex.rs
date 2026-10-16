@@ -94,6 +94,26 @@ fn parse_models(payload: &Value, base_url: &str) -> Result<Vec<ModelInfo>> {
                 provider: "opencodex".into(),
                 api: "openai-responses".into(),
                 base_url: Some(base_url.into()),
+                reasoning_levels: row
+                    .get("supported_reasoning_levels")
+                    .or_else(|| row.get("reasoning_efforts"))
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| {
+                                serde_json::from_value(
+                                    level
+                                        .get("effort")
+                                        .or_else(|| level.get("value"))
+                                        .or_else(|| level.get("id"))
+                                        .unwrap_or(level)
+                                        .clone(),
+                                )
+                                .ok()
+                            })
+                            .collect()
+                    }),
                 reasoning: row["supports_reasoning_effort"]
                     .as_bool()
                     .or_else(|| capabilities["supports_reasoning"].as_bool())
@@ -305,6 +325,7 @@ mod tests {
     fn catalog_keeps_routed_ids_metadata_and_unknown_prices() {
         let models = parse_models(&json!({"data": [
             {"id":"anthropic/model", "api_types":["responses"], "supports_reasoning_effort":true,
+             "reasoning_efforts":[{"id":"low","value":"low"},{"effort":"high"},"unknown"],
              "context_window":200000, "capabilities":{"max_output_tokens":8000, "input_modalities":["text","image"]}},
             {"id":"no-tools", "capabilities":{"supports_tool_use":false}},
             {"id":"chat-only", "api_types":["chat_completions"]},
@@ -318,6 +339,13 @@ mod tests {
         assert_eq!(models[0].max_tokens, Some(8000));
         assert_eq!(models[0].input, ["text", "image"]);
         assert!(models[0].reasoning);
+        assert_eq!(
+            models[0].reasoning_levels,
+            Some(vec![
+                crate::reasoning::ReasoningEffort::Low,
+                crate::reasoning::ReasoningEffort::High
+            ])
+        );
         assert!(models[0].cost.is_none());
         assert!(parse_models(&json!({"data":[]}), DEFAULT_BASE_URL).is_err());
     }

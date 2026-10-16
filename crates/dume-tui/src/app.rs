@@ -1,23 +1,17 @@
 use crate::component::{
-    AutocompleteItem, LoginProviderChoice, ThinkingLevel, calculate_transcript_height,
-    render_api_key_modal, render_autocomplete_dropdown, render_btw_modal, render_input_bar,
-    render_login_selector_modal, render_model_selector_modal, render_oauth_waiting_modal,
-    render_resume_picker_modal, render_routing_probe_confirm_modal, render_routing_settings_modal,
-    render_status_bar, render_transcript, render_update_modal,
+    AutocompleteItem, LoginProviderChoice, ThinkingLevel, build_transcript_lines,
+    calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
+    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
+    render_oauth_waiting_modal, render_resume_picker_modal, render_routing_probe_confirm_modal,
+    render_routing_settings_modal, render_status_bar, render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
+use crate::selection::{TextSelection, copy_to_clipboard};
+use crate::terminal::{ScreenRecovery, TerminalSession, read_events};
 use crate::theme::Theme;
-use anyhow::Result;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use anyhow::{Context, Result};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use dume_core::skills::SkillRegistry;
 use dume_core::updater::UpdateInfo;
 use dume_provider::ModelInfo;
@@ -28,7 +22,6 @@ use dume_store::{HarnessStore, RecentSessionSummary};
 use dume_worker::agent_loop::ToolDispatcher;
 use dume_worker::runtime::{RunSession, ToolStart};
 use dume_worker::subagent_settings::SubagentSettings;
-use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -38,6 +31,10 @@ use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
 
 fn save_credential_and_rotate_session(
     store: &dume_provider::CredentialStore,
@@ -351,7 +348,15 @@ fn routing_snapshot_for_run(
     snapshot.with_epoch_preservation(resuming)
 }
 
-fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> ChatMessage {
+fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> Option<ChatMessage> {
+    if decision.phase != dume_store::RoutingPhase::Fixed
+        || matches!(
+            decision.reason.as_str(),
+            "disabled" | "all_roles_inherit_original" | "all_roles_match_original_model"
+        )
+    {
+        return None;
+    }
     let usage = decision
         .classifier_usage
         .as_ref()
@@ -362,13 +367,13 @@ fn routing_decision_notice(decision: &dume_worker::routing::RoutingDecision) -> 
             )
         })
         .unwrap_or_default();
-    ChatMessage::ui_notice(format!(
+    Some(ChatMessage::ui_notice(format!(
         "라우팅: {} → {} · {}{}",
         decision.original_model,
         decision.effective_model,
         decision.notice_text(),
         usage,
-    ))
+    )))
 }
 
 fn routing_run_status(status: Option<&str>) -> bool {
@@ -827,6 +832,10 @@ pub struct App {
     pub session_elapsed_ms: i64,
     pub session_timing_complete: bool,
     pub last_routing_decision: Option<dume_worker::routing::RoutingDecision>,
+    active_request_model: Option<String>,
+    active_thinking: Option<ThinkingLevel>,
+    thinking_preferences: dume_provider::reasoning::ReasoningPreferences,
+    thinking_path: std::path::PathBuf,
 }
 
 fn get_persisted_or_default_model(model: Option<&str>) -> String {
@@ -924,6 +933,17 @@ fn format_session_metrics(metrics: &dume_store::ConversationRuntimeMetrics) -> S
                 },
                 usage
             ));
+            if let Some(identity) = attempt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("response_identity"))
+            {
+                text.push_str(&format!(
+                    "; server={} response={}",
+                    identity["model"].as_str().unwrap_or("unknown"),
+                    identity["response_id"].as_str().unwrap_or("unknown")
+                ));
+            }
         }
     }
     for tool in &metrics.tool_executions {
@@ -1013,24 +1033,15 @@ fn find_resumable_run(
     }))
 }
 
-pub fn persist_last_used_model(model: &str) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let store_path = std::path::PathBuf::from(home).join(".dume/agent/models-store.json");
-    let mut obj = if let Ok(content) = std::fs::read_to_string(&store_path) {
-        serde_json::from_str::<serde_json::Value>(&content)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if let Some(map) = obj.as_object_mut() {
-        map.insert("last_used_model".to_string(), serde_json::json!(model));
-    }
-    if let Some(parent) = store_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(serialized) = serde_json::to_string_pretty(&obj) {
-        let _ = std::fs::write(&store_path, serialized);
-    }
+pub fn persist_last_used_model(model: &str) -> Result<()> {
+    persist_model_to(&dume_provider::reasoning::preferences_path(), model)
+}
+
+fn persist_model_to(path: &std::path::Path, model: &str) -> Result<()> {
+    dume_provider::reasoning::update_settings(path, |settings| {
+        settings.insert("last_used_model".into(), serde_json::json!(model));
+        Ok(())
+    })
 }
 
 fn load_recent_sessions_overview() -> Vec<RecentSessionSummary> {
@@ -1075,11 +1086,12 @@ impl App {
         match target {
             ModelSelectorTarget::Conversation => {
                 let new_model = selected.expect("conversation model selection");
-                persist_last_used_model(&new_model);
+                persist_model_to(&self.thinking_path, &new_model)?;
                 self.messages.push(ChatMessage::ui_notice(format!(
                     "Switched model to '{new_model}'"
                 )));
                 self.model = new_model;
+                self.restore_thinking();
                 self.session_id = dume_provider::types::StreamRequestContext::new().session_id;
             }
             ModelSelectorTarget::Subagents { path, .. } => {
@@ -1100,6 +1112,95 @@ impl App {
     fn begin_run(&mut self, run_id: String) {
         self.current_run_id = Some(run_id);
         self.last_routing_decision = None;
+        self.active_request_model = None;
+        self.active_thinking = None;
+    }
+
+    fn status_model(&self) -> &str {
+        if self.is_busy {
+            self.active_request_model
+                .as_deref()
+                .or_else(|| {
+                    self.last_routing_decision
+                        .as_ref()
+                        .map(|decision| decision.effective_model.as_str())
+                })
+                .unwrap_or(&self.model)
+        } else {
+            &self.model
+        }
+    }
+
+    fn restore_thinking(&mut self) {
+        self.thinking = dume_provider::resolve_model(&self.model)
+            .ok()
+            .map(|model| self.thinking_for(&model))
+            .unwrap_or_default();
+    }
+
+    fn thinking_for(&self, model: &ModelInfo) -> ThinkingLevel {
+        let effort = self
+            .thinking_preferences
+            .get(&model.qualified_id())
+            .copied()
+            .unwrap_or_default();
+        if model.validate_effort(effort).is_ok() {
+            effort
+        } else {
+            ThinkingLevel::Default
+        }
+    }
+
+    fn cycle_thinking(&mut self, model: ModelInfo) {
+        let levels = model.supported_efforts();
+        if levels.len() <= 1 {
+            self.messages.push(ChatMessage::ui_notice(format!(
+                "Thinking adjustment is unavailable for {}.",
+                model.qualified_id()
+            )));
+            return;
+        }
+        let current = self.thinking_for(&model);
+        let index = levels
+            .iter()
+            .position(|level| *level == current)
+            .unwrap_or(0);
+        let next = levels[(index + 1) % levels.len()];
+        match dume_provider::reasoning::save_effort(&self.thinking_path, &model, next) {
+            Ok(()) => {
+                self.thinking_preferences.insert(model.qualified_id(), next);
+                self.restore_thinking();
+            }
+            Err(error) => self.messages.push(ChatMessage::ui_notice(format!(
+                "Could not save thinking setting: {error:#}"
+            ))),
+        }
+    }
+
+    fn status_thinking(&self) -> ThinkingLevel {
+        if self.is_busy {
+            self.active_thinking.unwrap_or(self.thinking)
+        } else {
+            self.thinking
+        }
+    }
+
+    fn picker_thinking(&self) -> ThinkingLevel {
+        if let ModalState::ModelSelector {
+            target,
+            filtered,
+            selected_idx,
+            ..
+        } = &self.modal
+        {
+            if let Some(model) = selected_idx
+                .checked_sub(target.model_offset())
+                .and_then(|index| filtered.get(index))
+            {
+                return self.thinking_for(model);
+            }
+        }
+        self.thinking
     }
 
     pub fn new(model: impl Into<String>) -> Self {
@@ -1111,9 +1212,25 @@ impl App {
         };
 
         let recent_sessions = load_recent_sessions_overview();
+        let thinking_path = dume_provider::reasoning::preferences_path();
+        let preferences = dume_provider::reasoning::load_preferences(&thinking_path);
+        let error = preferences
+            .as_ref()
+            .err()
+            .map(|error| format!("Could not load thinking settings: {error:#}"));
+        let thinking_preferences = preferences.unwrap_or_default();
+        let thinking = dume_provider::resolve_model(&effective_model)
+            .ok()
+            .and_then(|model| {
+                thinking_preferences
+                    .get(&model.qualified_id())
+                    .copied()
+                    .filter(|effort| model.validate_effort(*effort).is_ok())
+            })
+            .unwrap_or_default();
 
         Self {
-            messages: Vec::new(),
+            messages: error.into_iter().map(ChatMessage::ui_notice).collect(),
             input_buffer: String::new(),
             cursor_pos: 0, // In characters, not bytes!
             streaming_text: String::new(),
@@ -1121,7 +1238,10 @@ impl App {
             auto_scroll: true,
             is_busy: false,
             model: effective_model,
-            thinking: ThinkingLevel::Off,
+            thinking,
+            thinking_preferences,
+            thinking_path,
+            active_thinking: None,
             theme: Theme::default(),
             skills: SkillRegistry::load_default(),
             autocomplete_index: 0,
@@ -1144,6 +1264,7 @@ impl App {
             session_elapsed_ms: 0,
             session_timing_complete: false,
             last_routing_decision: None,
+            active_request_model: None,
         }
     }
 
@@ -1507,10 +1628,18 @@ impl App {
                 }
             }
             ConversationEvent::RoutingDecision(decision) => {
-                self.messages
-                    .retain(|message| !message.content.starts_with("라우팅: "));
-                self.messages.push(routing_decision_notice(&decision));
+                self.messages.retain(|message| {
+                    message.is_model_visible() || !message.content.starts_with("라우팅: ")
+                });
+                if let Some(notice) = routing_decision_notice(&decision) {
+                    self.messages.push(notice);
+                }
+                self.active_request_model = None;
                 self.last_routing_decision = Some(decision);
+            }
+            ConversationEvent::Stream(StreamEvent::AttemptStarted { model, context }) => {
+                self.active_request_model = Some(model);
+                self.active_thinking = context.reasoning_effort;
             }
             ConversationEvent::Stream(StreamEvent::TextDelta(delta)) => {
                 self.streaming_text.push_str(&delta);
@@ -1553,12 +1682,15 @@ impl App {
                 let decision_notice = self
                     .last_routing_decision
                     .as_ref()
-                    .map(routing_decision_notice);
+                    .and_then(routing_decision_notice);
                 if let Some(session_id) = session_id {
                     self.session_id = session_id;
                 }
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
                 self.messages = messages;
+                self.messages.retain(|message| {
+                    message.is_model_visible() || !message.content.starts_with("라우팅: ")
+                });
                 if let Some(notice) = decision_notice {
                     self.messages
                         .retain(|message| message.content != notice.content);
@@ -1571,6 +1703,8 @@ impl App {
                 }
                 self.streaming_text.clear();
                 self.is_busy = false;
+                self.active_request_model = None;
+                self.active_thinking = None;
                 self.busy_started_at = None;
             }
             ConversationEvent::OAuthComplete { provider, result } => {
@@ -1670,6 +1804,7 @@ impl App {
             }
             ConversationEvent::CatalogRefreshFinished(result) => match result {
                 Ok(Some(count)) => {
+                    self.restore_thinking();
                     self.messages.push(ChatMessage::ui_notice(format!(
                         "Model catalog updated ({count} models)."
                     )));
@@ -1747,48 +1882,10 @@ pub async fn run_tui_with_target(
     target: ResumeTarget,
     routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    let backend = CrosstermBackend::new(stdout);
+    let _session = TerminalSession::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-
-    let default_hook = Arc::new(std::panic::take_hook());
-    let hook_clone = default_hook.clone();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
-        hook_clone(panic_info);
-    }));
-
-    let res = run_app(&mut terminal, model, target, routing_snapshot).await;
-
-    // Restore terminal
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
-
-    std::panic::set_hook(Box::new(move |panic_info| default_hook(panic_info)));
-
-    res
+    run_app(&mut terminal, model, target, routing_snapshot).await
 }
 
 #[cfg(unix)]
@@ -1809,30 +1906,10 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut routing_snapshot: dume_worker::routing::RoutingSnapshot,
 ) -> Result<()> {
     let keybindings = KeyBindings::load_default()?;
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<crossterm::event::Event>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<io::Result<Event>>();
     let (stream_tx, mut stream_rx) = mpsc::channel::<ConversationEvent>(100);
     let cancellation = CancellationToken::new();
 
-    let reader_cancel = cancellation.child_token();
-    tokio::spawn(async move {
-        let mut reader = crossterm::event::EventStream::new();
-        loop {
-            tokio::select! {
-                _ = reader_cancel.cancelled() => break,
-                maybe_event = reader.next() => {
-                    match maybe_event {
-                        Some(Ok(event)) => {
-                            if event_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Some(Err(_)) => {}
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let db_path = std::path::PathBuf::from(home).join(".dume/agent/harness.db");
     let artifacts_dir = std::path::PathBuf::from(".dume/artifacts");
@@ -2063,7 +2140,10 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut current_stream_cancel: Option<CancellationToken> = None;
     let mut anim_tick: usize = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut screen_recovery = ScreenRecovery::new();
     let mut status_reporter = ProgramStatusReporter::new(io::stdout().is_terminal());
+    let mut selection = TextSelection::default();
 
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -2097,9 +2177,15 @@ async fn run_app<B: ratatui::backend::Backend>(
     spawn_codex_catalog_refresh(stream_tx.clone());
     spawn_opencodex_catalog_refresh(stream_tx.clone(), app.model.starts_with("opencodex/"));
 
+    let reader_task = tokio::spawn(read_events(
+        crossterm::event::EventStream::new(),
+        event_tx,
+        cancellation.child_token(),
+    ));
+
     let result: Result<()> = async {
       'app_loop: loop {
-        terminal.draw(|f| {
+        screen_recovery.draw(terminal, |f| {
             let line_count = app.input_buffer.split('\n').count().max(1);
             let input_height = (line_count as u16 + 2)
                 .min(10)
@@ -2125,7 +2211,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.scroll_offset = max_scroll;
             } else if app.scroll_offset >= max_scroll {
                 app.scroll_offset = max_scroll;
-                app.auto_scroll = true;
+                app.auto_scroll = !selection.is_dragging();
             }
 
             render_transcript(
@@ -2178,8 +2264,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             render_status_bar(
                 f,
                 chunks[2],
-                &app.model,
-                app.thinking,
+                app.status_model(),
+                app.status_thinking(),
                 app.is_busy,
                 elapsed_secs,
                 last_run.as_deref(),
@@ -2216,7 +2302,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         filter,
                         provider_tabs,
                         *active_tab_idx,
-                        app.thinking,
+                        app.picker_thinking(),
                         &app.model,
                         target,
                         &app.theme,
@@ -2356,6 +2442,33 @@ async fn run_app<B: ratatui::backend::Backend>(
                     );
                 }
             }
+            if matches!(app.modal, ModalState::None) && autocomplete_items.is_empty() {
+                selection.update_viewport(
+                    f.buffer_mut(),
+                    transcript_area,
+                    chunks[1].inner(ratatui::layout::Margin::new(1, 1)),
+                    app.scroll_offset,
+                );
+                if selection.selects_transcript() {
+                    let (lines, _) = build_transcript_lines(
+                        &app.messages,
+                        &app.streaming_text,
+                        &app.recent_sessions,
+                        transcript_area.width as usize,
+                        &app.theme,
+                    );
+                    selection.refresh_transcript(lines);
+                }
+                selection.highlight(
+                    f.buffer_mut(),
+                    ratatui::style::Style::default()
+                        .bg(app.theme.accent)
+                        .fg(ratatui::style::Color::Black),
+                );
+            } else {
+                selection.clear();
+                selection.update_viewport(f.buffer_mut(), Default::default(), Default::default(), 0);
+            }
         })?;
 
         tokio::select! {
@@ -2364,17 +2477,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.receive(ConversationEvent::RoutingProbeFinished { probe_id, message });
                 }
             }
-            Some(event) = event_rx.recv() => {
+            event = event_rx.recv() => {
+                let event = event.context("terminal input reader stopped")?;
                 let mut events = vec![event];
                 while let Ok(next) = event_rx.try_recv() {
                     events.push(next);
                 }
                 for event in events {
+                    let event = event.context("reading terminal input")?;
                     match event {
                     Event::Key(key) => {
                             if key.kind == crossterm::event::KeyEventKind::Release {
                                 continue;
                             }
+                            selection.clear();
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
                                 ModalState::ModelSelector {
@@ -2390,9 +2506,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         crossterm::event::KeyCode::Esc => {
                                             app.modal = ModalState::None;
                                         }
-                                        crossterm::event::KeyCode::Tab => {
-                                            if matches!(target, ModelSelectorTarget::Conversation) {
-                                                app.thinking = app.thinking.next();
+                                        _ if matches!(keybindings.action(key), Action::Tab) => {
+                                            if let Some(model) = selected_idx.checked_sub(target.model_offset()).and_then(|index| filtered.get(index)).cloned() {
+                                                app.cycle_thinking(model);
                                             }
                                         }
                                         crossterm::event::KeyCode::Left => {
@@ -2813,6 +2929,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                                 app.conversation_id = loaded_rec.id.clone();
                                                                 let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
+                                                                app.restore_thinking();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
                                                                 for mr in msg_recs {
@@ -3150,7 +3267,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.cursor_pos = app.input_buffer.chars().count();
                                         app.autocomplete_dismissed = true;
                                     } else {
-                                        app.thinking = app.thinking.next();
+                                        match dume_provider::resolve_model(&app.model) {
+                                            Ok(model) => app.cycle_thinking(model),
+                                            Err(error) => app.messages.push(ChatMessage::ui_notice(format!("Could not change thinking: {error:#}"))),
+                                        }
                                     }
                                 }
                                 Action::PageUp => {
@@ -3336,9 +3456,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             continue;
                                         } else if trimmed.starts_with("/model ") {
                                             let new_model = trimmed[7..].trim().to_string();
-                                            persist_last_used_model(&new_model);
+                                            if let Err(error) = persist_model_to(&app.thinking_path, &new_model) {
+                                                app.messages.push(ChatMessage::ui_notice(format!("Could not save model selection: {error:#}")));
+                                                continue;
+                                            }
                                             app.messages.push(ChatMessage::ui_notice(format!("Switched model to '{}'", new_model)));
                                             app.model = new_model;
+                                            app.restore_thinking();
                                             app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                             continue;
                                         } else if trimmed == "/subagents" {
@@ -3512,6 +3636,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                                 app.conversation_id = loaded_rec.id.clone();
                                                                 let _ = refresh_session_timing(&mut app, &harness_store);
                                                                 app.model = loaded_rec.model.clone();
+                                                                app.restore_thinking();
                                                                 app.session_id = loaded_rec.provider_session_id.clone();
                                                                 app.messages.clear();
                                                                 for mr in msg_recs {
@@ -3769,6 +3894,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         Event::Mouse(mouse) => {
                             match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if matches!(app.modal, ModalState::None) && app.get_autocomplete_items().is_empty() => {
+                                    let (lines, _) = build_transcript_lines(
+                                        &app.messages,
+                                        &app.streaming_text,
+                                        &app.recent_sessions,
+                                        terminal.size()?.width as usize,
+                                        &app.theme,
+                                    );
+                                    if selection.start(mouse, lines) {
+                                        app.auto_scroll = false;
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => selection.drag(mouse),
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if let Some(text) = selection.release(mouse) {
+                                        if let Err(error) = copy_to_clipboard(text).await {
+                                            app.messages.push(ChatMessage::ui_notice(format!("Could not copy selection: {error}")));
+                                        }
+                                    }
+                                }
                                 MouseEventKind::ScrollUp => {
                                     match &mut app.modal {
                                         ModalState::ResumePicker { sessions, selected_idx } => {
@@ -3859,6 +4005,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Event::Paste(text) => {
+                            selection.clear();
+                            let text = normalize_pasted_text(&text);
                             match &mut app.modal {
                                 ModalState::None => {
                                     app.autocomplete_dismissed = true;
@@ -3891,13 +4039,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Event::Resize(_, _) => {
-                            terminal.autoresize()?;
+                            selection.clear();
+                            screen_recovery.request_repaint();
                         }
+                        Event::FocusGained => screen_recovery.request_repaint(),
                         _ => {}
                     }
                 }
             }
             Some(stream_event) = stream_rx.recv() => {
+                if matches!(
+                    &stream_event,
+                    ConversationEvent::Compacted(_)
+                        | ConversationEvent::Stream(StreamEvent::Retrying { .. })
+                ) {
+                    selection.clear();
+                }
                 let finished_run_id = match &stream_event {
                     ConversationEvent::Finished { run_id: Some(run_id), .. }
                         if app.current_run_id.as_deref() == Some(run_id.as_str()) => Some(run_id.clone()),
@@ -4011,6 +4168,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     let _ = persist_handle.await;
 
     cancellation.cancel();
+    let _ = reader_task.await;
     if let ModalState::RoutingSettings(draft) | ModalState::RoutingProbeConfirm(draft) =
         &mut app.modal
     {
@@ -4358,6 +4516,7 @@ struct StreamTurn {
     reasoning: Vec<serde_json::Value>,
     deepseek_reasoning: String,
     gemini_parts: Vec<serde_json::Value>,
+    anthropic_thinking: Vec<serde_json::Value>,
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
@@ -4391,6 +4550,9 @@ impl StreamTurn {
             StreamEvent::CodexReasoning(items) => self.reasoning.extend(items.iter().cloned()),
             StreamEvent::DeepSeekReasoning(delta) => self.deepseek_reasoning.push_str(delta),
             StreamEvent::GeminiParts(parts) => self.gemini_parts.extend(parts.iter().cloned()),
+            StreamEvent::AnthropicThinking(parts) => {
+                self.anthropic_thinking.extend(parts.iter().cloned())
+            }
             StreamEvent::ToolCallDelta {
                 index,
                 id,
@@ -4420,6 +4582,7 @@ impl StreamTurn {
             }
             StreamEvent::Usage(_) => {}
             StreamEvent::AttemptStarted { .. }
+            | StreamEvent::ResponseIdentity(_)
             | StreamEvent::AttemptFinished { .. }
             | StreamEvent::ProviderError { .. }
             | StreamEvent::Retrying { .. } => {}
@@ -4463,6 +4626,7 @@ impl StreamTurn {
             message.deepseek_reasoning = Some(self.deepseek_reasoning);
         }
         message.gemini_parts = self.gemini_parts;
+        message.anthropic_thinking = self.anthropic_thinking;
         Ok((message, calls))
     }
 }
@@ -4523,13 +4687,15 @@ where
                 }
                 turn.push(&event)?;
             }
-            turn.finish().and_then(|(assistant, calls)| {
+            Ok::<_, anyhow::Error>(turn.finish().and_then(|(assistant, calls)| {
                 anyhow::ensure!(calls.is_empty(), "tool calls are disabled for /btw");
                 Ok(assistant)
-            })
+            }))
         };
         let operation = async {
-            tokio::try_join!(stream(model.to_string(), messages, context, event_tx), collect).map(|(_, msg)| msg)
+            let (result, message) = tokio::try_join!(async { Ok::<_, anyhow::Error>(stream(model.to_string(), messages, context, event_tx).await) }, collect)?;
+            result?;
+            message
         };
         let result = session.with_checkpoints(&cancellation, async {
             tokio::select! {
@@ -4607,13 +4773,13 @@ where
                         | StreamEvent::Usage(_)
                         | StreamEvent::AttemptStarted { .. }
                         | StreamEvent::AttemptFinished { .. }
+                        | StreamEvent::ResponseIdentity(_)
                         | StreamEvent::Retrying { .. }
                 ) {
                     tx.send(ConversationEvent::Stream(event)).await?;
                 }
             }
-            let (assistant, calls) = turn.finish()?;
-            Ok((assistant, calls, actual_model))
+            Ok((turn.finish(), actual_model))
         };
         // Both futures are scoped: errors drop the other side, never detach a producer.
         let effective_model = if let (Some(snapshot), Some(session)) =
@@ -4633,11 +4799,14 @@ where
         } else {
             original_model.to_string()
         };
-        let (prepared, (assistant, tool_calls, actual_model)) = tokio::select! {
+        let (prepared, (turn, actual_model)) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => anyhow::bail!("Conversation cancelled"),
-            result = async { tokio::try_join!(stream(messages.clone(), tools, session_id.clone(), effective_model, sub_tx), collect) } => result?,
+            // Drain queued attempt evidence when the producer fails; collector errors still cancel it.
+            result = async { tokio::try_join!(async { Ok::<_, anyhow::Error>(stream(messages.clone(), tools, session_id.clone(), effective_model, sub_tx).await) }, collect) } => result?,
         };
+        let prepared = prepared?;
+        let (assistant, tool_calls) = turn?;
         dispatcher.set_model(actual_model.as_deref().unwrap_or(&prepared.effective_model));
         *messages = prepared.messages;
         messages.push(assistant.clone());
@@ -4766,8 +4935,87 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_picker_settings_restore_per_model_and_skip_unsupported_levels() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new("openai-codex/gpt-5.4");
+        app.thinking_path = directory.path().join("models-store.json");
+        app.thinking_preferences.clear();
+        let mut first = dume_provider::resolve_model("openai-codex/gpt-5.4").unwrap();
+        first.reasoning_levels = Some(vec![ThinkingLevel::Low, ThinkingLevel::High]);
+        app.cycle_thinking(first.clone());
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::Low);
+        app.cycle_thinking(first.clone());
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        let mut second = first.clone();
+        second.provider = "openai".into();
+        assert_eq!(app.thinking_for(&second), ThinkingLevel::Default);
+        app.cycle_thinking(second.clone());
+        assert_eq!(app.thinking_for(&second), ThinkingLevel::Low);
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        app.thinking_preferences = dume_provider::reasoning::load_preferences(&app.thinking_path).unwrap();
+        assert_eq!(app.thinking_for(&first), ThinkingLevel::High);
+        let mut unsupported = first.clone();
+        unsupported.reasoning_levels = None;
+        assert_eq!(app.thinking_for(&unsupported), ThinkingLevel::Default);
+        app.cycle_thinking(unsupported);
+        assert!(app.messages.last().unwrap().content.contains("unavailable"));
+        app.modal = ModalState::model_selector(vec![first], &app.model, ModelSelectorTarget::Conversation);
+        assert_eq!(app.picker_thinking(), ThinkingLevel::High);
+    }
+
+    #[test]
+    fn status_keeps_requested_model_and_provider_errors_leave_input_available() {
+        let mut app = App::new("openai-codex/gpt-5.4");
+        app.is_busy = true;
+        let mut context = dume_provider::types::StreamRequestContext::new();
+        context.reasoning_effort = Some(ThinkingLevel::High);
+        app.receive(ConversationEvent::Stream(StreamEvent::AttemptStarted {
+            context: context.clone(), model: app.model.clone(),
+        }));
+        assert_eq!(app.status_thinking(), ThinkingLevel::High);
+        for identity in [
+            dume_provider::types::ResponseIdentity::default(),
+            dume_provider::types::ResponseIdentity {
+                model: Some("provider-alias".into()), response_id: Some("response-id".into()),
+            },
+        ] {
+            app.receive(ConversationEvent::Stream(StreamEvent::ResponseIdentity(identity.clone())));
+            app.receive(ConversationEvent::Stream(StreamEvent::AttemptFinished {
+                context: context.clone(), model: app.model.clone(),
+                outcome: dume_provider::AttemptOutcome::Succeeded, duration_ms: 1, usage: None, error: None, identity,
+            }));
+            assert_eq!(app.status_model(), app.model);
+        }
+        let error = "Provider: model_not_found: requested model is unavailable";
+        app.receive(ConversationEvent::Finished {
+            run_id: None, messages: Vec::new(), error: Some(error.into()), session_id: None,
+        });
+        assert!(!app.is_busy);
+        assert_eq!(app.status_model(), app.model);
+        assert_eq!(app.messages.last().unwrap().content, format!("Error: {error}"));
+    }
     use dume_provider::types::Role;
     use std::collections::VecDeque;
+
+    #[test]
+    fn pasted_line_endings_are_normalized_before_rendering_or_submission() {
+        for pasted in [
+            "first\rsecond\r안녕",
+            "first\r\nsecond\r\n안녕",
+            "first\nsecond\n안녕",
+        ] {
+            let normalized = normalize_pasted_text(pasted);
+            assert_eq!(normalized, "first\nsecond\n안녕");
+            assert_eq!(normalized.lines().count(), 3);
+            assert!(!normalized.contains('\r'));
+        }
+        assert_eq!(
+            normalize_pasted_text("first\r\n\r\nlast\r"),
+            "first\n\nlast\n"
+        );
+    }
 
     #[test]
     fn routing_field_cursor_edits_korean_by_unicode_scalar_and_roles_do_not_change_parent_model() {
@@ -4792,6 +5040,7 @@ mod tests {
         assert_eq!(draft.settings.models.complex, None);
         let app = App::new("parent/model");
         let model = ModelInfo {
+            reasoning_levels: None,
             id: "selected".into(),
             name: "선택".into(),
             provider: "fixture".into(),
@@ -5252,8 +5501,9 @@ mod tests {
     }
 
     #[test]
-    fn routing_decision_is_visible_controlplane_and_excluded_from_model_history() {
+    fn routing_updates_status_without_notices_or_changing_model_history() {
         let mut app = App::new("original/model");
+        app.is_busy = true;
         app.messages.push(ChatMessage::user("실제 요청"));
         let history_before = model_messages(&app.messages);
         app.receive(ConversationEvent::RoutingDecision(
@@ -5270,24 +5520,92 @@ mod tests {
             },
         ));
         assert_eq!(model_messages(&app.messages), history_before);
-        assert!(
-            app.messages
-                .last()
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.status_model(), "effective/model");
+        assert_eq!(app.model, "original/model");
+        assert_eq!(
+            app.last_routing_decision
+                .as_ref()
                 .unwrap()
-                .content
-                .contains("original/model → effective/model")
-        );
-        assert!(
-            app.messages
-                .last()
+                .classifier_usage
+                .as_ref()
                 .unwrap()
-                .content
-                .contains("분류 토큰 7+2 (가격 미확인)")
+                .input_tokens,
+            7
         );
         assert_eq!(
             app.last_routing_decision.as_ref().unwrap().effective_model,
             "effective/model"
         );
+    }
+
+    #[test]
+    fn status_follows_request_attempts_and_returns_to_selected_model() {
+        let mut app = App::new("original/model");
+        let user = ChatMessage::user("라우팅: 사용자 요청");
+        app.messages.push(user.clone());
+        for reason in [
+            "disabled",
+            "all_roles_inherit_original",
+            "all_roles_match_original_model",
+        ] {
+            app.receive(ConversationEvent::RoutingDecision(
+                dume_worker::routing::RoutingDecision {
+                    original_model: app.model.clone(),
+                    effective_model: app.model.clone(),
+                    phase: dume_store::RoutingPhase::Fixed,
+                    epoch: None,
+                    reason: reason.into(),
+                    classifier_usage: None,
+                },
+            ));
+            assert_eq!(app.messages, vec![user.clone()]);
+        }
+        app.begin_run("run".into());
+        app.is_busy = true;
+        assert_eq!(app.status_model(), "original/model");
+        for (phase, model) in [
+            (dume_store::RoutingPhase::Planning, "planning/model"),
+            (
+                dume_store::RoutingPhase::Implementation,
+                "implementation/model",
+            ),
+        ] {
+            app.receive(ConversationEvent::RoutingDecision(
+                dume_worker::routing::RoutingDecision {
+                    original_model: "original/model".into(),
+                    effective_model: model.into(),
+                    phase,
+                    epoch: Some("epoch".into()),
+                    reason: "complexity_complex".into(),
+                    classifier_usage: None,
+                },
+            ));
+            assert_eq!(app.status_model(), model);
+            app.receive(ConversationEvent::Stream(StreamEvent::AttemptStarted {
+                context: dume_provider::types::StreamRequestContext::new(),
+                model: format!("{model}-actual"),
+            }));
+            assert_eq!(app.status_model(), format!("{model}-actual"));
+            assert_eq!(app.model, "original/model");
+        }
+        // A new selection during a run must not hide the model already executing.
+        app.model = "selected/next".into();
+        assert_eq!(app.status_model(), "implementation/model-actual");
+        app.receive(ConversationEvent::Finished {
+            run_id: Some("run".into()),
+            messages: vec![
+                user.clone(),
+                ChatMessage::ui_notice("라우팅: 오래된 정상 안내"),
+            ],
+            error: None,
+            session_id: None,
+        });
+        assert_eq!(app.status_model(), "selected/next");
+        assert_eq!(app.messages, vec![user]);
+        app.begin_run("next-run".into());
+        app.is_busy = true;
+        assert_eq!(app.status_model(), "selected/next");
     }
 
     #[test]
@@ -5314,7 +5632,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_keeps_latest_routing_controlplane_notice_without_changing_model_history() {
+    fn finished_keeps_routing_failure_warning_without_changing_model_history() {
         let mut app = App::new("original/model");
         app.current_run_id = Some("run-routing".into());
         app.is_busy = true;
@@ -5323,10 +5641,10 @@ mod tests {
         app.receive(ConversationEvent::RoutingDecision(
             dume_worker::routing::RoutingDecision {
                 original_model: "original/model".into(),
-                effective_model: "opencode/qa-implementation".into(),
-                phase: dume_store::RoutingPhase::Implementation,
+                effective_model: "original/model".into(),
+                phase: dume_store::RoutingPhase::Fixed,
                 epoch: Some("epoch-current".into()),
-                reason: "complexity_complex".into(),
+                reason: "transport".into(),
                 classifier_usage: Some(dume_provider::classifier::ClassifierUsage {
                     input_tokens: 4,
                     output_tokens: 2,
@@ -5343,16 +5661,17 @@ mod tests {
             assert!(
                 app.messages
                     .iter()
-                    .any(|message| message.content.contains("opencode/qa-implementation"))
+                    .any(|message| message.content.contains("분류기 서버에 연결할 수 없어"))
             );
             assert_eq!(
                 app.messages
                     .iter()
-                    .filter(|message| message.content.contains("opencode/qa-implementation"))
+                    .filter(|message| message.content.contains("분류기 서버에 연결할 수 없어"))
                     .count(),
                 1
             );
             assert_eq!(model_messages(&app.messages), history_before);
+            assert_eq!(app.status_model(), "original/model");
             if error.is_some() {
                 assert!(
                     app.messages
@@ -5364,27 +5683,29 @@ mod tests {
     }
 
     #[test]
-    fn newer_fixed_routing_decision_replaces_old_controlplane_notice_and_stale_finish_cannot_reverse_it()
-     {
+    fn normal_routing_clears_old_warning_and_stale_finish_cannot_reverse_it() {
         let mut app = App::new("original/model");
         app.current_run_id = Some("run-current".into());
         app.is_busy = true;
         let decision =
-            |effective: &str, epoch: Option<&str>| dume_worker::routing::RoutingDecision {
+            |effective: &str, epoch: Option<&str>, reason: &str| dume_worker::routing::RoutingDecision {
                 original_model: "original/model".into(),
                 effective_model: effective.into(),
                 phase: dume_store::RoutingPhase::Fixed,
                 epoch: epoch.map(str::to_string),
-                reason: "disabled".into(),
+                reason: reason.into(),
                 classifier_usage: None,
             };
         app.receive(ConversationEvent::RoutingDecision(decision(
             "old/model",
             Some("old"),
+            "transport",
         )));
+        assert_eq!(app.messages.len(), 1);
         app.receive(ConversationEvent::RoutingDecision(decision(
             "original/model",
             None,
+            "disabled",
         )));
         app.receive(ConversationEvent::Finished {
             run_id: Some("run-stale".into()),
@@ -5392,16 +5713,9 @@ mod tests {
             error: None,
             session_id: None,
         });
-        assert!(
-            app.messages
-                .iter()
-                .any(|message| message.content.contains("original/model"))
-        );
-        assert!(
-            !app.messages
-                .iter()
-                .any(|message| message.content.contains("old/model"))
-        );
+        assert!(app.messages.is_empty());
+        assert!(app.is_busy);
+        assert_eq!(app.status_model(), "original/model");
         assert_eq!(app.last_routing_decision.as_ref().unwrap().epoch, None);
     }
 
@@ -5444,6 +5758,7 @@ mod tests {
                 .await
                 .unwrap();
                 send(StreamEvent::AttemptFinished {
+                    identity: Default::default(),
                     context: context.clone(),
                     model: "fake/model".into(),
                     outcome: dume_provider::types::AttemptOutcome::Failed,
@@ -5475,6 +5790,7 @@ mod tests {
                 send(StreamEvent::TextDelta("answer".into())).await.unwrap();
                 send(completed("stop")).await.unwrap();
                 send(StreamEvent::AttemptFinished {
+                    identity: Default::default(),
                     context: retry_context,
                     model: "fake/model".into(),
                     outcome: dume_provider::types::AttemptOutcome::Succeeded,
@@ -5790,6 +6106,7 @@ mod tests {
                         }
                         events
                             .send(StreamEvent::AttemptFinished {
+                                identity: Default::default(),
                                 context,
                                 model: "test".into(),
                                 outcome: dume_provider::AttemptOutcome::Succeeded,
@@ -5884,6 +6201,91 @@ mod tests {
             events.push(event);
         }
         (result, requests, events)
+    }
+
+    #[tokio::test]
+    async fn producer_error_drains_final_attempt_identity_before_ending_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(HarnessStore::in_memory(directory.path().join("artifacts")).unwrap());
+        store
+            .create_conversation("identity-test", "/tmp", "test", "session")
+            .unwrap();
+        let scope = RuntimeScope::Conversation("identity-test".into());
+        let receipt = store
+            .admit_input(scope.clone(), "input", InputKind::Submit, "fixture")
+            .unwrap();
+        let session = RunSession::start(
+            store.clone(),
+            scope,
+            receipt.run_id.as_deref().unwrap(),
+            "identity-test",
+        )
+        .unwrap();
+        let mut dispatcher =
+            ToolDispatcher::new(directory.path(), "test", CancellationToken::new())
+                .with_store(store.clone());
+        let (tx, _rx) = mpsc::channel(100);
+        let mut messages = vec![ChatMessage::user("fixture")];
+        let result = run_conversation(
+            &mut messages,
+            &tx,
+            &mut dispatcher,
+            &mut "session".to_string(),
+            &CancellationToken::new(),
+            Some(&session),
+            1,
+            None,
+            "test",
+            |_, _, _, _, events| async move {
+                let context = dume_provider::types::StreamRequestContext::from_ids(
+                    "session",
+                    "failed-identity",
+                );
+                events
+                    .send(StreamEvent::AttemptStarted {
+                        context: context.clone(),
+                        model: "test".into(),
+                    })
+                    .await
+                    .unwrap();
+                events
+                    .send(delta(
+                        0,
+                        Some("write"),
+                        Some("write_file"),
+                        r#"{"path":"blocked.txt","content":"bad"}"#,
+                    ))
+                    .await
+                    .unwrap();
+                events
+                    .send(StreamEvent::AttemptFinished {
+                        context,
+                        model: "test".into(),
+                        outcome: dume_provider::AttemptOutcome::Failed,
+                        duration_ms: 1,
+                        usage: None,
+                        identity: dume_provider::types::ResponseIdentity {
+                            model: Some("other".into()),
+                            response_id: Some("response".into()),
+                        },
+                        error: Some("Provider rejected requested model".into()),
+                    })
+                    .await
+                    .unwrap();
+                // All sends complete in one poll; the producer error must not discard queued evidence.
+                anyhow::bail!("Provider rejected requested model");
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("Provider rejected requested model"));
+        let metrics = store.conversation_runtime_metrics("identity-test").unwrap();
+        assert_eq!(metrics.model_attempts[0].state, "failed");
+        assert_eq!(
+            metrics.model_attempts[0].usage.as_ref().unwrap()["response_identity"]["model"],
+            "other"
+        );
+        assert!(metrics.tool_executions.is_empty());
+        assert!(!directory.path().join("blocked.txt").exists());
     }
 
     #[tokio::test]

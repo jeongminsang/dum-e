@@ -260,9 +260,10 @@ impl RunSession {
                 duration_ms,
                 usage,
                 error,
+                identity,
                 ..
             } => {
-                let usage = usage.as_ref().map(|usage| {
+                let mut usage = usage.as_ref().map(|usage| {
                     serde_json::json!({
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
@@ -273,6 +274,8 @@ impl RunSession {
                         "is_complete": usage.is_complete,
                     })
                 });
+                usage.get_or_insert_with(|| serde_json::json!({}))["response_identity"] =
+                    serde_json::to_value(identity)?;
                 self.store.finish_model_attempt(
                     &context.request_id,
                     ModelAttemptOutcome {

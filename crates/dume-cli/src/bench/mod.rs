@@ -278,6 +278,8 @@ impl BenchmarkRunner {
             agent = agent.with_base_url(base_url);
         }
         let ctx = dume_provider::types::StreamRequestContext {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: session_id.to_string(),
             request_id: format!("req_{}_0", attempt_id),
             benchmark_run_id: Some(self.config.run_id.clone()),

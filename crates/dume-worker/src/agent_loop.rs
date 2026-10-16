@@ -954,6 +954,7 @@ impl AgentLoop {
             let mut codex_reasoning = Vec::new();
             let mut deepseek_reasoning = String::new();
             let mut gemini_parts = Vec::new();
+            let mut anthropic_thinking = Vec::new();
             // Preserve order: index -> (id, name, args_buf)
             let mut ordered_calls: Vec<(String, String, String)> = Vec::new();
             let mut stream_completed_normally = false;
@@ -1021,16 +1022,19 @@ impl AgentLoop {
                     codex_reasoning.clear();
                     deepseek_reasoning.clear();
                     gemini_parts.clear();
+                    anthropic_thinking.clear();
                     ordered_calls.clear();
                 }
                 match evt {
                     StreamEvent::AttemptStarted { .. }
+                    | StreamEvent::ResponseIdentity(_)
                     | StreamEvent::AttemptFinished { .. }
                     | StreamEvent::Retrying { .. }
                     | StreamEvent::ProviderError { .. } => {}
                     StreamEvent::CodexReasoning(items) => codex_reasoning.extend(items),
                     StreamEvent::DeepSeekReasoning(delta) => deepseek_reasoning.push_str(&delta),
                     StreamEvent::GeminiParts(parts) => gemini_parts.extend(parts),
+                    StreamEvent::AnthropicThinking(parts) => anthropic_thinking.extend(parts),
                     StreamEvent::TextDelta(delta) => {
                         assistant_reply.push_str(&delta);
                     }
@@ -1129,6 +1133,7 @@ impl AgentLoop {
                 message.codex_reasoning = codex_reasoning;
                 if !deepseek_reasoning.is_empty() { message.deepseek_reasoning = Some(deepseek_reasoning); }
                 message.gemini_parts = gemini_parts;
+                message.anthropic_thinking = anthropic_thinking;
                 run_session.record_assistant(&message)?;
                 messages.push(message);
                 final_outcome = Some(AgentOutcome::Completed {
@@ -1173,6 +1178,7 @@ impl AgentLoop {
             message.codex_reasoning = codex_reasoning;
             message.deepseek_reasoning = Some(deepseek_reasoning);
             message.gemini_parts = gemini_parts;
+            message.anthropic_thinking = anthropic_thinking;
             let prepared = run_session.prepare_tools(&message)?;
             messages.push(message);
 
@@ -1766,6 +1772,68 @@ mod tests {
         serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
     }
 
+    #[tokio::test]
+    async fn provider_response_name_is_diagnostic_and_does_not_block_tools() {
+        use tokio::io::AsyncWriteExt;
+        let directory = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            dume_store::HarnessStore::in_memory(directory.path().join("artifacts")).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for turn in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_http_json(&mut socket).await);
+                let choice = if turn == 0 {
+                    json!({"delta":{"tool_calls":[{"index":0,"id":"write","function":{"name":"write_file","arguments":"{\"path\":\"provider-response.txt\",\"content\":\"trusted response\"}"}}]},"finish_reason":"tool_calls"})
+                } else {
+                    json!({"delta":{"content":"Done"},"finish_reason":"stop"})
+                };
+                let event = json!({"id":format!("response-{turn}"),"model":"provider-model-alias","choices":[choice],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}});
+                let sse = format!("data: {event}\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let mut context = dume_provider::types::StreamRequestContext::new();
+        context.reasoning_effort = Some(dume_provider::reasoning::ReasoningEffort::High);
+        let conversation = format!("worker:{}", context.request_id);
+        let agent = AgentLoop::new(directory.path(), "openai/gpt-5.4")
+            .with_store(store.clone())
+            .with_routing_credentials(routing_test_credentials(
+                &directory.path().join("auth.json"),
+            ))
+            .with_request_context(context)
+            .with_base_url(endpoint.clone())
+            .with_routing_snapshot(crate::routing::RoutingSnapshot::from_settings(
+                crate::RoutingSettings::default(),
+                false,
+            ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            agent.run_task("local fixture"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for request in server.await.unwrap() {
+            assert_eq!(request["model"], "gpt-5.4");
+            assert_eq!(request["reasoning_effort"], "high");
+        }
+        assert_eq!(std::fs::read_to_string(directory.path().join("provider-response.txt")).unwrap(), "trusted response");
+        let metrics = store.conversation_runtime_metrics(&conversation).unwrap();
+        assert_eq!(metrics.model_attempts.len(), 2);
+        assert!(metrics.model_attempts.iter().all(|attempt| attempt.state == "succeeded"));
+        assert_eq!(metrics.tool_executions.len(), 1);
+        let usage = metrics.model_attempts[0].usage.as_ref().unwrap();
+        assert_eq!(usage["response_identity"]["model"], "provider-model-alias");
+        assert_eq!(usage["response_identity"]["response_id"], "response-0");
+        assert!(usage["response_identity"].get("verified").is_none());
+        assert_eq!(usage["input_tokens"], 7);
+    }
+
     fn routing_test_credentials(path: &Path) -> dume_provider::CredentialStore {
         let credentials = dume_provider::CredentialStore::new(path);
         for provider in ["openai", "jev-local-system-one"] {
@@ -1955,6 +2023,7 @@ mod tests {
                 .unwrap();
             session
                 .record_model_event(&StreamEvent::AttemptFinished {
+                    identity: Default::default(),
                     context,
                     model: response_model.into(),
                     outcome: dume_provider::AttemptOutcome::Succeeded,
@@ -2379,6 +2448,7 @@ mod tests {
         usage.total_tokens = 9;
         session
             .record_model_event(&StreamEvent::AttemptFinished {
+                identity: Default::default(),
                 context,
                 model: "model".into(),
                 outcome: dume_provider::AttemptOutcome::Failed,

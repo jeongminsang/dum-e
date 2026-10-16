@@ -43,6 +43,8 @@ pub struct ChatMessage {
     pub deepseek_reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gemini_parts: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anthropic_thinking: Vec<Value>,
 }
 
 fn is_conversation_purpose(purpose: &MessagePurpose) -> bool {
@@ -60,6 +62,7 @@ impl ChatMessage {
             codex_reasoning: Vec::new(),
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
+            anthropic_thinking: Vec::new(),
         }
     }
 
@@ -73,6 +76,7 @@ impl ChatMessage {
             codex_reasoning: Vec::new(),
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
+            anthropic_thinking: Vec::new(),
         }
     }
 
@@ -89,6 +93,7 @@ impl ChatMessage {
             codex_reasoning: Vec::new(),
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
+            anthropic_thinking: Vec::new(),
         }
     }
 
@@ -102,6 +107,7 @@ impl ChatMessage {
             codex_reasoning: Vec::new(),
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
+            anthropic_thinking: Vec::new(),
         }
     }
 
@@ -131,6 +137,7 @@ impl ChatMessage {
             codex_reasoning: Vec::new(),
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
+            anthropic_thinking: Vec::new(),
         }
     }
 
@@ -259,6 +266,8 @@ impl TokenUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
+    ResponseIdentity(ResponseIdentity),
+    AnthropicThinking(Vec<Value>),
     ProviderError {
         kind: ProviderFailureKind,
         message: String,
@@ -275,6 +284,7 @@ pub enum StreamEvent {
         duration_ms: u64,
         usage: Option<TokenUsage>,
         error: Option<String>,
+        identity: ResponseIdentity,
     },
     Retrying {
         next_attempt: usize,
@@ -315,11 +325,33 @@ pub enum AttemptOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseIdentity {
+    pub model: Option<String>,
+    pub response_id: Option<String>,
+}
+
+impl ResponseIdentity {
+    pub fn from_response(response: &Value, model_field: &str, id_field: &str) -> Self {
+        Self {
+            model: response[model_field]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned),
+            response_id: response[id_field].as_str().map(str::to_owned),
+        }
+    }
+}
+
 /// Request and session context for model invocations.
 /// Transports that require session tracking (e.g. OpenCode) use these fields,
 /// while other transports ignore them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRequestContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::reasoning::ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub session_id: String,
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,6 +372,8 @@ impl StreamRequestContext {
     /// Create a new session context with fresh random opaque session and request IDs.
     pub fn new() -> Self {
         Self {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: Self::generate_opaque_id(),
             request_id: Self::generate_opaque_id(),
             benchmark_run_id: None,
@@ -354,6 +388,8 @@ impl StreamRequestContext {
     /// Create a new request context for an existing session with a new opaque request ID.
     pub fn for_session(session_id: impl Into<String>) -> Self {
         Self {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: session_id.into(),
             request_id: Self::generate_opaque_id(),
             benchmark_run_id: None,
@@ -367,6 +403,8 @@ impl StreamRequestContext {
 
     pub fn from_ids(session_id: impl Into<String>, request_id: impl Into<String>) -> Self {
         Self {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: session_id.into(),
             request_id: request_id.into(),
             benchmark_run_id: None,
@@ -382,6 +420,8 @@ impl StreamRequestContext {
     /// but with a fresh request ID.
     pub fn next_request(&self) -> Self {
         Self {
+            reasoning_effort: self.reasoning_effort,
+            endpoint: self.endpoint.clone(),
             session_id: self.session_id.clone(),
             request_id: Self::generate_opaque_id(),
             benchmark_run_id: self.benchmark_run_id.clone(),
@@ -396,6 +436,8 @@ impl StreamRequestContext {
     /// Produce a child context for a subagent.
     pub fn child_agent(&self, child_id: &str) -> Self {
         Self {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: Self::generate_opaque_id(),
             request_id: Self::generate_opaque_id(),
             benchmark_run_id: self.benchmark_run_id.clone(),
@@ -411,6 +453,8 @@ impl StreamRequestContext {
     /// while preserving benchmark metadata.
     pub fn reset_session(&self) -> Self {
         Self {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: Self::generate_opaque_id(),
             request_id: Self::generate_opaque_id(),
             benchmark_run_id: self.benchmark_run_id.clone(),

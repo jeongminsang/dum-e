@@ -8,6 +8,7 @@ pub mod gemini;
 pub mod oauth;
 pub mod openai;
 pub mod opencodex;
+pub mod reasoning;
 pub mod runtime;
 pub mod types;
 

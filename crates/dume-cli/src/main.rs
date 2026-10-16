@@ -1083,6 +1083,8 @@ async fn run_worker_child(
         let store = HarnessStore::open(db_path, &artifacts_path)
             .with_context(|| format!("open worker runtime store {}", db_path))?;
         let ctx = dume_provider::types::StreamRequestContext {
+            reasoning_effort: None,
+            endpoint: None,
             session_id: attempt_id.to_string(),
             request_id: format!("req_{}_0", attempt_id),
             benchmark_run_id: benchmark_run_id.map(ToString::to_string),

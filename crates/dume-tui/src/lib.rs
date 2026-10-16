@@ -2,6 +2,8 @@ pub mod app;
 pub mod component;
 pub mod keybinding;
 pub mod program_status;
+mod selection;
+mod terminal;
 pub mod theme;
 
 pub use app::{App, ResumeTarget, run_tui, run_tui_with_target};

@@ -346,7 +346,7 @@ impl CodexProvider {
         self
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         if self.account_id.is_none() {
             format!("{}/responses", self.base_url)
         } else if self.base_url.ends_with("/codex/responses") {
@@ -431,6 +431,9 @@ impl CodexProvider {
         });
         if let Some(ctx) = context {
             body["prompt_cache_key"] = json!(ctx.session_id);
+            if let Some(effort) = ctx.reasoning_effort.filter(|effort| !effort.is_default()) {
+                body["reasoning"] = json!({"effort": effort});
+            }
         }
         if !tools.is_empty() {
             body["tools"] = json!(
@@ -511,6 +514,13 @@ impl CodexProvider {
             }
             let value: Value =
                 serde_json::from_str(&event.data).context("Invalid Codex SSE JSON")?;
+            if let Some(response) = value.get("response") {
+                let identity =
+                    crate::types::ResponseIdentity::from_response(response, "model", "id");
+                if identity.model.is_some() || identity.response_id.is_some() {
+                    tx.send(StreamEvent::ResponseIdentity(identity)).await?;
+                }
+            }
             let (events, terminal) = state.process(&value)?;
             for event in events {
                 if let StreamEvent::ProviderError {
