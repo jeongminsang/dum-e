@@ -104,6 +104,48 @@ impl OpenAiProvider {
         hex::encode(&hash[..6]) // 12 hex chars
     }
 
+    pub fn format_opencode_session_id(seed: &str) -> String {
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut hasher = Sha256::new();
+        hasher.update(b"opencode\0ses_\0");
+        hasher.update(seed.as_bytes());
+        let hash = hasher.finalize();
+
+        // 36 bits from hash[0..5]
+        let ts36 = ((hash[0] as u64) << 28)
+            | ((hash[1] as u64) << 20)
+            | ((hash[2] as u64) << 12)
+            | ((hash[3] as u64) << 4)
+            | ((hash[4] >> 4) as u64);
+
+        // descending encoding: ~(ts36 << 12 | 1) & 0xffffffffffff
+        let descending_48 = !((ts36 << 12) | 1u64) & 0xffffffffffffu64;
+        let time_part = format!("{descending_48:012x}");
+
+        let random_part: String = hash[5..19]
+            .iter()
+            .map(|&byte| BASE62[(byte as usize) % 62] as char)
+            .collect();
+
+        format!("ses_{time_part}{random_part}")
+    }
+
+    pub fn format_opencode_request_id(seed: &str) -> String {
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut hasher = Sha256::new();
+        hasher.update(b"opencode\0msg_\0");
+        hasher.update(seed.as_bytes());
+        let hash = hasher.finalize();
+
+        let hex_part = hex::encode(&hash[..6]);
+        let random_part: String = hash[6..20]
+            .iter()
+            .map(|&byte| BASE62[(byte as usize) % 62] as char)
+            .collect();
+
+        format!("msg_{hex_part}{random_part}")
+    }
+
     pub async fn stream(
         &self,
         model: &str,
@@ -150,14 +192,23 @@ impl OpenAiProvider {
         context: Option<&StreamRequestContext>,
         tx: &mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        let url = self.url();
-        let mut headers = LlmClient::build_auth_headers(&self.api_key, false)?;
-
-        if let Some(profile) = &self.opencode_profile {
-            let free_compat_enabled = std::env::var("DUME_OPENCODE_FREE_COMPAT")
+        let is_opencode_free = self
+            .opencode_profile
+            .as_ref()
+            .map(|p| p.is_free_model)
+            .unwrap_or(false)
+            || std::env::var("DUME_OPENCODE_FREE_COMPAT")
                 .map(|v| v.trim() == "1")
                 .unwrap_or(false);
 
+        let url = if is_opencode_free && self.base_url == "https://opencode.ai/zen/v1" {
+            "https://opencode.ai/inference/v1/chat/completions".to_string()
+        } else {
+            self.url()
+        };
+        let mut headers = LlmClient::build_auth_headers(&self.api_key, false)?;
+
+        if let Some(profile) = &self.opencode_profile {
             let default_ctx;
             let ctx = match context {
                 Some(ctx) => ctx,
@@ -167,8 +218,23 @@ impl OpenAiProvider {
                 }
             };
 
-            if profile.is_free_model || free_compat_enabled {
-                headers.insert(USER_AGENT, HeaderValue::from_static("opencode"));
+            let (session_id, request_id) = if is_opencode_free {
+                (
+                    Self::format_opencode_session_id(&ctx.session_id),
+                    Self::format_opencode_request_id(&ctx.request_id),
+                )
+            } else {
+                (ctx.session_id.clone(), ctx.request_id.clone())
+            };
+
+            if is_opencode_free {
+                let default_ua = "opencode/1.19.0".to_string();
+                let opencode_ua = std::env::var("OPENCODE_USER_AGENT").unwrap_or(default_ua);
+                headers.insert(
+                    USER_AGENT,
+                    HeaderValue::from_str(&opencode_ua)
+                        .unwrap_or_else(|_| HeaderValue::from_static("opencode/1.19.0")),
+                );
                 headers.insert(
                     HeaderName::from_static("x-opencode-client"),
                     HeaderValue::from_static("desktop"),
@@ -196,11 +262,11 @@ impl OpenAiProvider {
 
             headers.insert(
                 HeaderName::from_static("x-opencode-session"),
-                HeaderValue::from_str(&ctx.session_id).context("Invalid session ID header")?,
+                HeaderValue::from_str(&session_id).context("Invalid session ID header")?,
             );
             headers.insert(
                 HeaderName::from_static("x-opencode-request"),
-                HeaderValue::from_str(&ctx.request_id).context("Invalid request ID header")?,
+                HeaderValue::from_str(&request_id).context("Invalid request ID header")?,
             );
         }
 
@@ -276,20 +342,48 @@ impl OpenAiProvider {
             }
         }
 
-        if !tools.is_empty() {
-            let tools_val: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
+        let mut tools_val: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
                 })
-                .collect();
+            })
+            .collect();
+
+        if is_opencode_free {
+            let has_read_tool = tools_val.iter().any(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("read")
+            });
+            if !has_read_tool {
+                tools_val.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read file contents",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": ["filePath"]
+                        }
+                    }
+                }));
+            }
+        }
+
+        if !tools_val.is_empty() {
             body["tools"] = json!(tools_val);
         }
 
@@ -675,12 +769,39 @@ mod tests {
             .await
             .unwrap();
 
-        let (headers, _body) = server.join().unwrap();
-        assert!(headers.contains("user-agent: opencode"));
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.contains("user-agent: opencode/1.19.0"));
         assert!(headers.contains("x-opencode-client: desktop"));
         assert!(headers.contains("x-opencode-project: global"));
-        assert!(headers.contains("x-opencode-session: free-sess-default"));
-        assert!(headers.contains("x-opencode-request: free-req-default"));
+        let session_header = headers
+            .lines()
+            .find(|line| line.starts_with("x-opencode-session: "))
+            .unwrap();
+        assert!(session_header.starts_with("x-opencode-session: ses_"));
+        assert_eq!(
+            session_header.trim(),
+            format!(
+                "x-opencode-session: {}",
+                OpenAiProvider::format_opencode_session_id("free-sess-default")
+            )
+        );
+        let request_header = headers
+            .lines()
+            .find(|line| line.starts_with("x-opencode-request: "))
+            .unwrap();
+        assert!(request_header.starts_with("x-opencode-request: msg_"));
+        assert_eq!(
+            request_header.trim(),
+            format!(
+                "x-opencode-request: {}",
+                OpenAiProvider::format_opencode_request_id("free-req-default")
+            )
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["filePath"]["type"],
+            "string"
+        );
         assert_eq!(rx.recv().await, Some(StreamEvent::TextDelta("ok".into())));
     }
 
@@ -711,13 +832,34 @@ mod tests {
             .await
             .unwrap();
 
-        let (headers, _body) = server.join().unwrap();
-        assert!(headers.contains("user-agent: opencode"));
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.contains("user-agent: opencode/1.19.0"));
         assert!(headers.contains("x-opencode-client: desktop"));
         assert!(headers.contains("x-opencode-project: global"));
-        assert!(headers.contains("x-opencode-session: free-sess-789"));
-        assert!(headers.contains("x-opencode-request: free-req-012"));
+        assert_eq!(
+            headers
+                .lines()
+                .find(|line| line.starts_with("x-opencode-session: "))
+                .unwrap()
+                .trim(),
+            format!(
+                "x-opencode-session: {}",
+                OpenAiProvider::format_opencode_session_id("free-sess-789")
+            )
+        );
+        assert_eq!(
+            headers
+                .lines()
+                .find(|line| line.starts_with("x-opencode-request: "))
+                .unwrap()
+                .trim(),
+            format!(
+                "x-opencode-request: {}",
+                OpenAiProvider::format_opencode_request_id("free-req-012")
+            )
+        );
         assert!(headers.contains("authorization: Bearer zen-key"));
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(rx.recv().await, Some(StreamEvent::TextDelta("ok".into())));
 
         unsafe {
