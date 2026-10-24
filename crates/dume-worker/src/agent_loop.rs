@@ -68,7 +68,7 @@ impl std::fmt::Display for AgentOutcome {
 pub struct AgentLoop {
     pub worktree_path: std::path::PathBuf,
     pub model: String,
-    pub max_turns: usize,
+    pub max_turns: Option<usize>,
     pub endpoint: Option<Endpoint>,
     pub store: Option<std::sync::Arc<dume_store::HarnessStore>>,
     artifact_store: Option<std::sync::Arc<dume_store::ArtifactStore>>,
@@ -93,7 +93,7 @@ impl AgentLoop {
         Self {
             worktree_path: worktree_path.as_ref().to_path_buf(),
             model: model.into(),
-            max_turns: 10,
+            max_turns: None,
             endpoint: None,
             store: None,
             artifact_store: None,
@@ -871,7 +871,14 @@ impl AgentLoop {
                 anyhow::bail!("Recovered run has unresolved tool outcome; operator resolution required");
             }
         }
-        for _turn in 0..self.max_turns {
+        let mut _turn = 0;
+        loop {
+            if let Some(limit) = self.max_turns {
+                if _turn >= limit {
+                    break;
+                }
+            }
+            _turn += 1;
             anyhow::ensure!(!cancellation.is_cancelled(), "Agent execution cancelled");
 
             let routing = if is_child {
@@ -1195,8 +1202,11 @@ impl AgentLoop {
                         }).await {
                             Ok(result) => result,
                             Err(error) if error.downcast_ref::<crate::tools::KnownToolFailure>().is_some() => {
-                                let failure = ChatMessage::tool(error.downcast_ref::<crate::tools::KnownToolFailure>().unwrap().output.clone(), execution.tool_call_id.clone());
-                                run_session.finish_tool_error(&execution, &attempt_id, &failure, started.elapsed().as_millis().min(i64::MAX as u128) as i64)?;
+                                let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                                let mut failure = ChatMessage::tool(error.downcast_ref::<crate::tools::KnownToolFailure>().unwrap().output.clone(), execution.tool_call_id.clone());
+                                failure.duration_ms = Some(elapsed as u64);
+                                failure.is_error = Some(true);
+                                run_session.finish_tool_error(&execution, &attempt_id, &failure, elapsed)?;
                                 messages.push(failure);
                                 continue;
                             }
@@ -1208,6 +1218,9 @@ impl AgentLoop {
                         };
                         anyhow::ensure!(!cancellation.is_cancelled(), "Tool effect outcome is uncertain after cancellation");
                         let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                        let mut result = result;
+                        result.duration_ms = Some(elapsed as u64);
+                        result.is_error = Some(false);
                         run_session.finish_tool(&execution, &attempt_id, &result, elapsed)?;
                         messages.push(result);
                     }
@@ -4228,7 +4241,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut agent =
             AgentLoop::new(dir.path(), "mock-model").with_mock_base_url(format!("http://{}", addr));
-        agent.max_turns = 2;
+        agent.max_turns = Some(2);
 
         let outcome = agent.run_task("infinite loop").await.unwrap();
         match outcome {
@@ -4237,6 +4250,77 @@ mod tests {
             }
             other => panic!("Expected TurnLimitExhausted, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_runs_beyond_ten_turns_to_completion() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = request_count.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = read_http_json(&mut socket).await;
+                let turn = count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let sse = if turn < 12 {
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "content": format!("Turn {turn} step..."),
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": format!("call_{turn}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": format!("{{\"command\": \"echo turn_{turn}\"}}")
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        })
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "content": "Finished all 12 turns successfully."
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        })
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let agent =
+            AgentLoop::new(dir.path(), "mock-model").with_mock_base_url(format!("http://{}", addr));
+        assert!(agent.max_turns.is_none(), "max_turns must default to None");
+
+        let outcome = agent.run_task("run 12 turns").await.unwrap();
+        match outcome {
+            AgentOutcome::Completed { answer, .. } => {
+                assert!(answer.contains("Finished all 12 turns successfully."));
+            }
+            other => panic!("Expected Completed after >10 turns, got {:?}", other),
+        }
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 13);
     }
 
     #[test]

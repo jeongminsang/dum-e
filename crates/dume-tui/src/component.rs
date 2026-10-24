@@ -1,4 +1,8 @@
 use crate::theme::Theme;
+use crate::tool_display::{
+    ActiveToolStatus, TranscriptConfig, extract_failure_summary, format_duration_short,
+    format_tool_display,
+};
 use dume_provider::types::{ChatMessage, Role};
 use dume_store::RecentSessionSummary;
 use ratatui::Frame;
@@ -63,21 +67,124 @@ fn wrap_text_line(prefix: &str, text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+fn wrap_spans<'a>(
+    spans: Vec<Span<'a>>,
+    width: usize,
+    continuation_prefix: &str,
+) -> Vec<Line<'static>> {
+    let available_width = width.max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0;
+
+    let continuation_prefix_width = UnicodeWidthStr::width(continuation_prefix);
+
+    let push_span = |spans: &mut Vec<Span<'static>>, text: &str, style: Style| {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = spans.last_mut() {
+            if last.style == style {
+                let mut s = last.content.to_string();
+                s.push_str(text);
+                *last = Span::styled(s, style);
+                return;
+            }
+        }
+        spans.push(Span::styled(text.to_string(), style));
+    };
+
+    for span in spans {
+        let style = span.style;
+        let content = span.content;
+
+        for word in content.split_inclusive(char::is_whitespace) {
+            let word_width = UnicodeWidthStr::width(word);
+            if current_width + word_width <= available_width {
+                push_span(&mut current_spans, word, style);
+                current_width += word_width;
+            } else {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    current_width = 0;
+                }
+
+                let max_avail = if !lines.is_empty() && continuation_prefix_width < available_width {
+                    available_width - continuation_prefix_width
+                } else {
+                    available_width
+                };
+
+                if word_width <= max_avail {
+                    if !lines.is_empty() && continuation_prefix_width > 0 && continuation_prefix_width < available_width {
+                        push_span(&mut current_spans, continuation_prefix, Style::default());
+                        current_width += continuation_prefix_width;
+                    }
+                    push_span(&mut current_spans, word, style);
+                    current_width += word_width;
+                } else {
+                    for ch in word.chars() {
+                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if current_width == 0 && !lines.is_empty() && continuation_prefix_width > 0 && continuation_prefix_width < available_width {
+                            push_span(&mut current_spans, continuation_prefix, Style::default());
+                            current_width += continuation_prefix_width;
+                        }
+                        if current_width + ch_width <= available_width {
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            push_span(&mut current_spans, s, style);
+                            current_width += ch_width;
+                        } else {
+                            if !current_spans.is_empty() {
+                                lines.push(Line::from(std::mem::take(&mut current_spans)));
+                                current_width = 0;
+                            }
+                            if !lines.is_empty() && continuation_prefix_width > 0 && continuation_prefix_width < available_width {
+                                push_span(&mut current_spans, continuation_prefix, Style::default());
+                                current_width += continuation_prefix_width;
+                            }
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            push_span(&mut current_spans, s, style);
+                            current_width += ch_width;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
 pub fn build_transcript_lines(
     messages: &[ChatMessage],
     streaming_text: &str,
     recent_sessions: &[RecentSessionSummary],
     effective_width: usize,
     theme: &Theme,
+    config: Option<&TranscriptConfig>,
 ) -> (Vec<Line<'static>>, Vec<bool>) {
     let mut lines = Vec::new();
     let mut is_user_logical_line = Vec::new();
+
+    let empty_set = std::collections::HashSet::new();
+    let expanded_tools = config.map(|c| c.expanded_tools).unwrap_or(&empty_set);
+    let selected_tool_id = config.and_then(|c| c.selected_tool_id);
+    let active_tools = config.map(|c| c.active_tools).unwrap_or(&[]);
+    let streaming_tools = config.map(|c| c.streaming_tools).unwrap_or(&[]);
 
     let has_conversation = messages
         .iter()
         .any(|m| m.role == Role::User || m.role == Role::Assistant);
 
-    if !has_conversation && streaming_text.is_empty() {
+    if !has_conversation && streaming_text.is_empty() && active_tools.is_empty() && streaming_tools.is_empty() {
         lines.push(Line::from(""));
         is_user_logical_line.push(false);
         lines.push(Line::from(vec![
@@ -219,9 +326,11 @@ pub fn build_transcript_lines(
     }
 
     if has_conversation || !messages.is_empty() {
+        let mut last_assistant_tool_calls: Option<&Vec<dume_provider::types::ToolCall>> = None;
         for msg in messages {
             match msg.role {
                 Role::User => {
+                    last_assistant_tool_calls = None;
                     // User prompt block: top and bottom padding lines
                     lines.push(Line::from(""));
                     is_user_logical_line.push(true);
@@ -246,6 +355,7 @@ pub fn build_transcript_lines(
                     is_user_logical_line.push(false);
                 }
                 Role::Assistant => {
+                    last_assistant_tool_calls = msg.tool_calls.as_ref();
                     // Assistant response block: clean plain output without 'dum-e' tag
                     for line in msg.content.lines() {
                         let wrapped = wrap_text_line("  ", line, effective_width);
@@ -261,25 +371,109 @@ pub fn build_transcript_lines(
                     is_user_logical_line.push(false);
                 }
                 Role::Tool => {
-                    // Tool call / execution output block
-                    lines.push(Line::from(vec![
-                        Span::styled("● ", Style::default().fg(theme.user_msg)),
-                        Span::styled(
-                            "tool execution",
+                    let matched_call = msg.tool_call_id.as_ref().and_then(|id| {
+                        last_assistant_tool_calls
+                            .and_then(|calls| calls.iter().find(|c| &c.id == id))
+                    });
+                    let (name, args_str) = match matched_call {
+                        Some(c) => (c.name.as_str(), c.arguments.as_str()),
+                        None => ("tool", ""),
+                    };
+                    let display = format_tool_display(name, args_str);
+                    let is_error = msg.is_error.unwrap_or_else(|| {
+                        msg.content.contains("Tool failed")
+                            || msg.content.contains("(exit code ")
+                            || msg.content.starts_with("Missing or invalid '")
+                    });
+                    let duration_str = msg.duration_ms.map(format_duration_short);
+                    let call_id = msg.tool_call_id.as_deref().unwrap_or("");
+                    let is_selected = selected_tool_id.is_some_and(|id| id == call_id);
+                    let is_expanded = expanded_tools.contains(call_id);
+
+                    let mut spans = Vec::new();
+                    if is_selected {
+                        spans.push(Span::styled(
+                            "▶ ",
                             Style::default()
-                                .fg(theme.border_focused)
+                                .fg(theme.accent)
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    is_user_logical_line.push(false);
-                    for line in msg.content.lines() {
-                        let wrapped = wrap_text_line("│ ", line, effective_width);
-                        for w in wrapped {
-                            lines.push(Line::from(vec![
-                                Span::styled("│ ", Style::default().fg(theme.border)),
-                                Span::styled(w, Style::default().fg(theme.status_bar_fg)),
-                            ]));
-                            is_user_logical_line.push(false);
+                        ));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+
+                    if is_error {
+                        spans.push(Span::styled(
+                            "✖ ",
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            format!("Failed · {}", display.target),
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            "✔ ",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            format!("{} · {}", display.kind_completed, display.target),
+                            Style::default()
+                                .fg(theme.foreground)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+
+                    if let Some(dur) = duration_str {
+                        spans.push(Span::styled(
+                            format!(" ({dur})"),
+                            Style::default().fg(theme.status_bar_fg),
+                        ));
+                    }
+
+                    if is_error {
+                        let failure_summary = extract_failure_summary(&msg.content);
+                        spans.push(Span::styled(
+                            format!(" — {failure_summary}"),
+                            Style::default().fg(theme.system_msg),
+                        ));
+                    }
+
+                    if is_selected {
+                        if is_expanded {
+                            spans.push(Span::styled(
+                                " [Ctrl+o to collapse]",
+                                Style::default().fg(theme.border),
+                            ));
+                        } else {
+                            spans.push(Span::styled(
+                                " [Ctrl+o to expand]",
+                                Style::default().fg(theme.border),
+                            ));
+                        }
+                    }
+
+                    for line in wrap_spans(spans, effective_width, "    ") {
+                        lines.push(line);
+                        is_user_logical_line.push(false);
+                    }
+
+                    if is_expanded {
+                        for line in msg.content.lines() {
+                            let wrapped = wrap_text_line("  │ ", line, effective_width);
+                            for w in wrapped {
+                                lines.push(Line::from(vec![
+                                    Span::styled("  │ ", Style::default().fg(theme.border)),
+                                    Span::styled(w, Style::default().fg(theme.status_bar_fg)),
+                                ]));
+                                is_user_logical_line.push(false);
+                            }
                         }
                     }
                     lines.push(Line::from(""));
@@ -305,6 +499,195 @@ pub fn build_transcript_lines(
                         }
                     }
                     lines.push(Line::from(""));
+                    is_user_logical_line.push(false);
+                }
+            }
+        }
+    }
+
+    // Active tools (in progress or just completed during streaming)
+    for active in active_tools {
+        let display = format_tool_display(&active.name, &active.arguments);
+        let is_selected = selected_tool_id.is_some_and(|id| id == active.call_id.as_str());
+        let is_expanded = expanded_tools.contains(&active.call_id);
+
+        let mut spans = Vec::new();
+        if is_selected {
+            spans.push(Span::styled(
+                "▶ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+
+        match &active.status {
+            ActiveToolStatus::Running { started_at } => {
+                spans.push(Span::styled(
+                    "● ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{} · {}", display.kind_running, display.target),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let elapsed = started_at.elapsed().as_millis() as u64;
+                if elapsed >= 1000 {
+                    spans.push(Span::styled(
+                        format!(" ({})", format_duration_short(elapsed)),
+                        Style::default().fg(theme.status_bar_fg),
+                    ));
+                }
+            }
+            ActiveToolStatus::Completed { duration_ms } => {
+                spans.push(Span::styled(
+                    "✔ ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{} · {}", display.kind_completed, display.target),
+                    Style::default()
+                        .fg(theme.foreground)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(" ({})", format_duration_short(*duration_ms)),
+                    Style::default().fg(theme.status_bar_fg),
+                ));
+            }
+            ActiveToolStatus::Failed { duration_ms, error } => {
+                spans.push(Span::styled(
+                    "✖ ",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("Failed · {}", display.target),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(" ({})", format_duration_short(*duration_ms)),
+                    Style::default().fg(theme.status_bar_fg),
+                ));
+                spans.push(Span::styled(
+                    format!(" — {error}"),
+                    Style::default().fg(theme.system_msg),
+                ));
+            }
+        }
+
+        if is_selected {
+            if is_expanded {
+                spans.push(Span::styled(
+                    " [Ctrl+o to collapse]",
+                    Style::default().fg(theme.border),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    " [Ctrl+o to expand]",
+                    Style::default().fg(theme.border),
+                ));
+            }
+        }
+
+        for line in wrap_spans(spans, effective_width, "    ") {
+            lines.push(line);
+            is_user_logical_line.push(false);
+        }
+
+        if is_expanded {
+            if let Some(output) = &active.output {
+                for line in output.lines() {
+                    let wrapped = wrap_text_line("  │ ", line, effective_width);
+                    for w in wrapped {
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(theme.border)),
+                            Span::styled(w, Style::default().fg(theme.status_bar_fg)),
+                        ]));
+                        is_user_logical_line.push(false);
+                    }
+                }
+            }
+        }
+    }
+
+    // Streaming tool calls (accumulated from ToolCallDelta before ToolStarted)
+    for streaming in streaming_tools {
+        if active_tools.iter().any(|a| (!a.call_id.is_empty() && a.call_id == streaming.id) || (!streaming.name.is_empty() && a.name == streaming.name)) {
+            continue;
+        }
+        let display = format_tool_display(&streaming.name, &streaming.arguments);
+        let call_id = if streaming.id.is_empty() {
+            streaming.name.as_str()
+        } else {
+            streaming.id.as_str()
+        };
+        let is_selected = selected_tool_id.is_some_and(|id| id == call_id);
+        let is_expanded = expanded_tools.contains(call_id);
+
+        let mut spans = Vec::new();
+        if is_selected {
+            spans.push(Span::styled(
+                "▶ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+
+        spans.push(Span::styled(
+            "● ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{} · {}", display.kind_running, display.target),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+        if is_selected {
+            if is_expanded {
+                spans.push(Span::styled(
+                    " [Ctrl+o to collapse]",
+                    Style::default().fg(theme.border),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    " [Ctrl+o to expand]",
+                    Style::default().fg(theme.border),
+                ));
+            }
+        }
+
+        for line in wrap_spans(spans, effective_width, "    ") {
+            lines.push(line);
+            is_user_logical_line.push(false);
+        }
+
+        if is_expanded && !streaming.arguments.is_empty() {
+            for line in streaming.arguments.lines() {
+                let wrapped = wrap_text_line("  │ ", line, effective_width);
+                for w in wrapped {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(theme.border)),
+                        Span::styled(w, Style::default().fg(theme.status_bar_fg)),
+                    ]));
                     is_user_logical_line.push(false);
                 }
             }
@@ -354,6 +737,7 @@ pub fn render_transcript(
     scroll_offset: u16,
     recent_sessions: &[RecentSessionSummary],
     theme: &Theme,
+    config: Option<&TranscriptConfig>,
 ) {
     let effective_width = area.width.max(1) as usize;
     let (lines, is_user_logical_line) = build_transcript_lines(
@@ -362,6 +746,7 @@ pub fn render_transcript(
         recent_sessions,
         effective_width,
         theme,
+        config,
     );
 
     let paragraph = Paragraph::new(lines)
@@ -400,7 +785,7 @@ pub fn commit_messages_to_scrollback<B: ratatui::backend::Backend>(
     if messages.is_empty() {
         return Ok(());
     }
-    let (lines, is_user) = build_transcript_lines(messages, "", &[], width, theme);
+    let (lines, is_user) = build_transcript_lines(messages, "", &[], width, theme, None);
     if lines.is_empty() {
         return Ok(());
     }
@@ -429,7 +814,7 @@ pub fn commit_welcome_banner_to_scrollback<B: ratatui::backend::Backend>(
     width: usize,
     theme: &Theme,
 ) -> std::io::Result<()> {
-    let (lines, _) = build_transcript_lines(&[], "", recent_sessions, width, theme);
+    let (lines, _) = build_transcript_lines(&[], "", recent_sessions, width, theme, None);
     if lines.is_empty() {
         return Ok(());
     }
@@ -452,7 +837,7 @@ pub fn render_streaming_viewport(
         return;
     }
     let effective_width = area.width.max(1) as usize;
-    let (lines, _) = build_transcript_lines(&[], streaming_text, &[], effective_width, theme);
+    let (lines, _) = build_transcript_lines(&[], streaming_text, &[], effective_width, theme, None);
     let h = area.height as usize;
     let visible: Vec<Line<'static>> = if lines.len() > h {
         lines[lines.len() - h..].to_vec()
@@ -469,6 +854,7 @@ pub fn calculate_transcript_height(
     messages: &[ChatMessage],
     streaming_text: &str,
     recent_sessions_count: usize,
+    config: Option<&TranscriptConfig>,
 ) -> u16 {
     let default_theme = Theme::default();
     let dummy_sessions: Vec<RecentSessionSummary> = (0..recent_sessions_count)
@@ -486,6 +872,7 @@ pub fn calculate_transcript_height(
         &dummy_sessions,
         effective_width,
         &default_theme,
+        config,
     );
     lines.len().min(u16::MAX as usize) as u16
 }
@@ -1894,6 +2281,7 @@ mod status_bar_tests {
                         0,
                         &[],
                         &theme,
+                        None,
                     );
                 })
                 .unwrap();
@@ -1929,7 +2317,7 @@ mod status_bar_tests {
         let theme = Theme::default();
         let height = 18;
         for width in [24, 80, 120] {
-            let total = calculate_transcript_height(width, &messages, "", 0);
+            let total = calculate_transcript_height(width, &messages, "", 0, None);
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
@@ -1941,6 +2329,7 @@ mod status_bar_tests {
                         total.saturating_sub(height),
                         &[],
                         &theme,
+                        None,
                     );
                 })
                 .unwrap();
@@ -1956,6 +2345,74 @@ mod status_bar_tests {
                 assert_ne!(buffer[(x, height - 1)].bg, theme.user_msg_bg);
             }
         }
+    }
+
+    #[test]
+    fn test_tool_transcript_formatting_folding_and_expansion() {
+        let theme = Theme::default();
+        let messages = vec![
+            ChatMessage::assistant_with_tool_calls(
+                "Reading file and running check",
+                vec![
+                    dume_provider::types::ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"app.rs\",\"start_line\":4420,\"end_line\":4450}".into(),
+                    },
+                    dume_provider::types::ToolCall {
+                        id: "call_check".into(),
+                        name: "bash".into(),
+                        arguments: "{\"command\":\"cargo check\"}".into(),
+                    },
+                ],
+            ),
+            ChatMessage::tool("line 4420: pub fn foo() {\nline 4421: }\n", "call_read")
+                .with_duration_ms(12),
+            ChatMessage::tool("Tool failed (exit code 101):\nerror: cannot find value `bar`", "call_check")
+                .with_duration_ms(350)
+                .with_is_error(true),
+        ];
+
+        // 1. Collapsed test (default)
+        let empty_set = std::collections::HashSet::new();
+        let cfg_collapsed = TranscriptConfig {
+            expanded_tools: &empty_set,
+            selected_tool_id: None,
+            active_tools: &[],
+            streaming_tools: &[],
+        };
+        let (lines, _) = build_transcript_lines(&messages, "", &[], 100, &theme, Some(&cfg_collapsed));
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let full_text = text.join("\n");
+
+        // Tool 1: Success, collapsed to 1 line, showing Read · app.rs:4420–4450 and duration
+        assert!(full_text.contains("✔ Read · app.rs:4420–4450"));
+        assert!(full_text.contains("(12ms)"));
+        // Raw content not present when collapsed
+        assert!(!full_text.contains("line 4420: pub fn foo()"));
+
+        // Tool 2: Failed, shows failure reason even when collapsed
+        assert!(full_text.contains("✖ Failed · cargo check"));
+        assert!(full_text.contains("exit code 101"));
+        assert!(full_text.contains("(350ms)"));
+
+        // 2. Expanded test
+        let mut expanded_set = std::collections::HashSet::new();
+        expanded_set.insert("call_read".to_string());
+        let cfg_expanded = TranscriptConfig {
+            expanded_tools: &expanded_set,
+            selected_tool_id: Some("call_read"),
+            active_tools: &[],
+            streaming_tools: &[],
+        };
+        let (lines_exp, _) = build_transcript_lines(&messages, "", &[], 100, &theme, Some(&cfg_expanded));
+        let full_text_exp = lines_exp.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+
+        // Now contains raw output lines
+        assert!(full_text_exp.contains("line 4420: pub fn foo()"));
+        // Shows selection indicator
+        assert!(full_text_exp.contains("▶"));
+        assert!(full_text_exp.contains("Ctrl+o"));
     }
 
     #[test]
@@ -2308,5 +2765,135 @@ mod status_bar_tests {
         let rows = rendered_rows(&terminal);
         assert!(rows.iter().any(|r| r.contains("Streaming output line 1")));
         assert!(rows.iter().any(|r| r.contains("Line 2")));
+    }
+
+    #[test]
+    fn test_narrow_column_long_tool_header_wraps_lines_matching_transcript_height() {
+        let theme = Theme::default();
+        let long_path = "crates/dume-core/src/submodules/very/deeply/nested/path/to/some_source_file.rs:100–200";
+        let messages = vec![
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![dume_provider::types::ToolCall {
+                    id: "call_long".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({
+                        "path": long_path,
+                    }).to_string(),
+                }],
+            ),
+            ChatMessage::tool("Tool failed: path does not exist on disk in current directory", "call_long")
+                .with_duration_ms(245)
+                .with_is_error(true),
+            ChatMessage::assistant("Final response after tool execution."),
+        ];
+
+        let empty_set = std::collections::HashSet::new();
+        let cfg = TranscriptConfig {
+            expanded_tools: &empty_set,
+            selected_tool_id: None,
+            active_tools: &[],
+            streaming_tools: &[],
+        };
+
+        let width = 40;
+        let height = calculate_transcript_height(width, &messages, "", 0, Some(&cfg));
+        let (lines, _) = build_transcript_lines(&messages, "", &[], width as usize, &theme, Some(&cfg));
+
+        // Lines count and calculate_transcript_height must match exactly
+        assert_eq!(height as usize, lines.len());
+
+        // Header was split into multiple lines so every line fits within the 40-column boundary
+        for (idx, line) in lines.iter().enumerate() {
+            let line_width = UnicodeWidthStr::width(line.to_string().as_str());
+            assert!(
+                line_width <= width as usize,
+                "Line {idx} width {line_width} exceeds viewport width {width}: {:?}",
+                line.to_string()
+            );
+        }
+
+        // The final response must be present at the bottom of the transcript
+        let all_text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(all_text.contains("Final response after tool execution."));
+        let last_line = lines.last().unwrap().to_string();
+        assert!(last_line.is_empty() || lines.iter().any(|l| l.to_string().contains("Final response")));
+    }
+
+    #[test]
+    fn test_active_tool_expansion_renders_output_during_progress() {
+        let theme = Theme::default();
+        let active_items = vec![crate::tool_display::ActiveToolItem {
+            call_id: "active_read".into(),
+            name: "read_file".into(),
+            arguments: "{\"path\":\"crates/dume-tui/src/app.rs\"}".into(),
+            status: crate::tool_display::ActiveToolStatus::Completed { duration_ms: 85 },
+            output: Some("pub fn run() {\n    // active output content\n}".into()),
+        }];
+
+        // Collapsed
+        let empty_set = std::collections::HashSet::new();
+        let cfg_collapsed = TranscriptConfig {
+            expanded_tools: &empty_set,
+            selected_tool_id: Some("active_read"),
+            active_tools: &active_items,
+            streaming_tools: &[],
+        };
+        let (lines_col, _) = build_transcript_lines(&[], "", &[], 80, &theme, Some(&cfg_collapsed));
+        let text_col = lines_col.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text_col.contains("Read · crates/dume-tui/src/app.rs"));
+        assert!(!text_col.contains("active output content"));
+
+        // Expanded
+        let mut expanded_set = std::collections::HashSet::new();
+        expanded_set.insert("active_read".into());
+        let cfg_expanded = TranscriptConfig {
+            expanded_tools: &expanded_set,
+            selected_tool_id: Some("active_read"),
+            active_tools: &active_items,
+            streaming_tools: &[],
+        };
+        let (lines_exp, _) = build_transcript_lines(&[], "", &[], 80, &theme, Some(&cfg_expanded));
+        let text_exp = lines_exp.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text_exp.contains("Read · crates/dume-tui/src/app.rs"));
+        assert!(text_exp.contains("active output content"));
+        assert!(text_exp.contains("│"));
+    }
+
+    #[test]
+    fn test_streaming_tool_call_summary_and_expansion() {
+        let theme = Theme::default();
+        let streaming_calls = vec![crate::tool_display::StreamingToolCall {
+            id: "stream_write".into(),
+            name: "write_file".into(),
+            arguments: "{\"path\":\"src/main.rs\",\"content\":\"pub fn main() {}\"}".into(),
+        }];
+
+        // Collapsed
+        let empty_set = std::collections::HashSet::new();
+        let cfg_collapsed = TranscriptConfig {
+            expanded_tools: &empty_set,
+            selected_tool_id: None,
+            active_tools: &[],
+            streaming_tools: &streaming_calls,
+        };
+        let (lines_col, _) = build_transcript_lines(&[], "", &[], 80, &theme, Some(&cfg_collapsed));
+        let text_col = lines_col.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text_col.contains("Writing · src/main.rs"));
+        assert!(!text_col.contains("pub fn main()"));
+
+        // Expanded
+        let mut expanded_set = std::collections::HashSet::new();
+        expanded_set.insert("stream_write".into());
+        let cfg_expanded = TranscriptConfig {
+            expanded_tools: &expanded_set,
+            selected_tool_id: Some("stream_write"),
+            active_tools: &[],
+            streaming_tools: &streaming_calls,
+        };
+        let (lines_exp, _) = build_transcript_lines(&[], "", &[], 80, &theme, Some(&cfg_expanded));
+        let text_exp = lines_exp.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text_exp.contains("Writing · src/main.rs"));
+        assert!(text_exp.contains("pub fn main()"));
     }
 }

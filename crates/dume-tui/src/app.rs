@@ -173,6 +173,18 @@ pub fn repair_conversation_history(messages: &mut Vec<ChatMessage>) -> (bool, Op
 
 enum ConversationEvent {
     Stream(StreamEvent),
+    ToolStarted {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolFinished {
+        call_id: String,
+        duration_ms: u64,
+        is_error: bool,
+        error: Option<String>,
+        output: String,
+    },
     RoutingDecision(dume_worker::routing::RoutingDecision),
     RoutingProbeFinished {
         probe_id: u64,
@@ -832,6 +844,10 @@ pub struct App {
     pub session_elapsed_ms: i64,
     pub session_timing_complete: bool,
     pub last_routing_decision: Option<dume_worker::routing::RoutingDecision>,
+    pub active_tools: Vec<crate::tool_display::ActiveToolItem>,
+    pub streaming_tools: Vec<crate::tool_display::StreamingToolCall>,
+    pub selected_tool_id: Option<String>,
+    pub expanded_tools: std::collections::HashSet<String>,
     active_request_model: Option<String>,
     active_thinking: Option<ThinkingLevel>,
     thinking_preferences: dume_provider::reasoning::ReasoningPreferences,
@@ -1265,6 +1281,97 @@ impl App {
             session_timing_complete: false,
             last_routing_decision: None,
             active_request_model: None,
+            active_tools: Vec::new(),
+            streaming_tools: Vec::new(),
+            selected_tool_id: None,
+            expanded_tools: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn tool_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for msg in &self.messages {
+            if msg.role == dume_provider::types::Role::Tool {
+                if let Some(ref id) = msg.tool_call_id {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        for active in &self.active_tools {
+            if !ids.iter().any(|id| id == &active.call_id) {
+                ids.push(active.call_id.clone());
+            }
+        }
+        for streaming in &self.streaming_tools {
+            let id = if streaming.id.is_empty() {
+                streaming.name.clone()
+            } else {
+                streaming.id.clone()
+            };
+            if !id.is_empty() && !ids.iter().any(|existing| existing == &id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    pub fn select_prev_tool(&mut self) {
+        let ids = self.tool_ids();
+        if ids.is_empty() {
+            self.selected_tool_id = None;
+            return;
+        }
+        let current_idx = self
+            .selected_tool_id
+            .as_ref()
+            .and_then(|id| ids.iter().position(|i| i == id));
+        let next_idx = match current_idx {
+            Some(idx) => idx.saturating_sub(1),
+            None => ids.len().saturating_sub(1),
+        };
+        self.selected_tool_id = ids.get(next_idx).cloned();
+    }
+
+    pub fn select_next_tool(&mut self) {
+        let ids = self.tool_ids();
+        if ids.is_empty() {
+            self.selected_tool_id = None;
+            return;
+        }
+        let current_idx = self
+            .selected_tool_id
+            .as_ref()
+            .and_then(|id| ids.iter().position(|i| i == id));
+        let next_idx = match current_idx {
+            Some(idx) => (idx + 1).min(ids.len().saturating_sub(1)),
+            None => 0,
+        };
+        self.selected_tool_id = ids.get(next_idx).cloned();
+    }
+
+    pub fn toggle_selected_tool_details(&mut self) {
+        let ids = self.tool_ids();
+        if ids.is_empty() {
+            return;
+        }
+        if self.selected_tool_id.is_none() {
+            self.selected_tool_id = ids.last().cloned();
+        }
+        if let Some(ref id) = self.selected_tool_id {
+            if self.expanded_tools.contains(id) {
+                self.expanded_tools.remove(id);
+            } else {
+                self.expanded_tools.insert(id.clone());
+            }
+        }
+    }
+
+    pub fn transcript_config(&self) -> crate::tool_display::TranscriptConfig<'_> {
+        crate::tool_display::TranscriptConfig {
+            expanded_tools: &self.expanded_tools,
+            selected_tool_id: self.selected_tool_id.as_deref(),
+            active_tools: &self.active_tools,
+            streaming_tools: &self.streaming_tools,
         }
     }
 
@@ -1637,6 +1744,46 @@ impl App {
                 self.active_request_model = None;
                 self.last_routing_decision = Some(decision);
             }
+            ConversationEvent::ToolStarted {
+                call_id,
+                name,
+                arguments,
+            } => {
+                if let Some(pos) = self.streaming_tools.iter().position(|s| {
+                    (!s.id.is_empty() && s.id == call_id)
+                        || (!s.name.is_empty() && s.name == name)
+                }) {
+                    self.streaming_tools.remove(pos);
+                }
+                self.active_tools.push(crate::tool_display::ActiveToolItem {
+                    call_id,
+                    name,
+                    arguments,
+                    status: crate::tool_display::ActiveToolStatus::Running {
+                        started_at: std::time::Instant::now(),
+                    },
+                    output: None,
+                });
+            }
+            ConversationEvent::ToolFinished {
+                call_id,
+                duration_ms,
+                is_error,
+                error,
+                output,
+            } => {
+                if let Some(tool) = self.active_tools.iter_mut().find(|t| t.call_id == call_id) {
+                    tool.output = Some(output);
+                    tool.status = if is_error {
+                        crate::tool_display::ActiveToolStatus::Failed {
+                            duration_ms,
+                            error: error.unwrap_or_default(),
+                        }
+                    } else {
+                        crate::tool_display::ActiveToolStatus::Completed { duration_ms }
+                    };
+                }
+            }
             ConversationEvent::Stream(StreamEvent::AttemptStarted { model, context }) => {
                 self.active_request_model = Some(model);
                 self.active_thinking = context.reasoning_effort;
@@ -1646,18 +1793,31 @@ impl App {
             }
             ConversationEvent::Stream(StreamEvent::Retrying { .. }) => {
                 self.streaming_text.clear();
+                self.active_tools.clear();
+                self.streaming_tools.clear();
                 self.current_turn_usage = dume_provider::types::TokenUsage::default();
             }
             ConversationEvent::Stream(StreamEvent::ToolCallDelta {
+                index,
+                id,
                 name,
                 arguments_delta,
-                ..
             }) => {
-                if let Some(name) = name {
-                    self.streaming_text
-                        .push_str(&format!("\n[Tool Call: {}] ", name));
+                while self.streaming_tools.len() <= index {
+                    self.streaming_tools
+                        .push(crate::tool_display::StreamingToolCall::default());
                 }
-                self.streaming_text.push_str(&arguments_delta);
+                if let Some(tool_id) = id {
+                    if !tool_id.is_empty() {
+                        self.streaming_tools[index].id = tool_id;
+                    }
+                }
+                if let Some(tool_name) = name {
+                    if !tool_name.is_empty() {
+                        self.streaming_tools[index].name = tool_name;
+                    }
+                }
+                self.streaming_tools[index].arguments.push_str(&arguments_delta);
             }
             ConversationEvent::Stream(StreamEvent::Usage(usage)) => {
                 self.current_turn_usage.merge_cumulative(&usage);
@@ -1702,6 +1862,8 @@ impl App {
                         .push(ChatMessage::ui_notice(format!("Error: {}", error)));
                 }
                 self.streaming_text.clear();
+                self.active_tools.clear();
+                self.streaming_tools.clear();
                 self.is_busy = false;
                 self.active_request_model = None;
                 self.active_thinking = None;
@@ -2205,6 +2367,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 &app.messages,
                 &app.streaming_text,
                 app.recent_sessions.len(),
+                Some(&app.transcript_config()),
             );
             let max_scroll = total_lines.saturating_sub(transcript_area.height);
             if app.auto_scroll {
@@ -2222,6 +2385,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.scroll_offset,
                 &app.recent_sessions,
                 &app.theme,
+                Some(&app.transcript_config()),
             );
 
             let is_exit_warned = app.last_ctrl_c.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2));
@@ -2450,12 +2614,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.scroll_offset,
                 );
                 if selection.selects_transcript() {
+                    let transcript_cfg = app.transcript_config();
                     let (lines, _) = build_transcript_lines(
                         &app.messages,
                         &app.streaming_text,
                         &app.recent_sessions,
                         transcript_area.width as usize,
                         &app.theme,
+                        Some(&transcript_cfg),
                     );
                     selection.refresh_transcript(lines);
                 }
@@ -3140,6 +3306,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.messages.push(ChatMessage::ui_notice("Streaming interrupted by user."));
                                         app.is_busy = false;
                                         app.streaming_text.clear();
+                                        app.active_tools.clear();
+                                        app.streaming_tools.clear();
                                         app.last_ctrl_c = None;
                                         continue;
                                     }
@@ -3175,17 +3343,32 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         app.messages.push(ChatMessage::ui_notice("Streaming interrupted by user."));
                                         app.is_busy = false;
                                         app.streaming_text.clear();
+                                        app.active_tools.clear();
+                                        app.streaming_tools.clear();
                                     }
                                     app.last_ctrl_c = None;
                                 }
                                 Action::Clear if !app.is_busy => {
                                     app.messages.clear();
                                     app.streaming_text.clear();
+                                    app.active_tools.clear();
+                                    app.streaming_tools.clear();
+                                    app.selected_tool_id = None;
+                                    app.expanded_tools.clear();
                                     app.auto_scroll = true;
                                     app.scroll_offset = 0;
                                     app.session_id = dume_provider::types::StreamRequestContext::new().session_id;
                                 }
                                 Action::Clear => {}
+                                Action::ToggleToolDetails => {
+                                    app.toggle_selected_tool_details();
+                                }
+                                Action::SelectPrevTool => {
+                                    app.select_prev_tool();
+                                }
+                                Action::SelectNextTool => {
+                                    app.select_next_tool();
+                                }
                                 Action::InsertChar(c) => {
                                     app.autocomplete_dismissed = false;
                                     app.insert_char(c);
@@ -3896,12 +4079,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left)
                                     if matches!(app.modal, ModalState::None) && app.get_autocomplete_items().is_empty() => {
+                                    let transcript_cfg = app.transcript_config();
                                     let (lines, _) = build_transcript_lines(
                                         &app.messages,
                                         &app.streaming_text,
                                         &app.recent_sessions,
                                         terminal.size()?.width as usize,
                                         &app.theme,
+                                        Some(&transcript_cfg),
                                     );
                                     if selection.start(mouse, lines) {
                                         app.auto_scroll = false;
@@ -4436,7 +4621,7 @@ async fn dispatch_authenticated(
         session_id,
         cancellation,
         Some(run_session),
-        10,
+        None,
         Some(&mut routing_snapshot),
         &model,
         |raw_messages, tools, request_session_id, effective_model, tx| {
@@ -4725,7 +4910,7 @@ async fn run_conversation<F, Fut>(
     session_id: &mut String,
     cancellation: &CancellationToken,
     run_session: Option<&RunSession>,
-    max_turns: usize,
+    max_turns: Option<usize>,
     mut routing_snapshot: Option<&mut dume_worker::routing::RoutingSnapshot>,
     original_model: &str,
     mut stream: F,
@@ -4740,7 +4925,14 @@ where
     ) -> Fut,
     Fut: std::future::Future<Output = Result<PreparedRequest>>,
 {
-    for _ in 0..max_turns {
+    let mut turn_count = 0;
+    loop {
+        if let Some(limit) = max_turns {
+            if turn_count >= limit {
+                anyhow::bail!("Conversation turn limit reached ({})", limit);
+            }
+        }
+        turn_count += 1;
         dispatcher.refresh_mcp().await?;
         let tools = dispatcher.tool_definitions_for_session(session_id);
         let (sub_tx, mut sub_rx) = mpsc::channel(100);
@@ -4839,19 +5031,23 @@ where
         }
         for (index, call) in tool_calls.into_iter().enumerate() {
             let name = call.name.clone();
-            tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
-                "\n[Tool execution: {}]\n",
-                name
-            ))))
-            .await?;
+            let call_id = call.id.clone();
+            let arguments = call.arguments.clone();
+            let _ = tx
+                .send(ConversationEvent::ToolStarted {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })
+                .await;
             let started =
                 if let (Some(session), Some(executions)) = (run_session, executions.as_ref()) {
                     Some((session, session.begin_tool(&executions[index])?))
                 } else {
                     None
                 };
-            let call_id = call.id.clone();
             let started_at = std::time::Instant::now();
+            let mut is_failure = false;
             let tool_res = match started {
                 Some((_, ToolStart::Cached { result })) => {
                     serde_json::from_str::<ChatMessage>(&result)?
@@ -4859,11 +5055,18 @@ where
                 Some((session, ToolStart::Execute { attempt_id })) => {
                     match dispatcher.execute(call, &messages).await {
                         Ok(tool_res) => {
+                            let elapsed =
+                                started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                            let mut tool_res = tool_res;
+                            tool_res.duration_ms = Some(elapsed as u64);
+                            if tool_res.is_error.is_none() {
+                                tool_res.is_error = Some(false);
+                            }
                             session.finish_tool(
                                 &executions.as_ref().expect("durable tool list")[index],
                                 &attempt_id,
                                 &tool_res,
-                                started_at.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                                elapsed,
                             )?;
                             session.checkpoint()?;
                             tool_res
@@ -4875,7 +5078,11 @@ where
                             if let Some(failure) =
                                 error.downcast_ref::<dume_worker::tools::KnownToolFailure>()
                             {
-                                let tool_res = ChatMessage::tool(failure.output.clone(), call_id);
+                                is_failure = true;
+                                let mut tool_res =
+                                    ChatMessage::tool(failure.output.clone(), call_id.clone());
+                                tool_res.duration_ms = Some(elapsed as u64);
+                                tool_res.is_error = Some(true);
                                 session.finish_tool_error(
                                     execution,
                                     &attempt_id,
@@ -4898,24 +5105,59 @@ where
                     }
                 }
                 None => match dispatcher.execute(call, &messages).await {
-                    Ok(tool_res) => tool_res,
+                    Ok(mut tool_res) => {
+                        let elapsed =
+                            started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        tool_res.duration_ms = Some(elapsed);
+                        if tool_res.is_error.is_none() {
+                            tool_res.is_error = Some(false);
+                        }
+                        tool_res
+                    }
                     Err(error) => {
                         if let Some(failure) =
                             error.downcast_ref::<dume_worker::tools::KnownToolFailure>()
                         {
-                            ChatMessage::tool(failure.output.clone(), call_id)
+                            is_failure = true;
+                            let elapsed =
+                                started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            let mut tool_res =
+                                ChatMessage::tool(failure.output.clone(), call_id.clone());
+                            tool_res.duration_ms = Some(elapsed);
+                            tool_res.is_error = Some(true);
+                            tool_res
                         } else {
                             return Err(error);
                         }
                     }
                 },
             };
-            messages.push(tool_res.clone());
-            tx.send(ConversationEvent::Stream(StreamEvent::TextDelta(format!(
-                "[Finished {}]\n",
-                name
-            ))))
-            .await?;
+            let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let mut tool_res = tool_res;
+            if tool_res.duration_ms.is_none() {
+                tool_res.duration_ms = Some(elapsed_ms);
+            }
+            if is_failure {
+                tool_res.is_error = Some(true);
+            } else if tool_res.is_error.is_none() {
+                tool_res.is_error = Some(false);
+            }
+            let is_err = tool_res.is_error.unwrap_or(false);
+            let err_content = if is_err {
+                Some(tool_res.content.clone())
+            } else {
+                None
+            };
+            let _ = tx
+                .send(ConversationEvent::ToolFinished {
+                    call_id: call_id.clone(),
+                    duration_ms: elapsed_ms,
+                    is_error: is_err,
+                    error: err_content,
+                    output: tool_res.content.clone(),
+                })
+                .await;
+            messages.push(tool_res);
         }
         if let Some(session) = run_session {
             let inputs = session.consume_steer()?;
@@ -4929,7 +5171,6 @@ where
             }
         }
     }
-    anyhow::bail!("Conversation turn limit reached ({})", max_turns)
 }
 
 #[cfg(test)]
@@ -6076,7 +6317,7 @@ mod tests {
                 &mut provider_session,
                 &CancellationToken::new(),
                 Some(&session),
-                3,
+                Some(3),
                 None,
                 "test",
                 |history, _, context, effective_model, events| {
@@ -6174,7 +6415,7 @@ mod tests {
             &mut session_id,
             &CancellationToken::new(),
             None,
-            max_turns,
+            Some(max_turns),
             None,
             "test",
             |history, _, _, effective_model, tx| {
@@ -6233,7 +6474,7 @@ mod tests {
             &mut "session".to_string(),
             &CancellationToken::new(),
             Some(&session),
-            1,
+            Some(1),
             None,
             "test",
             |_, _, _, _, events| async move {
@@ -6348,8 +6589,10 @@ mod tests {
         for event in events {
             app.receive(event);
         }
-        assert!(app.streaming_text.contains("[Tool Call: write_file]"));
+        assert!(!app.streaming_text.contains("[Tool Call:"));
         assert!(!app.streaming_text.contains("opaque-secret"));
+        assert!(app.active_tools.iter().any(|t| t.name == "write_file"));
+        assert!(app.active_tools.iter().any(|t| t.name == "read_file"));
         app.receive(ConversationEvent::Finished {
             run_id: None,
             messages: messages.clone(),
@@ -6611,7 +6854,7 @@ mod tests {
             &mut session_id,
             &cancellation,
             None,
-            10,
+            Some(10),
             None,
             "test",
             |_, _, _, _, tx| {
@@ -7068,6 +7311,193 @@ mod tests {
         let summary = format_session_metrics(&metrics);
         assert!(summary.contains("ERROR 0s (lower bound)"));
         assert!(summary.contains("CANCELLED 2s"));
+    }
+
+    #[tokio::test]
+    async fn test_run_conversation_unlimited_turns_exceeds_ten() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(HarnessStore::in_memory(directory.path().join("artifacts")).unwrap());
+        let mut dispatcher =
+            ToolDispatcher::new(directory.path(), "test", CancellationToken::new())
+                .with_store(store);
+        let mut messages = vec![ChatMessage::user("run 12 steps")];
+        let mut session_id = "test-session".to_string();
+        let (tx, _rx) = mpsc::channel(100);
+        let turn_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tc = turn_counter.clone();
+
+        let result = run_conversation(
+            &mut messages,
+            &tx,
+            &mut dispatcher,
+            &mut session_id,
+            &CancellationToken::new(),
+            None,
+            None,
+            None,
+            "test",
+            move |history, _tools, _session, effective_model, tx| {
+                let turn = tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if turn < 12 {
+                        let _ = tx
+                            .send(delta(
+                                0,
+                                Some(&format!("call_{turn}")),
+                                Some("bash"),
+                                "{\"command\":\"echo step\"}",
+                            ))
+                            .await;
+                        let _ = tx.send(completed("tool_calls")).await;
+                    } else {
+                        let _ = tx
+                            .send(StreamEvent::TextDelta("Finished 12 steps".into()))
+                            .await;
+                        let _ = tx.send(completed("stop")).await;
+                    }
+                    Ok(PreparedRequest {
+                        messages: history,
+                        effective_model,
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_conversation must succeed beyond 10 turns without stopping: {:?}",
+            result.err()
+        );
+        assert_eq!(turn_counter.load(std::sync::atomic::Ordering::SeqCst), 13);
+        assert_eq!(messages.last().unwrap().content, "Finished 12 steps");
+    }
+
+    #[tokio::test]
+    async fn test_run_conversation_cancellation_during_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(HarnessStore::in_memory(directory.path().join("artifacts")).unwrap());
+        let mut dispatcher =
+            ToolDispatcher::new(directory.path(), "test", CancellationToken::new())
+                .with_store(store);
+        let mut messages = vec![ChatMessage::user("cancel test")];
+        let mut session_id = "test-session".to_string();
+        let (tx, _rx) = mpsc::channel(100);
+        let cancellation = CancellationToken::new();
+        let cancel_trigger = cancellation.clone();
+        let turn_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let result = run_conversation(
+            &mut messages,
+            &tx,
+            &mut dispatcher,
+            &mut session_id,
+            &cancellation,
+            None,
+            None,
+            None,
+            "test",
+            move |history, _tools, _session, effective_model, tx| {
+                let turn = turn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let cancel_trigger = cancel_trigger.clone();
+                async move {
+                    if turn == 2 {
+                        cancel_trigger.cancel();
+                    }
+                    let _ = tx
+                        .send(delta(
+                            0,
+                            Some("call"),
+                            Some("bash"),
+                            "{\"command\":\"echo step\"}",
+                        ))
+                        .await;
+                    let _ = tx.send(completed("tool_calls")).await;
+                    Ok(PreparedRequest {
+                        messages: history,
+                        effective_model,
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn test_tool_navigation_and_details_toggle() {
+        let mut app = App::new("test-model");
+        app.messages = vec![
+            ChatMessage::user("do work"),
+            ChatMessage::assistant_with_tool_calls(
+                "I will read and edit",
+                vec![
+                    dume_provider::types::ToolCall {
+                        id: "tool_1".into(),
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"app.rs\"}".into(),
+                    },
+                    dume_provider::types::ToolCall {
+                        id: "tool_2".into(),
+                        name: "replace_file_content".into(),
+                        arguments: "{\"path\":\"lib.rs\"}".into(),
+                    },
+                ],
+            ),
+            ChatMessage::tool("content of app.rs", "tool_1").with_duration_ms(15),
+            ChatMessage::tool("error: cannot replace", "tool_2")
+                .with_duration_ms(30)
+                .with_is_error(true),
+        ];
+
+        let ids = app.tool_ids();
+        assert_eq!(ids, vec!["tool_1".to_string(), "tool_2".to_string()]);
+
+        assert_eq!(app.selected_tool_id, None);
+
+        app.select_next_tool();
+        assert_eq!(app.selected_tool_id.as_deref(), Some("tool_1"));
+
+        app.select_next_tool();
+        assert_eq!(app.selected_tool_id.as_deref(), Some("tool_2"));
+
+        app.select_next_tool();
+        assert_eq!(app.selected_tool_id.as_deref(), Some("tool_2"));
+
+        app.select_prev_tool();
+        assert_eq!(app.selected_tool_id.as_deref(), Some("tool_1"));
+
+        app.select_prev_tool();
+        assert_eq!(app.selected_tool_id.as_deref(), Some("tool_1"));
+
+        assert!(!app.expanded_tools.contains("tool_1"));
+        app.toggle_selected_tool_details();
+        assert!(app.expanded_tools.contains("tool_1"));
+        app.toggle_selected_tool_details();
+        assert!(!app.expanded_tools.contains("tool_1"));
+
+        app.toggle_selected_tool_details();
+        let cfg = app.transcript_config();
+        assert_eq!(cfg.selected_tool_id, Some("tool_1"));
+        assert!(cfg.expanded_tools.contains("tool_1"));
+    }
+
+    #[test]
+    fn test_reloaded_conversation_preserves_tool_duration_and_failure() {
+        let msg = ChatMessage::tool("Error: file not found", "call_abc")
+            .with_duration_ms(45)
+            .with_is_error(true);
+        let serialized = serde_json::to_string(&msg).unwrap();
+        assert!(serialized.contains("\"duration_ms\":45"));
+        assert!(serialized.contains("\"is_error\":true"));
+
+        let deserialized: ChatMessage = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(deserialized.duration_ms, Some(45));
+        assert_eq!(deserialized.is_error, Some(true));
+        assert_eq!(deserialized.content, "Error: file not found");
     }
 }
 

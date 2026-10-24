@@ -2,6 +2,7 @@ pub mod app;
 pub mod component;
 pub mod keybinding;
 pub mod program_status;
+pub mod tool_display;
 mod selection;
 mod terminal;
 pub mod theme;

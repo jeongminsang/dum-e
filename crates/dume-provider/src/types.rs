@@ -26,7 +26,7 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
@@ -45,7 +45,27 @@ pub struct ChatMessage {
     pub gemini_parts: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anthropic_thinking: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
+
+impl PartialEq for ChatMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.content == other.content
+            && self.purpose == other.purpose
+            && self.tool_call_id == other.tool_call_id
+            && self.tool_calls == other.tool_calls
+            && self.codex_reasoning == other.codex_reasoning
+            && self.deepseek_reasoning == other.deepseek_reasoning
+            && self.gemini_parts == other.gemini_parts
+            && self.anthropic_thinking == other.anthropic_thinking
+    }
+}
+
+impl Eq for ChatMessage {}
 
 fn is_conversation_purpose(purpose: &MessagePurpose) -> bool {
     *purpose == MessagePurpose::Conversation
@@ -63,6 +83,8 @@ impl ChatMessage {
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
             anthropic_thinking: Vec::new(),
+            duration_ms: None,
+            is_error: None,
         }
     }
 
@@ -77,6 +99,8 @@ impl ChatMessage {
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
             anthropic_thinking: Vec::new(),
+            duration_ms: None,
+            is_error: None,
         }
     }
 
@@ -94,6 +118,8 @@ impl ChatMessage {
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
             anthropic_thinking: Vec::new(),
+            duration_ms: None,
+            is_error: None,
         }
     }
 
@@ -108,6 +134,8 @@ impl ChatMessage {
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
             anthropic_thinking: Vec::new(),
+            duration_ms: None,
+            is_error: None,
         }
     }
 
@@ -138,7 +166,19 @@ impl ChatMessage {
             deepseek_reasoning: None,
             gemini_parts: Vec::new(),
             anthropic_thinking: Vec::new(),
+            duration_ms: None,
+            is_error: None,
         }
+    }
+
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn with_is_error(mut self, is_error: bool) -> Self {
+        self.is_error = Some(is_error);
+        self
     }
 
     /// Approximate token count for this message:

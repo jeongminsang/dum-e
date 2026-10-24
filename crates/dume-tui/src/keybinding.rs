@@ -32,6 +32,9 @@ pub enum Action {
     OpenRoutingSettings,
     Tab,
     Escape,
+    ToggleToolDetails,
+    SelectPrevTool,
+    SelectNextTool,
     None,
 }
 
@@ -133,6 +136,12 @@ fn defaults() -> HashMap<String, Action> {
         ("Alt+Left", Action::CursorWordLeft),
         ("Alt+f", Action::CursorWordRight),
         ("Alt+Right", Action::CursorWordRight),
+        ("Ctrl+o", Action::ToggleToolDetails),
+        ("Alt+o", Action::ToggleToolDetails),
+        ("Alt+Up", Action::SelectPrevTool),
+        ("Alt+Down", Action::SelectNextTool),
+        ("Ctrl+p", Action::SelectPrevTool),
+        ("Ctrl+n", Action::SelectNextTool),
     ]
     .into_iter()
     .map(|(key, action)| (key.to_ascii_lowercase(), action))
@@ -165,6 +174,9 @@ fn parse_action(name: &str) -> Result<Action> {
         "ScrollDown" => Action::ScrollDown,
         "PageUp" => Action::PageUp,
         "PageDown" => Action::PageDown,
+        "ToggleToolDetails" | "ToggleDetails" => Action::ToggleToolDetails,
+        "SelectPrevTool" => Action::SelectPrevTool,
+        "SelectNextTool" => Action::SelectNextTool,
         _ => bail!("unsupported action"),
     })
 }
