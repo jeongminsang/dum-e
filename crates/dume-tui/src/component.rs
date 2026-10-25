@@ -884,41 +884,119 @@ pub fn render_input_bar(
     cursor_pos: usize,
     is_exit_warned: bool,
     is_busy: bool,
+    active_phase: Option<&str>,
+    queued_badge: Option<&str>,
     anim_tick: usize,
     theme: &Theme,
 ) {
-    let title = if is_busy {
-        " Working... (Esc / Ctrl+C to cancel) "
-    } else if is_exit_warned {
-        " Prompt (Press Ctrl+C again within 2s to exit) "
-    } else {
-        " Prompt (Enter to submit, ↑/↓ for history, Esc to clear, Ctrl+C to exit) "
-    };
-
     let border_color = if is_exit_warned {
         theme.accent
     } else {
         theme.border_focused
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(title);
+        .border_style(Style::default().fg(border_color));
 
-    let raw_lines: Vec<&str> = input_buffer.split('\n').collect();
-    let mut lines = Vec::with_capacity(raw_lines.len());
-    for (idx, line) in raw_lines.iter().enumerate() {
-        let prefix = if idx == 0 { "> " } else { "  " };
-        lines.push(Line::from(vec![
+    if is_busy {
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner_char = SPINNER[anim_tick % SPINNER.len()];
+        let phase = active_phase.unwrap_or("Working...");
+
+        let left_title = Line::from(vec![
             Span::styled(
-                prefix,
+                format!(" {} ", spinner_char),
                 Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(*line, Style::default().fg(theme.foreground)),
+            Span::styled(
+                format!("{} ", phase),
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        block = block.title(left_title);
+
+        let right_hint = if input_buffer.is_empty() {
+            Span::styled(
+                " [Esc / Ctrl+C to cancel] ",
+                Style::default().fg(theme.border),
+            )
+        } else {
+            Span::styled(
+                " [Enter: Steer | Alt+Enter: Follow-up | Esc: Clear] ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        block = block.title(Line::from(right_hint).right_aligned());
+    } else {
+        let left_title = if is_exit_warned {
+            Line::from(Span::styled(
+                " Prompt (Press Ctrl+C again within 2s to exit) ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(Span::styled(
+                " Prompt (Enter to submit, ↑/↓ for history, Esc to clear, Ctrl+C to exit) ",
+                Style::default().fg(theme.border_focused),
+            ))
+        };
+        block = block.title(left_title);
+    }
+
+    if let Some(badge) = queued_badge {
+        block = block.title_bottom(Line::from(vec![
+            Span::styled(
+                format!(" ↳ {} ", badge),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
+    }
+
+    let mut lines = Vec::new();
+    if input_buffer.is_empty() {
+        let placeholder = if is_busy {
+            "Type to steer active run (Enter) or queue follow-up (Alt+Enter)..."
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                "> ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                placeholder,
+                Style::default()
+                    .fg(theme.border)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    } else {
+        let raw_lines: Vec<&str> = input_buffer.split('\n').collect();
+        for (idx, line) in raw_lines.iter().enumerate() {
+            let prefix = if idx == 0 { "> " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(*line, Style::default().fg(theme.foreground)),
+            ]));
+        }
     }
 
     let chars: Vec<char> = input_buffer.chars().collect();
@@ -949,39 +1027,101 @@ pub fn render_input_bar(
 
     f.render_widget(paragraph, area);
 
-    // If working, render a traveling dot (•) orbiting the input border perimeter
+    // If working, render a smooth luminous dual-wave shimmer along the border
     if is_busy && area.width >= 2 && area.height >= 2 {
-        let w = area.width as usize;
-        let h = area.height as usize;
-        let perimeter = 2 * (w + h) - 4;
+        let w = area.width;
+        let h = area.height;
+        let perimeter = (2 * w + 2 * h).saturating_sub(4) as usize;
         if perimeter > 0 {
-            let pos = anim_tick % perimeter;
-            let (dx, dy) = if pos < w {
-                // Top border: left to right
-                (pos, 0)
-            } else if pos < w + h - 1 {
-                // Right border: top to bottom
-                (w - 1, pos - (w - 1))
-            } else if pos < 2 * w + h - 2 {
-                // Bottom border: right to left
-                (w - 1 - (pos - (w + h - 1)), h - 1)
-            } else {
-                // Left border: bottom to top
-                (0, h - 1 - (pos - (2 * w + h - 2)))
+            // Period of one full rotation in animation ticks
+            let cycle_len = 40.0f32;
+            let phase = ((anim_tick as f32) / cycle_len).fract();
+            let phase2 = (phase + 0.5).fract();
+
+            let buf = f.buffer_mut();
+            let mut apply_shimmer = |x: u16, y: u16, cell_idx: usize| {
+                let cell_pos = cell_idx as f32 / perimeter as f32;
+                let d1 = (phase - cell_pos).rem_euclid(1.0);
+                let d2 = (phase2 - cell_pos).rem_euclid(1.0);
+                let tail_len = 0.22f32;
+                let i1 = if d1 <= tail_len {
+                    (1.0 - d1 / tail_len).powi(2)
+                } else {
+                    0.0
+                };
+                let i2 = if d2 <= tail_len {
+                    (1.0 - d2 / tail_len).powi(2)
+                } else {
+                    0.0
+                };
+                let mut intensity = i1.max(i2);
+
+                let a1 = (cell_pos - phase).rem_euclid(1.0);
+                let a2 = (cell_pos - phase2).rem_euclid(1.0);
+                if a1 <= 0.03 {
+                    intensity = intensity.max(1.0 - a1 / 0.03);
+                }
+                if a2 <= 0.03 {
+                    intensity = intensity.max(1.0 - a2 / 0.03);
+                }
+
+                if intensity > 0.02 && x < buf.area.width && y < buf.area.height {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        let sym = cell.symbol();
+                        // Only highlight border glyphs without corrupting title text
+                        if sym == "─"
+                            || sym == "│"
+                            || sym == "╭"
+                            || sym == "╮"
+                            || sym == "╰"
+                            || sym == "╯"
+                            || sym == "┌"
+                            || sym == "┐"
+                            || sym == "└"
+                            || sym == "┘"
+                        {
+                            let color = if intensity <= 0.8 {
+                                crate::theme::blend_rgb(
+                                    theme.border_focused,
+                                    theme.accent,
+                                    intensity / 0.8,
+                                )
+                            } else {
+                                crate::theme::blend_rgb(
+                                    theme.accent,
+                                    ratatui::style::Color::Rgb(245, 245, 255),
+                                    (intensity - 0.8) / 0.2,
+                                )
+                            };
+                            cell.set_style(cell.style().fg(color));
+                            if intensity > 0.85 {
+                                cell.set_style(cell.style().add_modifier(Modifier::BOLD));
+                            }
+                        }
+                    }
+                }
             };
 
-            let dot_x = area.x + dx as u16;
-            let dot_y = area.y + dy as u16;
-            let buf = f.buffer_mut();
-            if dot_x < buf.area.width && dot_y < buf.area.height {
-                if let Some(cell) = buf.cell_mut((dot_x, dot_y)) {
-                    cell.set_symbol("•");
-                    cell.set_style(
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
+            let mut idx = 0usize;
+            // Top edge (left to right)
+            for x in area.x..area.x + w {
+                apply_shimmer(x, area.y, idx);
+                idx += 1;
+            }
+            // Right edge (top to bottom, excluding corners)
+            for y in area.y + 1..area.y + h - 1 {
+                apply_shimmer(area.x + w - 1, y, idx);
+                idx += 1;
+            }
+            // Bottom edge (right to left)
+            for x in (area.x..area.x + w).rev() {
+                apply_shimmer(x, area.y + h - 1, idx);
+                idx += 1;
+            }
+            // Left edge (bottom to top, excluding corners)
+            for y in (area.y + 1..area.y + h - 1).rev() {
+                apply_shimmer(area.x, y, idx);
+                idx += 1;
             }
         }
     }
@@ -1224,34 +1364,13 @@ pub fn render_status_bar(
     }
 
     if is_busy {
-        // Braille spinner frames
-        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let spinner_char = SPINNER[anim_tick % SPINNER.len()];
-
-        // Ping-pong bouncing progress bar: [···█···]
-        const BAR_WIDTH: usize = 9;
-        let cycle = (BAR_WIDTH - 1) * 2;
-        let pos = (anim_tick / 2) % cycle;
-        let active_idx = if pos < BAR_WIDTH { pos } else { cycle - pos };
-
-        let mut bar = String::with_capacity(BAR_WIDTH + 2);
-        bar.push('[');
-        for i in 0..BAR_WIDTH {
-            if i == active_idx {
-                bar.push('█');
-            } else {
-                bar.push('·');
-            }
-        }
-        bar.push(']');
-
         let time_str = match elapsed_secs {
             Some(secs) => format!(" ({:.1}s)", secs),
             None => String::new(),
         };
 
         spans.push(Span::styled(
-            format!(" {} thinking {}{} ", spinner_char, bar, time_str),
+            format!(" thinking{} ", time_str),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1266,7 +1385,7 @@ pub fn render_status_bar(
     }
 
     let timing = if is_busy {
-        elapsed_secs.map(|seconds| format!(" RUN {:.0}s ", seconds))
+        None
     } else {
         last_run.map(|last| format!(" LAST {last} "))
     };

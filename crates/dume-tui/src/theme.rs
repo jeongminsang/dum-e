@@ -48,3 +48,23 @@ pub fn rainbow_color(tick: usize) -> Color {
     let (r, g, b) = PALETTE[(tick / 2) % PALETTE.len()];
     Color::Rgb(r, g, b)
 }
+
+/// Linearly interpolates between two RGB colors by factor `t` in `0.0..=1.0`.
+pub fn blend_rgb(c1: Color, c2: Color, t: f32) -> Color {
+    let factor = t.clamp(0.0, 1.0);
+    match (c1, c2) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let r = (r1 as f32 + (r2 as f32 - r1 as f32) * factor).round() as u8;
+            let g = (g1 as f32 + (g2 as f32 - g1 as f32) * factor).round() as u8;
+            let b = (b1 as f32 + (b2 as f32 - b1 as f32) * factor).round() as u8;
+            Color::Rgb(r, g, b)
+        }
+        _ => {
+            if factor > 0.5 {
+                c2
+            } else {
+                c1
+            }
+        }
+    }
+}

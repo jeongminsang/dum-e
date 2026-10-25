@@ -298,4 +298,155 @@ mod tests {
         assert_eq!(app.input_buffer, "first line");
         assert_eq!(app.cursor_pos, 10);
     }
+
+    #[test]
+    fn test_blend_rgb() {
+        use ratatui::style::Color;
+        let c1 = Color::Rgb(100, 100, 100);
+        let c2 = Color::Rgb(200, 200, 200);
+
+        assert_eq!(theme::blend_rgb(c1, c2, 0.0), c1);
+        assert_eq!(theme::blend_rgb(c1, c2, 1.0), c2);
+        assert_eq!(theme::blend_rgb(c1, c2, 0.5), Color::Rgb(150, 150, 150));
+    }
+
+    #[test]
+    fn test_app_current_working_phase_transitions() {
+        let mut app = App::new("test-model");
+        // 1. Not busy -> None
+        assert_eq!(app.current_working_phase(), None);
+
+        // 2. Busy default -> Thinking...
+        app.is_busy = true;
+        assert_eq!(app.current_working_phase().as_deref(), Some("Thinking..."));
+
+        // 3. Streaming text arriving -> Generating response...
+        app.streaming_text = "Hello world".into();
+        assert_eq!(app.current_working_phase().as_deref(), Some("Generating response..."));
+
+        // 4. Streaming tools -> Preparing ...
+        app.streaming_tools.push(crate::tool_display::StreamingToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        });
+        assert!(app.current_working_phase().as_deref().unwrap().contains("Preparing"));
+
+        // 5. Active running tool takes highest priority
+        app.active_tools.push(crate::tool_display::ActiveToolItem {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"cargo check"}"#.into(),
+            status: crate::tool_display::ActiveToolStatus::Running {
+                started_at: std::time::Instant::now(),
+            },
+            output: None,
+        });
+        assert!(app.current_working_phase().as_deref().unwrap().contains("Running"));
+    }
+
+    #[test]
+    fn test_app_queued_badge_expiry() {
+        let mut app = App::new("test-model");
+        assert_eq!(app.queued_badge(), None);
+
+        app.queued_feedback = Some(("Steer queued: \"test\"".into(), std::time::Instant::now()));
+        assert_eq!(app.queued_badge(), Some("Steer queued: \"test\""));
+
+        // Expired after 6s
+        app.queued_feedback = Some((
+            "Steer queued: \"test\"".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(7),
+        ));
+        assert_eq!(app.queued_badge(), None);
+    }
+
+    #[test]
+    fn test_render_input_bar_busy_preserves_border_and_shows_placeholder() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let default_theme = Theme::default();
+
+        terminal
+            .draw(|f| {
+                component::render_input_bar(
+                    f,
+                    f.area(),
+                    "",
+                    0,
+                    false,
+                    true,
+                    Some("Running bash · cargo check"),
+                    Some("Steer queued: \"add tests\""),
+                    10,
+                    &default_theme,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Verify corners and horizontal borders remain box-drawing chars, not replaced by '•'
+        let top_left = buffer.cell((0, 0)).unwrap().symbol();
+        assert_ne!(top_left, "•");
+
+        // Verify placeholder text is rendered when input_buffer is empty and is_busy is true
+        let mut found_placeholder = false;
+        let mut found_title = false;
+        for y in 0..5 {
+            let row_str: String = (0..80)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect();
+            if row_str.contains("Type to steer active run") {
+                found_placeholder = true;
+            }
+            if row_str.contains("Running bash") {
+                found_title = true;
+            }
+        }
+        assert!(found_placeholder, "Placeholder was not found in buffer");
+        assert!(found_title, "Running phase title was not found in buffer");
+    }
+
+    #[test]
+    fn test_render_status_bar_busy_displays_only_thinking_and_seconds() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let default_theme = Theme::default();
+
+        terminal
+            .draw(|f| {
+                component::render_status_bar(
+                    f,
+                    f.area(),
+                    "test-model",
+                    component::ThinkingLevel::Default,
+                    true,
+                    Some(2.5),
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    &default_theme,
+                );
+            })
+            .unwrap();
+
+        let row: String = (0..100)
+            .map(|x| terminal.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+
+        // Must contain "thinking (2.5s)"
+        assert!(row.contains("thinking (2.5s)"), "row: {row}");
+        // Must NOT contain bouncing progress bar or spinner
+        assert!(!row.contains("···"), "row: {row}");
+        assert!(!row.contains("█"), "row: {row}");
+        assert!(!row.contains("⠋"), "row: {row}");
+    }
 }

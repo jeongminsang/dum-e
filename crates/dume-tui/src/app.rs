@@ -1090,6 +1090,7 @@ pub struct App {
     pub streaming_tools: Vec<crate::tool_display::StreamingToolCall>,
     pub selected_tool_id: Option<String>,
     pub expanded_tools: std::collections::HashSet<String>,
+    pub queued_feedback: Option<(String, std::time::Instant)>,
     pub auth_store: dume_provider::CredentialStore,
     active_request_model: Option<String>,
     active_thinking: Option<ThinkingLevel>,
@@ -1538,6 +1539,7 @@ impl App {
             streaming_tools: Vec::new(),
             selected_tool_id: None,
             expanded_tools: std::collections::HashSet::new(),
+            queued_feedback: None,
             auth_store,
         }
     }
@@ -1627,6 +1629,50 @@ impl App {
             active_tools: &self.active_tools,
             streaming_tools: &self.streaming_tools,
         }
+    }
+
+    pub fn queued_badge(&self) -> Option<&str> {
+        if let Some((ref text, ref time)) = self.queued_feedback {
+            if time.elapsed() < std::time::Duration::from_secs(6) {
+                return Some(text.as_str());
+            }
+        }
+        None
+    }
+
+    pub fn current_working_phase(&self) -> Option<String> {
+        if !self.is_busy {
+            return None;
+        }
+        if let Some(tool) = self.active_tools.iter().rev().find(|t| {
+            matches!(
+                t.status,
+                crate::tool_display::ActiveToolStatus::Running { .. }
+            )
+        }) {
+            let display = crate::tool_display::format_tool_display(&tool.name, &tool.arguments);
+            let target = if display.target.chars().count() > 32 {
+                let s: String = display.target.chars().take(29).collect();
+                format!("{s}...")
+            } else {
+                display.target
+            };
+            return Some(format!("Running {} · {}", display.kind_running, target));
+        }
+        if let Some(tool) = self.streaming_tools.last() {
+            let display = crate::tool_display::format_tool_display(&tool.name, &tool.arguments);
+            let target = if display.target.chars().count() > 32 {
+                let s: String = display.target.chars().take(29).collect();
+                format!("{s}...")
+            } else {
+                display.target
+            };
+            return Some(format!("Preparing {} · {}", display.kind_running, target));
+        }
+        if !self.streaming_text.is_empty() {
+            return Some("Generating response...".to_string());
+        }
+        Some("Thinking...".to_string())
     }
 
     /// Return filtered autocomplete suggestions when input starts with '/'
@@ -2643,6 +2689,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             );
 
             let is_exit_warned = app.last_ctrl_c.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2));
+            let working_phase = app.current_working_phase();
+            let queued_badge = app.queued_badge();
             render_input_bar(
                 f,
                 chunks[1],
@@ -2650,6 +2698,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.cursor_pos,
                 is_exit_warned,
                 app.is_busy,
+                working_phase.as_deref(),
+                queued_badge,
                 anim_tick,
                 &app.theme,
             );
@@ -3736,9 +3786,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     }
 
                                     if app.is_busy && !app.input_buffer.trim().is_empty() {
-                                        let draft = app.input_buffer.trim();
-                                        let (kind, content) = draft.strip_prefix("/follow-up ")
-                                            .map(|content| (InputKind::FollowUp, content.trim()))
+                                        let draft = app.input_buffer.trim().to_string();
+                                        let (kind, content) = draft
+                                            .strip_prefix("/follow-up ")
+                                            .map(|c| (InputKind::FollowUp, c.trim().to_string()))
                                             .unwrap_or((InputKind::Steer, draft));
                                         if content.is_empty() { continue; }
                                         let request_id = dume_provider::types::StreamRequestContext::new().request_id;
@@ -3751,6 +3802,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             Ok(_) => {
                                                 app.input_buffer.clear();
                                                 app.cursor_pos = 0;
+                                                let label = match kind {
+                                                    InputKind::Steer => "Steer queued",
+                                                    InputKind::FollowUp => "Follow-up queued",
+                                                    _ => "Input queued",
+                                                };
+                                                let preview = if content.chars().count() > 30 {
+                                                    let s: String = content.chars().take(27).collect();
+                                                    format!("{}...", s)
+                                                } else {
+                                                    content.to_string()
+                                                };
+                                                app.messages.push(ChatMessage::ui_notice(format!("{label}: \"{preview}\"")));
+                                                app.queued_feedback = Some((format!("{label}: {preview}"), std::time::Instant::now()));
                                             }
                                             Err(error) => app.messages.push(ChatMessage::ui_notice(
                                                 format!("Could not queue steer: {error}"),
@@ -4292,7 +4356,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         Ok(receipt) => {
                                             app.input_buffer.clear();
                                             app.cursor_pos = 0;
-                                            app.messages.push(ChatMessage::ui_notice(format!("Follow-up queued ({})", receipt.disposition)));
+                                            let preview = if content.chars().count() > 30 {
+                                                let s: String = content.chars().take(27).collect();
+                                                format!("{}...", s)
+                                            } else {
+                                                content.clone()
+                                            };
+                                            app.messages.push(ChatMessage::ui_notice(format!("Follow-up queued ({}): \"{}\"", receipt.disposition, preview)));
+                                            app.queued_feedback = Some((format!("Follow-up queued: {preview}"), std::time::Instant::now()));
                                             if !app.is_busy {
                                                 if let Some(run_id) = receipt.run_id {
                                                     let history = harness_store.conversation_history(&app.conversation_id)?;
@@ -4611,7 +4682,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 break 'app_loop;
             }
             _ = ticker.tick() => {
-                if app.is_busy {
+                if app.is_busy || app.queued_badge().is_some() {
                     anim_tick = anim_tick.wrapping_add(1);
                 }
             }
