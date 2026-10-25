@@ -39,22 +39,29 @@ fn openai_stream_failure(error: &Value) -> ProviderStreamFailure {
         .or_else(|| detail.get("type"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let kind = match code {
-        "overloaded_error"
-        | "overload"
-        | "server_busy"
-        | "server_error"
-        | "resource_exhausted"
-        | "rate_limit_exceeded"
-        | "rate_limit_error" => ProviderFailureKind::Transient,
-        "invalid_api_key" | "authentication_error" | "unauthorized" | "permission_denied" => {
-            ProviderFailureKind::Auth
+    let message = detail.get("message").and_then(Value::as_str).unwrap_or("");
+    let kind = if crate::types::is_quota_type_or_code(code)
+        || crate::types::is_quota_message(message)
+    {
+        ProviderFailureKind::QuotaExceeded
+    } else {
+        match code {
+            "overloaded_error"
+            | "overload"
+            | "server_busy"
+            | "server_error"
+            | "resource_exhausted"
+            | "rate_limit_exceeded"
+            | "rate_limit_error" => ProviderFailureKind::Transient,
+            "invalid_api_key" | "authentication_error" | "unauthorized" | "permission_denied" => {
+                ProviderFailureKind::Auth
+            }
+            "context_length_exceeded" | "maximum_context_length_exceeded" => {
+                ProviderFailureKind::Context
+            }
+            "invalid_request_error" | "bad_request" => ProviderFailureKind::InvalidRequest,
+            _ => ProviderFailureKind::Unknown,
         }
-        "context_length_exceeded" | "maximum_context_length_exceeded" => {
-            ProviderFailureKind::Context
-        }
-        "invalid_request_error" | "bad_request" => ProviderFailureKind::InvalidRequest,
-        _ => ProviderFailureKind::Unknown,
     };
     ProviderStreamFailure {
         kind,
@@ -590,6 +597,20 @@ mod tests {
             )
             .kind,
             ProviderFailureKind::Unknown
+        );
+        assert_eq!(
+            openai_stream_failure(
+                &json!({"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}})
+            )
+            .kind,
+            ProviderFailureKind::QuotaExceeded
+        );
+        assert_eq!(
+            openai_stream_failure(
+                &json!({"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}})
+            )
+            .kind,
+            ProviderFailureKind::QuotaExceeded
         );
     }
 

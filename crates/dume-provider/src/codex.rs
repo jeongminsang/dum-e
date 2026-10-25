@@ -688,20 +688,26 @@ impl ResponseState {
                     .unwrap_or(event);
                 let code = error.get("code").and_then(Value::as_str).unwrap_or("");
                 let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-                let kind = match code {
-                    "server_busy"
-                    | "overloaded_error"
-                    | "rate_limit_exceeded"
-                    | "temporarily_unavailable" => ProviderFailureKind::Transient,
-                    "invalid_api_key" | "authentication_error" | "permission_denied" => {
-                        ProviderFailureKind::Auth
+                let kind = if crate::types::is_quota_type_or_code(code)
+                    || crate::types::is_quota_message(message)
+                {
+                    ProviderFailureKind::QuotaExceeded
+                } else {
+                    match code {
+                        "server_busy"
+                        | "overloaded_error"
+                        | "rate_limit_exceeded"
+                        | "temporarily_unavailable" => ProviderFailureKind::Transient,
+                        "invalid_api_key" | "authentication_error" | "permission_denied" => {
+                            ProviderFailureKind::Auth
+                        }
+                        "invalid_request" | "unsupported_parameter" => {
+                            ProviderFailureKind::InvalidRequest
+                        }
+                        "context_length_exceeded" => ProviderFailureKind::Context,
+                        "" => ProviderFailureKind::Unknown,
+                        _ => ProviderFailureKind::Unknown,
                     }
-                    "invalid_request" | "unsupported_parameter" => {
-                        ProviderFailureKind::InvalidRequest
-                    }
-                    "context_length_exceeded" => ProviderFailureKind::Context,
-                    "" => ProviderFailureKind::Unknown,
-                    _ => ProviderFailureKind::Unknown,
                 };
                 events.push(StreamEvent::ProviderError {
                     kind,

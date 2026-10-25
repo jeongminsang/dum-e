@@ -200,8 +200,13 @@ impl ResolvedProvider {
             let mut server_delay = None;
             if let Err(error) = &result {
                 if let Some(http) = error.downcast_ref::<crate::client::HttpFailure>() {
-                    server_delay = http.retry_after.map(|d| d.min(Duration::from_secs(30)));
-                    if http.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    server_delay = http.retry_after;
+                    if http.status == reqwest::StatusCode::PAYMENT_REQUIRED
+                        || (http.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            && crate::types::is_quota_exceeded_body(&http.body))
+                    {
+                        failure_kind = Some(ProviderFailureKind::QuotaExceeded);
+                    } else if http.status == reqwest::StatusCode::TOO_MANY_REQUESTS
                         || http.status.is_server_error()
                     {
                         failure_kind = Some(ProviderFailureKind::Transient);
@@ -220,7 +225,10 @@ impl ResolvedProvider {
             if result.is_err() && failure_kind.is_none() {
                 failure_kind = Some(ProviderFailureKind::Protocol);
             }
-            let retryable = failure_kind == Some(ProviderFailureKind::Transient);
+            let max_auto_retry_delay = Duration::from_secs(10);
+            let delay_too_long = server_delay.is_some_and(|d| d > max_auto_retry_delay)
+                || event_retry_after.is_some_and(|d| d > max_auto_retry_delay);
+            let retryable = failure_kind == Some(ProviderFailureKind::Transient) && !delay_too_long;
             let succeeded = result.is_ok() && error_text.is_empty() && completion.is_some();
             if !succeeded {
                 if let Some(usage) = usage.as_mut() {
@@ -261,7 +269,7 @@ impl ResolvedProvider {
                 let retry_delay = server_delay
                     .or(event_retry_after)
                     .unwrap_or(delay)
-                    .min(Duration::from_secs(30))
+                    .min(Duration::from_secs(10))
                     .min(Duration::from_secs(120).saturating_sub(retry_started.elapsed()));
                 let delay_ms = retry_delay.as_millis() as u64;
                 let _ = tx
@@ -285,6 +293,7 @@ impl ResolvedProvider {
                         error_text.clone()
                     },
                     retry_after_ms: event_retry_after
+                        .or(server_delay)
                         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
                 })
                 .await;
@@ -845,6 +854,14 @@ mod tests {
         statuses: Vec<&'static str>,
         body: &'static str,
     ) -> (String, thread::JoinHandle<()>) {
+        status_fixture_with_retry_after(statuses, body, None)
+    }
+
+    fn status_fixture_with_retry_after(
+        statuses: Vec<&'static str>,
+        body: &'static str,
+        retry_after: Option<u64>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
@@ -874,7 +891,15 @@ mod tests {
                         break;
                     }
                 }
-                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                let retry_header = retry_after
+                    .map(|secs| format!("Retry-After: {secs}\r\n"))
+                    .unwrap_or_default();
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
             }
         });
         (url, handle)
@@ -942,6 +967,80 @@ mod tests {
             }
             assert_eq!(starts, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn free_usage_limit_and_quota_errors_are_never_retried() {
+        for body in [
+            r#"{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}}"#,
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+        ] {
+            let (url, server) = status_fixture(vec!["429 Too Many Requests"], body);
+            let provider = bind_credential(
+                resolve_model("opencode/glm-5.1").unwrap(),
+                credential("api_key"),
+            )
+            .unwrap()
+            .with_base_url(&url)
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            assert!(
+                provider
+                    .stream(&[ChatMessage::user("hi")], &[], tx)
+                    .await
+                    .is_err()
+            );
+            server.join().unwrap();
+            let mut starts = 0;
+            let mut failure_kind = None;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::AttemptStarted { .. } => starts += 1,
+                    StreamEvent::ProviderError { kind, .. } => failure_kind = Some(kind),
+                    _ => {}
+                }
+            }
+            assert_eq!(starts, 1);
+            assert_eq!(failure_kind, Some(ProviderFailureKind::QuotaExceeded));
+        }
+    }
+
+    #[tokio::test]
+    async fn excessive_retry_after_is_not_retried() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
+        let (url, server) = status_fixture_with_retry_after(
+            vec!["429 Too Many Requests"],
+            body,
+            Some(30),
+        );
+        let provider = bind_credential(
+            resolve_model("openai/gpt-5.4").unwrap(),
+            credential("api_key"),
+        )
+        .unwrap()
+        .with_base_url(&url)
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        assert!(
+            provider
+                .stream(&[ChatMessage::user("hi")], &[], tx)
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+        let mut starts = 0;
+        let mut retry_after_received = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::AttemptStarted { .. } => starts += 1,
+                StreamEvent::ProviderError { retry_after_ms, .. } => {
+                    retry_after_received = retry_after_ms
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(starts, 1);
+        assert_eq!(retry_after_received, Some(30_000));
     }
 
     #[tokio::test]

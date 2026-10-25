@@ -1584,6 +1584,93 @@ pub fn render_login_selector_modal(
     f.render_widget(paragraph, inner);
 }
 
+pub fn render_logout_selector_modal(
+    f: &mut Frame,
+    area: Rect,
+    providers: &[LoginProviderChoice],
+    selected_idx: usize,
+    theme: &Theme,
+) {
+    let width = 72.min(area.width.saturating_sub(6));
+    let height = 12.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    f.render_widget(
+        ratatui::widgets::Clear,
+        Rect::new(area.x, y, area.width, height),
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" Select Provider to Log Out (↑/↓, Enter to log out, Esc to cancel) ");
+
+    let inner = modal_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Choose an LLM provider to log out and remove credentials:",
+        Style::default()
+            .fg(theme.status_bar_fg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, p) in providers.iter().enumerate() {
+        let is_selected = i == selected_idx;
+        let prefix = if is_selected { "▶ " } else { "  " };
+
+        let status_span = if p.is_authenticated {
+            Span::styled(
+                "[Active ✓]  ",
+                Style::default()
+                    .fg(theme.user_msg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("[No Auth]   ", Style::default().fg(theme.border))
+        };
+
+        let name_style = if is_selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let bg = if is_selected {
+            Style::default().bg(theme.status_bar_bg)
+        } else {
+            Style::default()
+        };
+
+        lines.push(
+            Line::from(vec![
+                Span::styled(prefix, name_style),
+                status_span,
+                Span::styled(format!("{:<18}", p.name), name_style),
+                Span::styled(
+                    format!("({})", p.auth_type),
+                    Style::default().fg(theme.border),
+                ),
+            ])
+            .style(bg),
+        );
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph, inner);
+}
+
 pub fn render_api_key_modal(
     f: &mut Frame,
     area: Rect,

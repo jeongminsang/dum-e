@@ -1648,7 +1648,7 @@ async fn run_binary_cli_lifecycle(reject: bool, routed: bool) {
         let auth = CredentialStore::new(home.join(".dume/agent/auth.json"));
         auth.save_credential("jev-local-system-one", "classifier-fixture-key")
             .unwrap();
-        auth.save_credential("openai", "openai-fixture-key")
+        auth.save_credential("openai", "cli-fixture-key")
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let settings = serde_json::json!({

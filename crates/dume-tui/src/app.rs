@@ -1,9 +1,10 @@
 use crate::component::{
     AutocompleteItem, LoginProviderChoice, ThinkingLevel, build_transcript_lines,
     calculate_transcript_height, render_api_key_modal, render_autocomplete_dropdown,
-    render_btw_modal, render_input_bar, render_login_selector_modal, render_model_selector_modal,
-    render_oauth_waiting_modal, render_resume_picker_modal, render_routing_probe_confirm_modal,
-    render_routing_settings_modal, render_status_bar, render_transcript, render_update_modal,
+    render_btw_modal, render_input_bar, render_login_selector_modal, render_logout_selector_modal,
+    render_model_selector_modal, render_oauth_waiting_modal, render_resume_picker_modal,
+    render_routing_probe_confirm_modal, render_routing_settings_modal, render_status_bar,
+    render_transcript, render_update_modal,
 };
 use crate::keybinding::{Action, KeyBindings};
 use crate::program_status::{ProgramStatus, ProgramStatusReporter};
@@ -55,6 +56,244 @@ fn delete_credential_and_rotate_session(
     store.delete(provider)?;
     *session_id = dume_provider::types::StreamRequestContext::new().session_id;
     Ok(())
+}
+
+fn select_login_provider(
+    app: &mut App,
+    selected_idx: usize,
+    stream_tx: &tokio::sync::mpsc::Sender<ConversationEvent>,
+) {
+    let provider_ids = [
+        "anthropic",
+        "openai",
+        "google",
+        "deepseek",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
+        "opencodex",
+    ];
+    let provider_names = [
+        "Anthropic Claude",
+        "OpenAI ChatGPT",
+        "Google Gemini",
+        "DeepSeek",
+        "OpenAI Codex",
+        "OpenCode Zen",
+        "OpenCode Go",
+        "OpenCodex Local",
+    ];
+    if selected_idx >= provider_ids.len() {
+        return;
+    }
+    let p_id = provider_ids[selected_idx];
+    let p_name = provider_names[selected_idx];
+
+    if p_id == "openai-codex" {
+        use dume_provider::oauth;
+        match oauth::get_oauth_config("openai-codex") {
+            Some(config) => match oauth::generate_pkce() {
+                Ok(pkce) => {
+                    let state = oauth::generate_state().unwrap_or_else(|_| "dum-e-login".to_string());
+                    match oauth::build_authorization_url(&config, &state, &pkce.challenge) {
+                        Ok(auth_url) => {
+                            let _ = std::process::Command::new("open").arg(&auth_url).spawn();
+                            let cancel_token = CancellationToken::new();
+                            let tx = stream_tx.clone();
+                            let cancel_child = cancel_token.clone();
+
+                            let oauth_store = app.auth_store.clone();
+
+                            tokio::spawn(async move {
+                                let flow = async {
+                                    let listener = oauth::bind_oauth_callback(config.port).await?;
+                                    let code = oauth::wait_for_oauth_callback(listener, config.callback_path, &state).await?;
+                                    let token = oauth::exchange_code_for_token(
+                                        &config,
+                                        &code,
+                                        &config.redirect_uri(),
+                                        &pkce.verifier,
+                                        &state,
+                                    ).await?;
+                                    let cred = dume_provider::Credential::from_oauth("openai-codex", token, None)?;
+                                    oauth_store.save("openai-codex", &cred)?;
+                                    Ok::<_, anyhow::Error>(())
+                                };
+
+                                tokio::select! {
+                                    res = flow => {
+                                        let _ = tx.send(ConversationEvent::OAuthComplete {
+                                            provider: "OpenAI Codex".to_string(),
+                                            result: res,
+                                        }).await;
+                                    }
+                                    _ = cancel_child.cancelled() => {}
+                                }
+                            });
+
+                            app.modal = ModalState::CodexOAuthWaiting {
+                                url: auth_url,
+                                cancel_token,
+                            };
+                        }
+                        Err(e) => {
+                            app.messages.push(ChatMessage::ui_notice(format!("Failed to build OAuth URL: {}", e)));
+                            app.modal = ModalState::None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.messages.push(ChatMessage::ui_notice(format!("PKCE generation failed: {}", e)));
+                    app.modal = ModalState::None;
+                }
+            },
+            None => {
+                app.messages.push(ChatMessage::ui_notice("OAuth config for openai-codex not found."));
+                app.modal = ModalState::None;
+            }
+        }
+    } else {
+        app.modal = ModalState::ApiKeyInput {
+            provider_id: p_id.to_string(),
+            provider_name: p_name.to_string(),
+            input: String::new(),
+        };
+    }
+}
+
+fn select_logout_provider(app: &mut App, selected_idx: usize) {
+    let provider_ids = [
+        "anthropic",
+        "openai",
+        "google",
+        "deepseek",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
+        "opencodex",
+    ];
+    let provider_names = [
+        "Anthropic Claude",
+        "OpenAI ChatGPT",
+        "Google Gemini",
+        "DeepSeek",
+        "OpenAI Codex",
+        "OpenCode Zen",
+        "OpenCode Go",
+        "OpenCodex Local",
+    ];
+    if selected_idx >= provider_ids.len() {
+        return;
+    }
+    let p_id = provider_ids[selected_idx];
+    let p_name = provider_names[selected_idx];
+
+    let cred_store = app.auth_store.clone();
+    match delete_credential_and_rotate_session(&cred_store, p_id, &mut app.session_id) {
+        Ok(()) => {
+            app.messages.push(ChatMessage::ui_notice(format!(
+                "Logged out from provider '{}' ({})",
+                p_id, p_name
+            )));
+        }
+        Err(e) => {
+            app.messages.push(ChatMessage::ui_notice(format!(
+                "Failed to logout from '{}': {}",
+                p_id, e
+            )));
+        }
+    }
+    app.modal = ModalState::None;
+}
+
+pub fn handle_logout_command(app: &mut App, args: &str) {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        app.modal = ModalState::LogoutSelector { selected_idx: 0 };
+    } else if trimmed == "all" {
+        let cred_store = app.auth_store.clone();
+        let mut targets = std::collections::BTreeSet::new();
+        for p in [
+            "anthropic",
+            "openai",
+            "google",
+            "deepseek",
+            "openai-codex",
+            "opencode",
+            "opencode-go",
+            "opencodex",
+            "jev-local-system-one",
+        ] {
+            targets.insert(p.to_string());
+        }
+        match cred_store.load() {
+            Ok(stored) => {
+                for k in stored.keys() {
+                    targets.insert(k.clone());
+                }
+            }
+            Err(e) => {
+                app.messages.push(ChatMessage::ui_notice(format!(
+                    "Failed to load credentials for logout: {e}"
+                )));
+                return;
+            }
+        }
+
+        let mut count = 0;
+        let mut failures = Vec::new();
+        for p in &targets {
+            match delete_credential_and_rotate_session(&cred_store, p, &mut app.session_id) {
+                Ok(()) => {
+                    count += 1;
+                }
+                Err(e) => {
+                    failures.push((p.clone(), e.to_string()));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            let failure_details = failures
+                .iter()
+                .map(|(p, err)| format!("{p}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if count > 0 {
+                app.messages.push(ChatMessage::ui_notice(format!(
+                    "Logged out from {count} provider(s), but failed for: {failure_details}"
+                )));
+            } else {
+                app.messages.push(ChatMessage::ui_notice(format!(
+                    "Failed to log out from providers: {failure_details}"
+                )));
+            }
+        } else {
+            app.messages.push(ChatMessage::ui_notice(format!(
+                "Logged out from all providers ({count} cleared)"
+            )));
+        }
+    } else {
+        let cred_store = app.auth_store.clone();
+        match delete_credential_and_rotate_session(
+            &cred_store,
+            trimmed,
+            &mut app.session_id,
+        ) {
+            Ok(()) => {
+                app.messages.push(ChatMessage::ui_notice(format!(
+                    "Logged out from provider '{}'",
+                    trimmed
+                )));
+            }
+            Err(e) => {
+                app.messages.push(ChatMessage::ui_notice(format!(
+                    "Failed to logout from '{}': {}",
+                    trimmed, e
+                )));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,6 +980,9 @@ pub enum ModalState {
     LoginSelector {
         selected_idx: usize,
     },
+    LogoutSelector {
+        selected_idx: usize,
+    },
     ApiKeyInput {
         provider_id: String,
         provider_name: String,
@@ -848,6 +1090,7 @@ pub struct App {
     pub streaming_tools: Vec<crate::tool_display::StreamingToolCall>,
     pub selected_tool_id: Option<String>,
     pub expanded_tools: std::collections::HashSet<String>,
+    pub auth_store: dume_provider::CredentialStore,
     active_request_model: Option<String>,
     active_thinking: Option<ThinkingLevel>,
     thinking_preferences: dume_provider::reasoning::ReasoningPreferences,
@@ -1220,6 +1463,16 @@ impl App {
     }
 
     pub fn new(model: impl Into<String>) -> Self {
+        Self::with_auth_store(
+            model,
+            dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path()),
+        )
+    }
+
+    pub fn with_auth_store(
+        model: impl Into<String>,
+        auth_store: dume_provider::CredentialStore,
+    ) -> Self {
         let m = model.into();
         let effective_model = if m == "anthropic/claude-sonnet-4-5" || m.is_empty() {
             get_persisted_or_default_model(None)
@@ -1285,6 +1538,7 @@ impl App {
             streaming_tools: Vec::new(),
             selected_tool_id: None,
             expanded_tools: std::collections::HashSet::new(),
+            auth_store,
         }
     }
 
@@ -2473,9 +2727,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     );
                 }
                 ModalState::LoginSelector { selected_idx } => {
-                    let cred_store = dume_provider::CredentialStore::new(
-                        dume_provider::CredentialStore::default_path(),
-                    );
+                    let cred_store = &app.auth_store;
 
                     let has_anthropic = cred_store.has_credential("anthropic");
                     let has_openai = cred_store.has_credential("openai");
@@ -2537,6 +2789,68 @@ async fn run_app<B: ratatui::backend::Backend>(
                     ];
 
                     render_login_selector_modal(
+                        f,
+                        f.area(),
+                        &choices,
+                        *selected_idx,
+                        &app.theme,
+                    );
+                }
+                ModalState::LogoutSelector { selected_idx } => {
+                    let cred_store = &app.auth_store;
+
+                    let choices = [
+                        LoginProviderChoice {
+                            id: "anthropic",
+                            name: "Anthropic Claude",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("anthropic"),
+                        },
+                        LoginProviderChoice {
+                            id: "openai",
+                            name: "OpenAI ChatGPT",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("openai"),
+                        },
+                        LoginProviderChoice {
+                            id: "google",
+                            name: "Google Gemini",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("google"),
+                        },
+                        LoginProviderChoice {
+                            id: "deepseek",
+                            name: "DeepSeek",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("deepseek"),
+                        },
+                        LoginProviderChoice {
+                            id: "openai-codex",
+                            name: "OpenAI Codex",
+                            auth_type: "OAuth Browser",
+                            is_authenticated: cred_store.has_credential("openai-codex"),
+                        },
+                        LoginProviderChoice {
+                            id: "opencode",
+                            name: "OpenCode Zen",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("opencode"),
+                        },
+                        LoginProviderChoice {
+                            id: "opencode-go",
+                            name: "OpenCode Go",
+                            auth_type: "API Key",
+                            is_authenticated: cred_store.has_credential("opencode-go"),
+                        },
+                        LoginProviderChoice {
+                            id: "opencodex",
+                            name: "OpenCodex Local",
+                            auth_type: "API Key (optional)",
+                            is_authenticated: cred_store.has_credential("opencodex"),
+                        },
+                    ];
+
+                    render_logout_selector_modal(
                         f,
                         f.area(),
                         &choices,
@@ -2657,6 +2971,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 continue;
                             }
                             selection.clear();
+                            let mut selected_login = None;
+                            let mut selected_logout = None;
                             // 1. Handle Modal Events if modal is active
                             match &mut app.modal {
                                 ModalState::ModelSelector {
@@ -2794,128 +3110,60 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     continue;
                                 }
                                 ModalState::LoginSelector { selected_idx } => {
-                                    let provider_ids = [
-                                        "anthropic",
-                                        "openai",
-                                        "google",
-                                        "deepseek",
-                                        "openai-codex",
-                                        "opencode",
-                                        "opencode-go",
-                                        "opencodex",
-                                    ];
-                                    let provider_names = [
-                                        "Anthropic Claude",
-                                        "OpenAI ChatGPT",
-                                        "Google Gemini",
-                                        "DeepSeek",
-                                        "OpenAI Codex",
-                                        "OpenCode Zen",
-                                        "OpenCode Go",
-                                        "OpenCodex Local",
-                                    ];
-
                                     match key.code {
                                         crossterm::event::KeyCode::Esc => {
                                             app.modal = ModalState::None;
                                         }
                                         crossterm::event::KeyCode::Up => {
                                             if *selected_idx == 0 {
-                                                *selected_idx = provider_ids.len() - 1;
+                                                *selected_idx = 7;
                                             } else {
                                                 *selected_idx -= 1;
                                             }
                                         }
                                         crossterm::event::KeyCode::Down => {
-                                            if *selected_idx + 1 >= provider_ids.len() {
+                                            if *selected_idx + 1 >= 8 {
                                                 *selected_idx = 0;
                                             } else {
                                                 *selected_idx += 1;
                                             }
                                         }
                                         crossterm::event::KeyCode::Enter => {
-                                            let p_id = provider_ids[*selected_idx];
-                                            let p_name = provider_names[*selected_idx];
-
-                                            if p_id == "openai-codex" {
-                                                use dume_provider::oauth;
-                                                match oauth::get_oauth_config("openai-codex") {
-                                                    Some(config) => {
-                                                        match oauth::generate_pkce() {
-                                                            Ok(pkce) => {
-                                                                let state = oauth::generate_state().unwrap_or_else(|_| "dum-e-login".to_string());
-                                                                match oauth::build_authorization_url(&config, &state, &pkce.challenge) {
-                                                                    Ok(auth_url) => {
-                                                                        // Open browser automatically on mac
-                                                                        let _ = std::process::Command::new("open").arg(&auth_url).spawn();
-
-                                                                        let cancel_token = CancellationToken::new();
-                                                                        let tx = stream_tx.clone();
-                                                                        let cancel_child = cancel_token.clone();
-
-                                                                        tokio::spawn(async move {
-                                                                            let flow = async {
-                                                                                let listener = oauth::bind_oauth_callback(config.port).await?;
-                                                                                let code = oauth::wait_for_oauth_callback(listener, config.callback_path, &state).await?;
-                                                                                let token = oauth::exchange_code_for_token(
-                                                                                    &config,
-                                                                                    &code,
-                                                                                    &config.redirect_uri(),
-                                                                                    &pkce.verifier,
-                                                                                    &state,
-                                                                                ).await?;
-                                                                                let cred = dume_provider::Credential::from_oauth("openai-codex", token, None)?;
-                                                                                let store = dume_provider::CredentialStore::new(
-                                                                                    dume_provider::CredentialStore::default_path(),
-                                                                                );
-                                                                                store.save("openai-codex", &cred)?;
-                                                                                Ok::<_, anyhow::Error>(())
-                                                                            };
-
-                                                                            tokio::select! {
-                                                                                res = flow => {
-                                                                                    let _ = tx.send(ConversationEvent::OAuthComplete {
-                                                                                        provider: "OpenAI Codex".to_string(),
-                                                                                        result: res,
-                                                                                    }).await;
-                                                                                }
-                                                                                _ = cancel_child.cancelled() => {}
-                                                                            }
-                                                                        });
-
-                                                                        app.modal = ModalState::CodexOAuthWaiting {
-                                                                            url: auth_url,
-                                                                            cancel_token,
-                                                                        };
-                                                                    }
-                                                                    Err(e) => {
-                                                                        app.messages.push(ChatMessage::ui_notice(format!("Failed to build OAuth URL: {}", e)));
-                                                                        app.modal = ModalState::None;
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                app.messages.push(ChatMessage::ui_notice(format!("PKCE generation failed: {}", e)));
-                                                                app.modal = ModalState::None;
-                                                            }
-                                                        }
-                                                    }
-                                                    None => {
-                                                        app.messages.push(ChatMessage::ui_notice("OAuth config for openai-codex not found."));
-                                                        app.modal = ModalState::None;
-                                                    }
-                                                }
-                                            } else {
-                                                app.modal = ModalState::ApiKeyInput {
-                                                    provider_id: p_id.to_string(),
-                                                    provider_name: p_name.to_string(),
-                                                    input: String::new(),
-                                                };
-                                            }
+                                            selected_login = Some(*selected_idx);
                                         }
                                         _ => {}
                                     }
-                                    continue;
+                                    if selected_login.is_none() {
+                                        continue;
+                                    }
+                                }
+                                ModalState::LogoutSelector { selected_idx } => {
+                                    match key.code {
+                                        crossterm::event::KeyCode::Esc => {
+                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Up => {
+                                            if *selected_idx == 0 {
+                                                *selected_idx = 7;
+                                            } else {
+                                                *selected_idx -= 1;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Down => {
+                                            if *selected_idx + 1 >= 8 {
+                                                *selected_idx = 0;
+                                            } else {
+                                                *selected_idx += 1;
+                                            }
+                                        }
+                                        crossterm::event::KeyCode::Enter => {
+                                            selected_logout = Some(*selected_idx);
+                                        }
+                                        _ => {}
+                                    }
+                                    if selected_logout.is_none() {
+                                        continue;
+                                    }
                                 }
                                 ModalState::ApiKeyInput { provider_id, provider_name, input } => {
                                     match key.code {
@@ -2928,9 +3176,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         crossterm::event::KeyCode::Enter => {
                                             let key = input.trim();
                                             if !key.is_empty() {
-                                                let cred_store = dume_provider::CredentialStore::new(
-                                                    dume_provider::CredentialStore::default_path(),
-                                                );
+                                                let cred_store = app.auth_store.clone();
                                                 match save_credential_and_rotate_session(
                                                     &cred_store,
                                                     provider_id,
@@ -2950,8 +3196,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         )));
                                                     }
                                                 }
+                                                app.modal = ModalState::None;
+                                            } else {
+                                                app.messages.push(ChatMessage::ui_notice(format!(
+                                                    "API key cannot be empty for {}. Please enter or paste a valid API key.",
+                                                    provider_name
+                                                )));
                                             }
-                                            app.modal = ModalState::None;
+                                        }
+                                        crossterm::event::KeyCode::Char('v') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                            if let Some(clip) = crate::selection::get_clipboard_text() {
+                                                let clean = normalize_pasted_text(&clip);
+                                                input.push_str(clean.trim());
+                                            }
                                         }
                                         crossterm::event::KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                                             input.clear();
@@ -3280,6 +3537,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     continue;
                                 }
                                 ModalState::None => {}
+                            }
+
+                            if let Some(idx) = selected_login {
+                                select_login_provider(&mut app, idx, &stream_tx);
+                                continue;
+                            }
+                            if let Some(idx) = selected_logout {
+                                select_logout_provider(&mut app, idx);
+                                continue;
                             }
 
                             // 2. Normal Editor and Transcript Handling
@@ -3677,7 +3943,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             } else {
                                                 let provider = parts[0];
                                                 let key = parts[1..].join(" ");
-                                                let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
+                                                let cred_store = app.auth_store.clone();
                                                 match save_credential_and_rotate_session(
                                                     &cred_store,
                                                     provider,
@@ -3699,31 +3965,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                             continue;
-                                        } else if trimmed == "/logout" || trimmed.starts_with("/logout ") {
-                                            let provider = if trimmed == "/logout" {
-                                                "anthropic"
-                                            } else {
-                                                trimmed[8..].trim()
-                                            };
-                                            let cred_store = dume_provider::CredentialStore::new(dume_provider::CredentialStore::default_path());
-                                            match delete_credential_and_rotate_session(
-                                                &cred_store,
-                                                provider,
-                                                &mut app.session_id,
-                                            ) {
-                                                Ok(()) => {
-                                                    app.messages.push(ChatMessage::ui_notice(format!(
-                                                        "Logged out from provider '{}'",
-                                                        provider
-                                                    )));
-                                                }
-                                                Err(e) => {
-                                                    app.messages.push(ChatMessage::ui_notice(format!(
-                                                        "Failed to logout from '{}': {}",
-                                                        provider, e
-                                                    )));
-                                                }
-                                            }
+                                        } else if trimmed == "/logout" {
+                                            handle_logout_command(&mut app, "");
+                                            continue;
+                                        } else if trimmed.starts_with("/logout ") {
+                                            let rest = trimmed[8..].trim();
+                                            handle_logout_command(&mut app, rest);
                                             continue;
                                         } else if trimmed == "/usage" {
                                             match harness_store.conversation_runtime_metrics(&app.conversation_id) {
@@ -4077,19 +4324,59 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         Event::Mouse(mouse) => {
                             match mouse.kind {
-                                MouseEventKind::Down(MouseButton::Left)
-                                    if matches!(app.modal, ModalState::None) && app.get_autocomplete_items().is_empty() => {
-                                    let transcript_cfg = app.transcript_config();
-                                    let (lines, _) = build_transcript_lines(
-                                        &app.messages,
-                                        &app.streaming_text,
-                                        &app.recent_sessions,
-                                        terminal.size()?.width as usize,
-                                        &app.theme,
-                                        Some(&transcript_cfg),
-                                    );
-                                    if selection.start(mouse, lines) {
-                                        app.auto_scroll = false;
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let mut click_login = None;
+                                    let mut click_logout = None;
+                                    match &app.modal {
+                                        ModalState::None if app.get_autocomplete_items().is_empty() => {
+                                            let transcript_cfg = app.transcript_config();
+                                            let (lines, _) = build_transcript_lines(
+                                                &app.messages,
+                                                &app.streaming_text,
+                                                &app.recent_sessions,
+                                                terminal.size()?.width as usize,
+                                                &app.theme,
+                                                Some(&transcript_cfg),
+                                            );
+                                            if selection.start(mouse, lines) {
+                                                app.auto_scroll = false;
+                                            }
+                                        }
+                                        ModalState::LoginSelector { .. } => {
+                                            let size = terminal.size()?;
+                                            let width = 72.min(size.width.saturating_sub(6));
+                                            let height = 12.min(size.height.saturating_sub(4));
+                                            let x = (size.width.saturating_sub(width)) / 2;
+                                            let y = (size.height.saturating_sub(height)) / 2;
+                                            if mouse.column >= x
+                                                && mouse.column < x + width
+                                                && mouse.row >= y + 3
+                                                && mouse.row < y + 3 + 8
+                                            {
+                                                click_login = Some((mouse.row - (y + 3)) as usize);
+                                            }
+                                        }
+                                        ModalState::LogoutSelector { .. } => {
+                                            let size = terminal.size()?;
+                                            let width = 72.min(size.width.saturating_sub(6));
+                                            let height = 12.min(size.height.saturating_sub(4));
+                                            let x = (size.width.saturating_sub(width)) / 2;
+                                            let y = (size.height.saturating_sub(height)) / 2;
+                                            if mouse.column >= x
+                                                && mouse.column < x + width
+                                                && mouse.row >= y + 3
+                                                && mouse.row < y + 3 + 8
+                                            {
+                                                click_logout = Some((mouse.row - (y + 3)) as usize);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if let Some(idx) = click_login {
+                                        select_login_provider(&mut app, idx, &stream_tx);
+                                    }
+                                    if let Some(idx) = click_logout {
+                                        select_logout_provider(&mut app, idx);
                                     }
                                 }
                                 MouseEventKind::Drag(MouseButton::Left) => selection.drag(mouse),
@@ -4121,7 +4408,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                         }
-                                        ModalState::LoginSelector { selected_idx } => {
+                                        ModalState::LoginSelector { selected_idx }
+                                        | ModalState::LogoutSelector { selected_idx } => {
                                             if *selected_idx == 0 {
                                                 *selected_idx = 7;
                                             } else {
@@ -4164,7 +4452,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                 }
                                             }
                                         }
-                                        ModalState::LoginSelector { selected_idx } => {
+                                        ModalState::LoginSelector { selected_idx }
+                                        | ModalState::LogoutSelector { selected_idx } => {
                                             if *selected_idx + 1 >= 8 {
                                                 *selected_idx = 0;
                                             } else {
@@ -4330,7 +4619,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         let state = if cancellation.is_cancelled() {
             ProgramStatus::Idle
-        } else if matches!(&app.modal, ModalState::LoginSelector { .. } | ModalState::ApiKeyInput { .. } | ModalState::CodexOAuthWaiting { .. }) {
+        } else if matches!(&app.modal, ModalState::LoginSelector { .. } | ModalState::LogoutSelector { .. } | ModalState::ApiKeyInput { .. } | ModalState::CodexOAuthWaiting { .. }) {
             ProgramStatus::BlockedAuth
         } else if app.is_busy || btw_tasks.iter().any(|(_, handle)| !handle.is_finished()) {
             ProgramStatus::Working
@@ -7498,6 +7787,88 @@ mod tests {
         assert_eq!(deserialized.duration_ms, Some(45));
         assert_eq!(deserialized.is_error, Some(true));
         assert_eq!(deserialized.content, "Error: file not found");
+    }
+
+    #[test]
+    fn test_select_login_provider_opens_api_key_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        let mut app = App::with_auth_store("test-model", store);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        select_login_provider(&mut app, 1, &tx);
+        match &app.modal {
+            ModalState::ApiKeyInput { provider_id, provider_name, input } => {
+                assert_eq!(provider_id, "openai");
+                assert_eq!(provider_name, "OpenAI ChatGPT");
+                assert!(input.is_empty());
+            }
+            _ => panic!("expected ApiKeyInput"),
+        }
+    }
+
+    #[test]
+    fn test_select_logout_provider_closes_modal_and_records_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        store.save_credential("openai", "dummy-key").unwrap();
+        let mut app = App::with_auth_store("test-model", store.clone());
+        app.modal = ModalState::LogoutSelector { selected_idx: 1 };
+        let prev_session = app.session_id.clone();
+        select_logout_provider(&mut app, 1);
+        assert!(matches!(app.modal, ModalState::None));
+        assert_ne!(app.session_id, prev_session);
+        assert!(app.messages.iter().any(|m| m.content.contains("Logged out from provider 'openai'")));
+        assert!(!store.has_credential("openai"));
+    }
+
+    #[test]
+    fn test_handle_logout_command_empty_opens_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        let mut app = App::with_auth_store("test-model", store);
+        handle_logout_command(&mut app, "");
+        assert!(matches!(app.modal, ModalState::LogoutSelector { selected_idx: 0 }));
+    }
+
+    #[test]
+    fn test_handle_logout_command_all_clears_stored_and_standard_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dume_provider::CredentialStore::new(dir.path().join("auth.json"));
+        store.save_credential("openai", "sk-test").unwrap();
+        store.save_credential("jev-local-system-one", "custom-token").unwrap();
+        let mut app = App::with_auth_store("test-model", store.clone());
+        let prev_session = app.session_id.clone();
+
+        handle_logout_command(&mut app, "all");
+
+        assert_ne!(app.session_id, prev_session);
+        assert!(!store.has_credential("openai"));
+        assert!(!store.has_credential("jev-local-system-one"));
+        assert!(app.messages.iter().any(|m| m.content.contains("Logged out from all providers")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_logout_command_all_reports_failures_when_store_unwritable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("auth.json");
+        let store = dume_provider::CredentialStore::new(&store_path);
+        store.save_credential("openai", "sk-test").unwrap();
+
+        // Make store directory read-only so write_all tempfile creation / persisting fails
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        let _ = std::fs::set_permissions(dir.path(), perms.clone());
+
+        let mut app = App::with_auth_store("test-model", store.clone());
+        handle_logout_command(&mut app, "all");
+
+        // Restore permissions so tempdir cleanup succeeds
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(dir.path(), perms);
+
+        assert!(app.messages.iter().any(|m| m.content.contains("Failed to log out from") || m.content.contains("failed for:")));
     }
 }
 

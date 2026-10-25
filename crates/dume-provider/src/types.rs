@@ -355,8 +355,73 @@ pub enum ProviderFailureKind {
     Auth,
     InvalidRequest,
     Context,
+    QuotaExceeded,
     Protocol,
     Unknown,
+}
+
+pub fn is_quota_type_or_code(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "freeusagelimiterror"
+            | "free_usage_limit"
+            | "insufficient_quota"
+            | "quota_exceeded"
+            | "credit_exhausted"
+            | "insufficient_balance"
+            | "billing_not_active"
+    )
+}
+
+pub fn is_quota_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("free usage limit")
+        || lower.contains("insufficient quota")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("insufficient balance")
+        || lower.contains("credit balance")
+        || lower.contains("billing details")
+        || lower.contains("usage limit reached")
+}
+
+pub fn is_quota_exceeded_body(body: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let detail = value.get("error").unwrap_or(&value);
+        let error_type = detail
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let error_code = detail
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let message = detail
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if is_quota_type_or_code(error_type)
+            || is_quota_type_or_code(error_code)
+            || is_quota_message(message)
+        {
+            return true;
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("freeusagelimiterror")
+        || lower.contains("free usage limit")
+        || lower.contains("insufficient_quota")
+        || lower.contains("insufficient quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota_exceeded")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("insufficient_balance")
+        || lower.contains("insufficient balance")
+        || lower.contains("credit balance is too low")
+        || lower.contains("credit_exhausted")
+        || lower.contains("billing_not_active")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

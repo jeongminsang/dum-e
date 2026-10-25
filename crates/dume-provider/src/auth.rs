@@ -138,6 +138,15 @@ impl Credential {
     }
 }
 
+static BLOCKED_ENV_PROVIDERS: OnceLock<
+    std::sync::RwLock<std::collections::HashSet<(PathBuf, String)>>,
+> = OnceLock::new();
+
+fn blocked_env_providers()
+-> &'static std::sync::RwLock<std::collections::HashSet<(PathBuf, String)>> {
+    BLOCKED_ENV_PROVIDERS.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+}
+
 #[derive(Debug, Clone)]
 pub struct CredentialStore {
     file_path: PathBuf,
@@ -153,6 +162,38 @@ impl CredentialStore {
     pub fn default_path() -> PathBuf {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
             .join(".dume/agent/auth.json")
+    }
+
+    fn store_key(&self, provider: &str) -> (PathBuf, String) {
+        let parent = self.parent();
+        let canonical_parent =
+            std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        let file_name = self.file_path.file_name().unwrap_or_default();
+        let path = canonical_parent.join(file_name);
+        (path, normalize_provider(provider).to_string())
+    }
+
+    pub fn block_env(&self, provider: &str) {
+        let key = self.store_key(provider);
+        if let Ok(mut set) = blocked_env_providers().write() {
+            set.insert(key);
+        }
+    }
+
+    pub fn unblock_env(&self, provider: &str) {
+        let key = self.store_key(provider);
+        if let Ok(mut set) = blocked_env_providers().write() {
+            set.remove(&key);
+        }
+    }
+
+    pub fn is_env_blocked(&self, provider: &str) -> bool {
+        let key = self.store_key(provider);
+        if let Ok(set) = blocked_env_providers().read() {
+            set.contains(&key)
+        } else {
+            false
+        }
     }
 
     fn parent(&self) -> &Path {
@@ -213,14 +254,22 @@ impl CredentialStore {
 
     pub async fn resolve_credential(&self, provider: &str) -> Result<Option<Credential>> {
         let provider = normalize_provider(provider);
+        // Stored credential in auth.json has higher priority than environment variables
+        if let Some(cred) = self.spawn_resolve_owner(provider.to_owned(), None).await? {
+            return Ok(Some(cred));
+        }
+        if self.is_env_blocked(provider) {
+            return Ok(None);
+        }
         let env = credential_env(provider);
-        if let Ok(key) = std::env::var(env) {
-            if !key.trim().is_empty() {
-                return Ok(Some(Self::api_key(&key)));
+        if !env.is_empty() {
+            if let Ok(key) = std::env::var(env) {
+                if !key.trim().is_empty() {
+                    return Ok(Some(Self::api_key(&key)));
+                }
             }
         }
-        let provider = provider.to_owned();
-        self.spawn_resolve_owner(provider, None).await
+        Ok(None)
     }
 
     async fn spawn_resolve_owner(
@@ -313,15 +362,21 @@ impl CredentialStore {
     pub fn save(&self, provider: &str, credential: &Credential) -> Result<()> {
         let _lock = self.lock()?;
         let mut credentials = self.load()?;
-        credentials.insert(normalize_provider(provider).to_owned(), credential.clone());
-        self.write_all(&credentials)
+        let normalized = normalize_provider(provider);
+        credentials.insert(normalized.to_owned(), credential.clone());
+        self.write_all(&credentials)?;
+        self.unblock_env(normalized);
+        Ok(())
     }
 
     pub fn delete(&self, provider: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut credentials = self.load()?;
-        credentials.remove(normalize_provider(provider));
-        self.write_all(&credentials)
+        let normalized = normalize_provider(provider);
+        credentials.remove(normalized);
+        self.write_all(&credentials)?;
+        self.block_env(normalized);
+        Ok(())
     }
 
     fn api_key(key: &str) -> Credential {
@@ -367,12 +422,6 @@ impl CredentialStore {
 
     pub fn has_credential(&self, provider: &str) -> bool {
         let provider = normalize_provider(provider);
-        let env = credential_env(provider);
-        if let Ok(key) = std::env::var(env) {
-            if !key.trim().is_empty() {
-                return true;
-            }
-        }
         if let Ok(map) = self.load() {
             if let Some(cred) = map.get(provider) {
                 match cred.cred_type.as_str() {
@@ -386,6 +435,17 @@ impl CredentialStore {
                             .is_some_and(|t| !t.trim().is_empty());
                     }
                     _ => {}
+                }
+            }
+        }
+        if self.is_env_blocked(provider) {
+            return false;
+        }
+        let env = credential_env(provider);
+        if !env.is_empty() {
+            if let Ok(key) = std::env::var(env) {
+                if !key.trim().is_empty() {
+                    return true;
                 }
             }
         }
@@ -694,6 +754,70 @@ mod tests {
             0,
             "File permissions should not be world or group accessible: {:o}",
             file_perm
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_credential_takes_precedence_over_environment_variable() {
+        const CHILD: &str = "DUME_AUTH_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Set the fixture environment before the child starts any test threads.
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::tests::stored_credential_takes_precedence_over_environment_variable",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("OPENAI_API_KEY", "env-key")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated credential test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("auth.json"));
+        assert_eq!(
+            store
+                .resolve_credential("openai")
+                .await
+                .unwrap()
+                .unwrap()
+                .key
+                .as_deref(),
+            Some("env-key"),
+        );
+        store.save_credential("openai", "store-key").unwrap();
+
+        let cred = store.resolve_credential("openai").await.unwrap().unwrap();
+        assert_eq!(cred.key.as_deref(), Some("store-key"));
+
+        store.delete("openai").unwrap();
+        // Environment variable OPENAI_API_KEY is NOT removed from process
+        assert_eq!(std::env::var("OPENAI_API_KEY").as_deref(), Ok("env-key"));
+        // But store blocks it from resolution
+        assert!(!store.has_credential("openai"));
+        assert!(store.resolve_credential("openai").await.unwrap().is_none());
+
+        store.save_credential("openai", "replacement-key").unwrap();
+        assert!(!store.is_env_blocked("openai"));
+        assert!(store.has_credential("openai"));
+        assert_eq!(
+            store
+                .resolve_credential("openai")
+                .await
+                .unwrap()
+                .unwrap()
+                .key
+                .as_deref(),
+            Some("replacement-key"),
         );
     }
 }

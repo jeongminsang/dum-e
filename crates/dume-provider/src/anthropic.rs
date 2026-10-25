@@ -764,19 +764,27 @@ impl AnthropicProvider {
                                         "Anthropic response error [{code}]: {}",
                                         error.get("message").and_then(Value::as_str).unwrap_or("")
                                     );
-                                    let kind = match code {
-                                        "overloaded_error" | "server_busy" => {
-                                            ProviderFailureKind::Transient
+                                    let kind = if crate::types::is_quota_type_or_code(code)
+                                        || crate::types::is_quota_message(&message)
+                                    {
+                                        ProviderFailureKind::QuotaExceeded
+                                    } else {
+                                        match code {
+                                            "overloaded_error" | "server_busy" => {
+                                                ProviderFailureKind::Transient
+                                            }
+                                            "authentication_error" | "permission_error" => {
+                                                ProviderFailureKind::Auth
+                                            }
+                                            "invalid_request_error" => {
+                                                ProviderFailureKind::InvalidRequest
+                                            }
+                                            "context_length_exceeded" => {
+                                                ProviderFailureKind::Context
+                                            }
+                                            "" => ProviderFailureKind::Unknown,
+                                            _ => ProviderFailureKind::Unknown,
                                         }
-                                        "authentication_error" | "permission_error" => {
-                                            ProviderFailureKind::Auth
-                                        }
-                                        "invalid_request_error" => {
-                                            ProviderFailureKind::InvalidRequest
-                                        }
-                                        "context_length_exceeded" => ProviderFailureKind::Context,
-                                        "" => ProviderFailureKind::Unknown,
-                                        _ => ProviderFailureKind::Unknown,
                                     };
                                     let _ = tx
                                         .send(StreamEvent::ProviderError {

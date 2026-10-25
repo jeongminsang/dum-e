@@ -247,6 +247,45 @@ pub(crate) async fn copy_to_clipboard(text: String) -> Result<()> {
     }
 }
 
+pub(crate) fn get_clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/pbpaste")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            String::from_utf8(output.stdout).ok()
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("wl-paste").output() {
+            if output.status.success() {
+                if let Ok(s) = String::from_utf8(output.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+        if let Ok(output) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(s) = String::from_utf8(output.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 #[cfg(any(not(target_os = "macos"), test))]
 fn write_osc52(writer: &mut impl Write, text: &str) -> io::Result<()> {
     write!(

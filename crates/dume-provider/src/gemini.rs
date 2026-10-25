@@ -19,15 +19,24 @@ pub struct GeminiProvider {
 fn gemini_provider_error(error: &Value) -> (ProviderFailureKind, String) {
     let code = error.get("status").and_then(Value::as_str).unwrap_or("");
     let numeric_code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
-    let kind = match code {
-        "RESOURCE_EXHAUSTED" | "UNAVAILABLE" | "ABORTED" => ProviderFailureKind::Transient,
-        "UNAUTHENTICATED" | "PERMISSION_DENIED" => ProviderFailureKind::Auth,
-        "INVALID_ARGUMENT" => ProviderFailureKind::InvalidRequest,
-        "FAILED_PRECONDITION" => ProviderFailureKind::Context,
-        _ if matches!(numeric_code, 429 | 500 | 502 | 503 | 504) => ProviderFailureKind::Transient,
-        _ if numeric_code == 401 || numeric_code == 403 => ProviderFailureKind::Auth,
-        _ if numeric_code == 400 => ProviderFailureKind::InvalidRequest,
-        _ => ProviderFailureKind::Unknown,
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    let kind = if crate::types::is_quota_type_or_code(code)
+        || crate::types::is_quota_message(message)
+    {
+        ProviderFailureKind::QuotaExceeded
+    } else {
+        match code {
+            "RESOURCE_EXHAUSTED" | "UNAVAILABLE" | "ABORTED" => ProviderFailureKind::Transient,
+            "UNAUTHENTICATED" | "PERMISSION_DENIED" => ProviderFailureKind::Auth,
+            "INVALID_ARGUMENT" => ProviderFailureKind::InvalidRequest,
+            "FAILED_PRECONDITION" => ProviderFailureKind::Context,
+            _ if matches!(numeric_code, 429 | 500 | 502 | 503 | 504) => {
+                ProviderFailureKind::Transient
+            }
+            _ if numeric_code == 401 || numeric_code == 403 => ProviderFailureKind::Auth,
+            _ if numeric_code == 400 => ProviderFailureKind::InvalidRequest,
+            _ => ProviderFailureKind::Unknown,
+        }
     };
     (kind, error.to_string())
 }
